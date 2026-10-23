@@ -40,7 +40,7 @@ jobs:
         uses: nerima-games/.github/conformance/ast-grep@94af2b2f6f260e87db75285f72f87685fd06bba3
 
       - name: Configure GitHub Packages authentication
-        run: pnpm config set --location=user //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
+        run: pnpm config set --location=global //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
