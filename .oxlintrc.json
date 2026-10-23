@@ -1,0 +1,47 @@
+{
+  "$schema": "https://oxc-project.github.io/oxc/schema/linter.json",
+  "env": {
+    "es2022": true,
+    "node": true
+  },
+  "settings": {
+    "typescript": {
+      "version": "7.0"
+    }
+  },
+  "plugins": [],
+  "categories": {
+    "correctness": "warn",
+    "suspicious": "warn",
+    "perf": "warn",
+    "style": "warn",
+    "restriction": "warn"
+  },
+  "rules": {
+    "@typescript-eslint/consistent-type-definitions": ["warn", "type"],
+    "@typescript-eslint/no-explicit-any": "off",
+    "@typescript-eslint/no-unused-vars": "warn",
+    "@typescript-eslint/no-floating-promises": "warn",
+    "no-eval": "error",
+    "no-implied-eval": "error",
+    "no-restricted-imports": [
+      "error",
+      {
+        "patterns": [
+          {
+            "group": [
+              "@nerima-games/mc-host-web",
+              "@nerima-games/mc-host-web/**",
+              "@nerima-games/mc-playground-kit",
+              "@nerima-games/mc-playground-kit/**",
+              "@nerima-games/mc-dev-meta",
+              "@nerima-games/mc-dev-meta/**"
+            ],
+            "message": "mc-server may depend on lower tiers, but mc-playground-kit is dev-only and Tier5 peers are forbidden."
+          }
+        ]
+      }
+    ]
+  },
+  "ignorePatterns": ["node_modules/**", "coverage/**", "dist/**", ".git/**", "*.config.ts", "docs/**"]
+}

@@ -1,0 +1,57 @@
+{
+  "name": "@nerima-games/mc-server",
+  "version": "0.0.0",
+  "description": "Planned Node host package for the Minecraft server.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=12.14.0"
+  },
+  "packageManager": "pnpm@12.14.0",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "mc-server": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.build.json --pretty false && tsc -p tsconfig.test.json --pretty false",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.release.json --pretty false",
+    "lint": "oxlint --deny-warnings src test scripts && ast-grep scan",
+    "lint:fix": "oxlint --fix src test scripts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test",
+    "package:verify": "pnpm build && node scripts/verify-package.mjs",
+    "prepublishOnly": "pnpm verify && pnpm package:verify"
+  },
+  "dependencies": {
+    "effect": "4.0.5"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "1.0.1",
+    "@changesets/cli": "3.0.3",
+    "@effect/vitest": "4.0.5",
+    "@types/node": "26.6.5",
+    "@vitest/coverage-v8": "5.0.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
