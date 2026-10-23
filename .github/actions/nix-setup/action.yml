@@ -1,0 +1,58 @@
+name: Set up Nix
+description: >-
+  Install Nix (Determinate Systems installer) and configure Cachix when a cache
+  name is provided.
+
+# This is the only place where the installer and Cachix action SHAs are pinned.
+# Repositories using the same Cachix cache can reuse package builds because
+# their development shells use only packages from nixpkgs.
+
+# The calling workflow must check out this repository before using the local action.
+
+inputs:
+  cachix-cache:
+    description: Cachix cache name. When empty, Cachix is not configured.
+    required: false
+    default: ""
+  cachix-auth-token:
+    description: >-
+      Cachix auth token. Pull requests and runs without a token use pull-only access.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+    - name: Resolve Cachix mode
+      id: cachix-mode
+      shell: bash
+      env:
+        CACHIX_AUTH_TOKEN: ${{ inputs.cachix-auth-token }}
+        CACHIX_CACHE: ${{ inputs.cachix-cache }}
+        EVENT_NAME: ${{ github.event_name }}
+      run: |
+        set -euo pipefail
+        push=false
+        if [[ -n "$CACHIX_AUTH_TOKEN" && "$EVENT_NAME" != "pull_request" ]]; then
+          push=true
+        fi
+        printf 'push=%s\n' "$push" >> "$GITHUB_OUTPUT"
+        if [[ -z "$CACHIX_CACHE" ]]; then
+          echo "::warning::CACHIX_CACHE is unset; building without a binary cache"
+        fi
+
+    - name: Configure Cachix (pull-only)
+      if: ${{ inputs.cachix-cache != '' && steps.cachix-mode.outputs.push != 'true' }}
+      uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      with:
+        name: ${{ inputs.cachix-cache }}
+        skipPush: true
+
+    - name: Configure Cachix (push-enabled)
+      if: ${{ inputs.cachix-cache != '' && steps.cachix-mode.outputs.push == 'true' }}
+      uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      with:
+        name: ${{ inputs.cachix-cache }}
+        authToken: ${{ inputs.cachix-auth-token }}
