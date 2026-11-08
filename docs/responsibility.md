@@ -1,11 +1,11 @@
 # Responsibility
 
-## Planned ownership
+## Current ownership
 
-`mc-server` composes game modules for a Node server and drives simulation ticks. It owns the listener and CLI, the `READY:` status line, server-state file persistence, and host integration with the redstone behavior package `mx-redstone`.
+`apps/multiplayer-server/main.ts` runs the Node WebSocket host. It owns the listener and CLI, optional state-file persistence, and the 50 ms server tick loop. The host creates multiplayer cores for the Overworld, Nether, and End; each tick advances those cores and the `mx-redstone` runtime. After binding, it prints the WebSocket address.
 
-The host supplies filesystem and cryptography adapters for the `legacy-player-claims` file, which stores per-player secret hashes. The host implementation will specify the exact `READY:` line and tick schedule.
+State stays in memory unless `--state-file` or `MULTIPLAYER_STATE_FILE` configures a persistence file. The host reads legacy player claims from the path set by `--legacy-player-claims-file` or `MULTIPLAYER_LEGACY_PLAYER_CLAIMS_FILE`. `apps/multiplayer-server/legacy-player-claims.ts` uses Node cryptography to validate per-player secret hashes.
 
 ## Out of scope
 
-`mc-sim` is the simulation package and owns simulation state, clock, random source, and the test harness. `mx-multiplayer` owns the multiplayer protocol, validation, command ledger, and anti-cheat. It defines the generic interface for requesting world-state writes; `mc-kernel` defines the shared TypeScript type for that port. `mc-server` supplies its implementation when it composes `mx-redstone`. UI, browser DOM, E2E tests, and game rule implementations remain outside this host package.
+`mc-sim` is the simulation package and owns simulation state, clock, random source, and the test harness. `mx-multiplayer` owns the multiplayer protocol, validation, command ledger, and anti-cheat. It defines the typed interface for world-state write requests; `mc-server` supplies the host implementation when it composes `mx-redstone`. UI, browser DOM, E2E tests, and game rule implementations remain outside this host package.

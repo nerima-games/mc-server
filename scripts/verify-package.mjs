@@ -23,18 +23,33 @@ const run = (command, args) => {
 }
 
 try {
-  const runtime = await import(pathToFileURL(join(root, "dist/index.js")).href)
+  const runtime = await import(pathToFileURL(join(root, "dist/src/index.js")).href)
   if (runtime.serverPackageName !== packageJson.name) {
-    throw new Error("dist/index.js does not expose the package identifier")
+    throw new Error("dist/src/index.js does not expose the package identifier")
+  }
+
+  const shared = await import("@nerima-games/mc-server/shared")
+  if (typeof shared.isValidAnvilName !== "function") {
+    throw new Error("the shared package subpath does not expose isValidAnvilName")
+  }
+
+  const server = await import(pathToFileURL(join(root, "dist/apps/multiplayer-server/main.js")).href)
+  if (typeof server.startMultiplayerServer !== "function") {
+    throw new Error("the server entry does not expose startMultiplayerServer")
   }
 
   const cliPath = join(root, packageJson.bin["mc-server"])
-  const cli = spawnSync(process.execPath, [cliPath], { encoding: "utf8", timeout: 10_000 })
+  const cliSource = readFileSync(cliPath, "utf8")
+  if (!cliSource.startsWith("#!/usr/bin/env node\n")) {
+    throw new Error("the mc-server bin entry is missing its Node shebang")
+  }
+  const invalidOptions = spawnSync(process.execPath, [cliPath, "--port=invalid"], { encoding: "utf8", timeout: 10_000 })
   if (
-    cli.status !== SUCCESS_EXIT_STATUS ||
-    cli.stderr !== "The mc-server CLI is a placeholder and does not start a server.\n"
+    invalidOptions.error ||
+    invalidOptions.status === SUCCESS_EXIT_STATUS ||
+    !invalidOptions.stderr.includes("port must be an integer")
   ) {
-    throw new Error("the CLI entry does not report its placeholder state")
+    throw new Error("the mc-server bin entry did not reject an invalid port")
   }
 
   run("pnpm", ["pack", "--pack-destination", temporaryDirectory, "--silent"])
@@ -46,9 +61,11 @@ try {
   const archive = join(temporaryDirectory, archiveName)
   const entries = new Set(run("tar", ["-tzf", archive]).split("\n").filter(Boolean))
   for (const entry of [
-    "package/dist/index.js",
-    "package/dist/index.d.ts",
-    "package/dist/cli.js",
+    "package/dist/src/index.js",
+    "package/dist/src/index.d.ts",
+    "package/dist/apps/multiplayer-shared/index.js",
+    "package/dist/apps/multiplayer-shared/index.d.ts",
+    "package/dist/apps/multiplayer-server/main.js",
     "package/README.md",
     "package/LICENSE"
   ]) {

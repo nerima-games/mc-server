@@ -1,7 +1,7 @@
 {
   "name": "@nerima-games/mc-server",
   "version": "0.0.0",
-  "description": "Planned Node host package for the Minecraft server.",
+  "description": "Node host for the Minecraft multiplayer server.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0",
@@ -9,17 +9,22 @@
   },
   "packageManager": "pnpm@12.14.0",
   "license": "MIT",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "default": "./dist/src/index.js"
+    },
+    "./shared": {
+      "types": "./dist/apps/multiplayer-shared/index.d.ts",
+      "import": "./dist/apps/multiplayer-shared/index.js",
+      "default": "./dist/apps/multiplayer-shared/index.js"
     }
   },
   "bin": {
-    "mc-server": "./dist/cli.js"
+    "mc-server": "./dist/apps/multiplayer-server/main.js"
   },
   "files": [
     "dist",
@@ -55,11 +60,11 @@
   "devDependencies": {
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
-    "@effect/vitest": "0.30.0",
     "@types/node": "26.6.5",
     "@types/ws": "8.18.2",
-    "@vitest/coverage-v8": "4.1.11",
+    "@vitest/coverage-v8": "4.1.12",
+    "fast-check": "4.10.2",
     "typescript": "7.0.2",
-    "vitest": "4.1.11"
+    "vitest": "4.1.12"
   }
 }

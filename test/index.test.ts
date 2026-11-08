@@ -1,23 +1,17 @@
-import { describe, expect, it } from "@effect/vitest"
-import { Effect } from "effect"
-import process from "node:process"
-import { serverPackageName } from "../src/index.js"
-import { vi } from "vitest"
+import fc from "fast-check"
+import { describe, expect, it } from "vitest"
 
-const EXPECTED_CLI_WRITES = 1
+import { serverPackageName } from "../src/index.js"
+import { isValidAnvilName } from "../apps/multiplayer-shared/index.js"
 
 describe("package entry points", () => {
-  it.effect("exports its name and reports the CLI placeholder", () =>
-    Effect.promise(async () => {
-      const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
-      try {
-        await import("../src/cli.js")
-        expect(serverPackageName).toBe("@nerima-games/mc-server")
-        expect(stderrWrite).toHaveBeenCalledTimes(EXPECTED_CLI_WRITES)
-        expect(stderrWrite).toHaveBeenCalledWith("The mc-server CLI is a placeholder and does not start a server.\n")
-      } finally {
-        stderrWrite.mockRestore()
-      }
-    }),
-  )
+  it("exports its name and shared helpers", () => {
+    expect(serverPackageName).toBe("@nerima-games/mc-server")
+    expect(isValidAnvilName("Hunter")).toBe(true)
+    expect(isValidAnvilName("x".repeat(51))).toBe(false)
+  })
+
+  it("returns a boolean for arbitrary anvil names", () => {
+    fc.assert(fc.property(fc.anything(), (value) => typeof isValidAnvilName(value) === "boolean"))
+  })
 })

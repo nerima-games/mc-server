@@ -1,5 +1,5 @@
 {
-  description = "mc-server: planned Node host package for the Minecraft server.";
+  description = "mc-server: Node host for the Minecraft multiplayer server.";
 
   inputs = {
     # flake.lock pins nixpkgs to 624af665, providing oxlint 1.75.0. That version
