@@ -1,0 +1,62 @@
+[
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runPromise( Effect.provideService(Layer.build(RedstoneWorldRuntimeLayer), Scope.Scope, scope), )"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runPromise(Effect.provide(makeRuntimeRedstoneStages, context))"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync( stage.run(elapsedSecs as Parameters<typeof stage.run>[0]).pipe(Effect.provide(ServerClockLayer)), )"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(Scope.make())"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(runtime.drainHopperTransferEvents)"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(runtime.drainLampTransitions)"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(runtime.drainPistonTransitions)"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(runtime.drainPoweredComponentTransitions)"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(runtime.drainTriggerEvents)"
+  },
+  {
+    "count": 1,
+    "file": "apps/multiplayer-server/redstone-runtime.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(runtime.syncSnapshot({ dimension: realm.dimension, components }))"
+  }
+]

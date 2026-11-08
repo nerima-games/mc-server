@@ -10,6 +10,29 @@ permissions:
   packages: read
 
 jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: ./.github/actions/nix-setup
+        with:
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Check shared conformance
+        uses: nerima-games/.github/conformance/ast-grep@f594176eb568341ab31babbfef16a260979f75f2
+        with:
+          public-api-baseline: .github/conformance/public-api-baseline.json
+
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -35,9 +58,6 @@ jobs:
         with:
           cachix-cache: ${{ vars.CACHIX_CACHE }}
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
-      - name: Check org conformance
-        uses: nerima-games/.github/conformance/ast-grep@94af2b2f6f260e87db75285f72f87685fd06bba3
 
       - name: Configure GitHub Packages authentication
         run: pnpm config set --location=global //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
