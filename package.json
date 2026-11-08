@@ -33,8 +33,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.build.json --pretty false && tsc -p tsconfig.test.json --pretty false",
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.release.json --pretty false",
-    "lint": "oxlint --deny-warnings src test scripts && ast-grep scan",
-    "lint:fix": "oxlint --fix src test scripts",
+    "lint": "oxlint --deny-warnings src apps test scripts && ast-grep scan",
+    "lint:fix": "oxlint --fix src apps test scripts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -43,15 +43,23 @@
     "prepublishOnly": "pnpm verify && pnpm package:verify"
   },
   "dependencies": {
-    "effect": "4.0.5"
+    "@nerima-games/mc-kernel": "0.7.1",
+    "@nerima-games/mc-sim": "0.4.2",
+    "@nerima-games/mc-worldgen": "0.3.2",
+    "@nerima-games/mx-gameplay": "0.6.0",
+    "@nerima-games/mx-multiplayer": "0.11.0",
+    "@nerima-games/mx-redstone": "0.3.3",
+    "effect": "3.22.1",
+    "ws": "8.22.0"
   },
   "devDependencies": {
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
-    "@effect/vitest": "4.0.5",
+    "@effect/vitest": "0.30.0",
     "@types/node": "26.6.5",
-    "@vitest/coverage-v8": "5.0.5",
+    "@types/ws": "8.18.2",
+    "@vitest/coverage-v8": "4.1.11",
     "typescript": "7.0.2",
-    "vitest": "5.0.5"
+    "vitest": "4.1.11"
   }
 }

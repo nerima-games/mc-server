@@ -6,7 +6,7 @@ const config: ViteUserConfig = {
     include: ["test/**/*.test.ts"],
     coverage: {
       provider: "v8",
-      include: ["src/**/*.ts"],
+      include: ["src/**/*.ts", "apps/multiplayer-shared/**/*.ts"],
       exclude: ["**/*.d.ts", "**/*.config.ts", "**/*.test.ts", "**/*.spec.ts"],
       reporter: ["text", "html", "lcov"],
       reportsDirectory: "./coverage",
