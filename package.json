@@ -1,6 +1,6 @@
 {
   "name": "@nerima-games/mc-server",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Node host for the Minecraft multiplayer server.",
   "type": "module",
   "engines": {
