@@ -26,7 +26,7 @@ import {
   type HungerEvent,
 } from '@nerima-games/mx-multiplayer'
 import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
-import { pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
+import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type Dimension } from '@nerima-games/mc-worldgen'
 import { EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
 import {
@@ -129,7 +129,7 @@ import {
   type EnderDragonEncounterSnapshot,
   type EnchantedItem,
 } from '@nerima-games/mx-gameplay'
-import { Option, Result } from 'effect'
+import { Option, Result, Schema } from 'effect'
 import {
   SleepAuthority,
   decodeSleepWireMessage,
@@ -205,6 +205,8 @@ export type ClientId = string
 export type SendFrame = (frame: WireText) => void
 
 type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
+const pistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
+type PistonHeadOffsetFailure = ResultFailure<typeof pistonHeadOffsetResult>
 type WitherOperation = 'match-summon' | 'summon' | 'damage' | 'advance'
 type WitherRuntimeFailure = ResultFailure<
   | ReturnType<typeof matchRuntimeWitherSummon>
@@ -256,6 +258,7 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
   | Readonly<{ _tag: 'AnvilPlanFailure'; failure: AnvilPlanFailure }>
   | Readonly<{ _tag: 'AnvilExperienceSpendFailure'; failure: AnvilExperienceSpendFailure }>
+  | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
   | Readonly<{ _tag: 'GeneratedBlockReadFailure'; failure: GeneratedBlockReadFailure }>
   | Readonly<{ _tag: 'InvalidServerTickDuration'; elapsedMs: number }>
 
@@ -1580,7 +1583,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (Result.isFailure(piston)) return Result.fail(piston.failure)
     if (piston.success !== 'piston') return Result.succeed(false)
 
-    const head = pistonPositionAt(plan.piston, plan.facing, 1)
+    if (Result.isFailure(pistonHeadOffsetResult)) {
+      return Result.fail({ _tag: 'PistonHeadOffsetFailure', failure: pistonHeadOffsetResult.failure })
+    }
+    const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffsetResult.success)
     if (!isInBounds(head)) return Result.succeed(false)
     if (plan.fromState === 'extended') {
       const headBlock = blockAt(head)

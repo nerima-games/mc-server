@@ -1,5 +1,6 @@
 import {
   makeRuntimeRedstoneStages,
+  PistonBlockOffsetSchema,
   pistonPositionAt,
   planPistonTransition,
   RedstoneWorldRuntime,
@@ -8,7 +9,7 @@ import {
   type RedstonePosition,
 } from '@nerima-games/mx-redstone'
 import { blockIdOf, capabilityOfBlockId, DeltaTimeSecs, isBlockType } from '@nerima-games/mc-kernel'
-import { Context, Effect, Layer, Option, Result, Scope } from 'effect'
+import { Context, Effect, Layer, Option, Result, Schema, Scope } from 'effect'
 
 import { ServerClockLayer } from './clock.js'
 import type { MultiplayerServerCore, MultiplayerServerCoreFailure } from './core.js'
@@ -16,6 +17,8 @@ import type { MultiplayerServerCore, MultiplayerServerCoreFailure } from './core
 const lampBlocks = new Set(['redstone_lamp', 'redstone_lamp_lit'] as const)
 const doorBlocks = new Set(['door', 'door_open'] as const)
 type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
+const pistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
+type PistonHeadOffsetFailure = ResultFailure<typeof pistonHeadOffsetResult>
 type PistonCapabilityFailure =
   | Readonly<{ _tag: 'UnknownBlockType'; block: string }>
   | Readonly<{ _tag: 'UnregisteredBlockType'; block: string }>
@@ -67,6 +70,7 @@ export type MultiplayerRedstoneTickFailure =
   | Readonly<{ _tag: 'RedstoneDeltaTimeFailure'; failure: RedstoneTickFailure }>
   | Readonly<{ _tag: 'CoreBlockReadFailure'; failure: MultiplayerServerCoreFailure }>
   | Readonly<{ _tag: 'PistonCapabilityFailure'; failure: PistonCapabilityFailure }>
+  | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
 
 const componentForBlock = (
   core: MultiplayerServerCore,
@@ -118,7 +122,10 @@ const componentForBlock = (
     case 'door_open':
       return Result.succeed({ position, kind: 'door' })
     case 'piston': {
-      const head = core.readPistonCell(pistonPositionAt(position, 'north', 1))
+      if (Result.isFailure(pistonHeadOffsetResult)) {
+        return Result.fail({ _tag: 'PistonHeadOffsetFailure', failure: pistonHeadOffsetResult.failure })
+      }
+      const head = core.readPistonCell(pistonPositionAt(position, 'north', pistonHeadOffsetResult.success))
       if (Result.isFailure(head)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: head.failure })
       return Result.succeed({
         position,
