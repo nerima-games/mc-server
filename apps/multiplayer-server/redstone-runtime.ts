@@ -7,8 +7,9 @@ import {
   RedstoneWorldRuntimeLayer,
   type RedstoneComponentSnapshot,
   type RedstonePosition,
+  type RedstoneWorldRuntimeService,
 } from '@nerima-games/mx-redstone'
-import { blockIdOf, capabilityOfBlockId, DeltaTimeSecs, isBlockType } from '@nerima-games/mc-kernel'
+import { blockIdOf, BlockPositionSchema, capabilityOfBlockId, DeltaTimeSecs, DimensionIdSchema, isBlockType } from '@nerima-games/mc-kernel'
 import { Context, Effect, Layer, Option, Result, Schema, Scope } from 'effect'
 
 import { ServerClockLayer } from './clock.js'
@@ -17,14 +18,28 @@ import type { MultiplayerServerCore, MultiplayerServerCoreFailure } from './core
 const lampBlocks = new Set(['redstone_lamp', 'redstone_lamp_lit'] as const)
 const doorBlocks = new Set(['door', 'door_open'] as const)
 type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
+type EffectFailure<Value> = Value extends Effect.Effect<unknown, infer Failure> ? Failure : never
 type PistonHeadOffsetResult = Result.Result<Schema.Schema.Type<typeof PistonBlockOffsetSchema>, Schema.SchemaError>
 const pistonHeadOffsetResult: PistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
 type PistonHeadOffsetFailure = ResultFailure<PistonHeadOffsetResult>
+type RedstoneSnapshotSyncFailure = EffectFailure<ReturnType<RedstoneWorldRuntimeService['syncSnapshot']>>
+type RedstonePositionDecode = Result.Result<Schema.Schema.Type<typeof BlockPositionSchema>, Schema.SchemaError>
 type PistonCapabilityFailure =
   | Readonly<{ _tag: 'UnknownBlockType'; block: string }>
   | Readonly<{ _tag: 'UnregisteredBlockType'; block: string }>
   | Readonly<{ _tag: 'BlockCapabilityResolutionFailure'; failure: ResultFailure<ReturnType<typeof capabilityOfBlockId>> }>
 type PistonCapabilityResult = ReturnType<typeof capabilityOfBlockId>
+
+const positionAtOffset = (
+  position: RedstonePosition,
+  offsetX: number,
+  offsetY: number,
+  offsetZ: number,
+): RedstonePositionDecode => Schema.decodeUnknownResult(BlockPositionSchema)({
+  x: position.x + offsetX,
+  y: position.y + offsetY,
+  z: position.z + offsetZ,
+})
 
 const makePistonCapabilities = (): Readonly<{
   readonly capabilities: Readonly<{ pistonImmovable: (block: string) => PistonCapabilityResult }>
@@ -69,6 +84,8 @@ type RedstoneTickFailure = ReturnType<typeof DeltaTimeSecs.result> extends Resul
 export type MultiplayerRedstoneTickFailure =
   | Readonly<{ _tag: 'InvalidRedstoneTickDuration'; elapsedMs: number }>
   | Readonly<{ _tag: 'RedstoneDeltaTimeFailure'; failure: RedstoneTickFailure }>
+  | Readonly<{ _tag: 'RedstoneSchemaFailure'; operation: 'dimension' | 'position'; failure: Schema.SchemaError }>
+  | Readonly<{ _tag: 'RedstoneSnapshotSyncFailure'; failure: RedstoneSnapshotSyncFailure }>
   | Readonly<{ _tag: 'CoreBlockReadFailure'; failure: MultiplayerServerCoreFailure }>
   | Readonly<{ _tag: 'PistonCapabilityFailure'; failure: PistonCapabilityFailure }>
   | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
@@ -100,18 +117,30 @@ const componentForBlock = (
       return Result.succeed({ position, kind: 'lever', active: active.success })
     }
     case 'comparator': {
-      const inputFrom = { x: position.x, y: position.y, z: position.z + 1 }
-      const containerSlots = core.readContainerSlots(inputFrom)
+      const inputFrom = positionAtOffset(position, 0, 0, 1)
+      if (Result.isFailure(inputFrom)) {
+        return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'position', failure: inputFrom.failure })
+      }
+      const outputTo = positionAtOffset(position, 0, 0, -1)
+      if (Result.isFailure(outputTo)) {
+        return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'position', failure: outputTo.failure })
+      }
+      const sideInputLeft = positionAtOffset(position, -1, 0, 0)
+      if (Result.isFailure(sideInputLeft)) {
+        return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'position', failure: sideInputLeft.failure })
+      }
+      const sideInputRight = positionAtOffset(position, 1, 0, 0)
+      if (Result.isFailure(sideInputRight)) {
+        return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'position', failure: sideInputRight.failure })
+      }
+      const containerSlots = core.readContainerSlots(inputFrom.success)
       if (Result.isFailure(containerSlots)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: containerSlots.failure })
       return Result.succeed({
         position,
         kind: 'comparator',
-        inputFrom,
-        outputTo: { x: position.x, y: position.y, z: position.z - 1 },
-        sideInputs: [
-          { x: position.x - 1, y: position.y, z: position.z },
-          { x: position.x + 1, y: position.y, z: position.z },
-        ],
+        inputFrom: inputFrom.success,
+        outputTo: outputTo.success,
+        sideInputs: [sideInputLeft.success, sideInputRight.success],
         mode: 'compare',
         ...(containerSlots.success === undefined ? {} : { containerSlots: containerSlots.success }),
       })
@@ -169,7 +198,12 @@ export const makeMultiplayerRedstoneRuntime = async (
           if (Result.isFailure(component)) return Result.fail(component.failure)
           if (component.success !== undefined) components.push(component.success)
         }
-        Effect.runSync(runtime.syncSnapshot({ dimension: realm.dimension, components }))
+        const dimension = Schema.decodeUnknownResult(DimensionIdSchema)(realm.dimension)
+        if (Result.isFailure(dimension)) {
+          return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'dimension', failure: dimension.failure })
+        }
+        const sync = Effect.runSync(Effect.result(runtime.syncSnapshot({ dimension: dimension.success, components })))
+        if (Result.isFailure(sync)) return Result.fail({ _tag: 'RedstoneSnapshotSyncFailure', failure: sync.failure })
       }
       for (const stage of stages) {
         Effect.runSync(

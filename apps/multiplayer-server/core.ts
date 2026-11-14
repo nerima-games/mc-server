@@ -25,10 +25,10 @@ import {
   type HungerCommand,
   type HungerEvent,
 } from '@nerima-games/mx-multiplayer'
-import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type Dimension } from '@nerima-games/mc-worldgen'
-import { EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
+import { advanceFurnace, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -59,7 +59,6 @@ import {
   ZOMBIE_KIND,
   ZOMBIE_XP_REWARD,
   ZOMBIFIED_PIGLIN_KIND,
-  applyFurnaceAdvance,
   applyStatusEffect,
   acceptBrewingBottle,
   acceptBrewingFuel,
@@ -90,12 +89,10 @@ import {
   ENDERMAN_TELEPORT_ATTEMPTS,
   endermanTeleportCandidateCells,
   endermanTeleportUrge,
-  furnaceAdvanceChanged,
   FALLING_BLOCK_MOVES_PER_TICK,
   miningLootContextForItem,
   nextRoll,
   normaliseSeed,
-  planFurnaceAdvance,
   planFallingBlockMoves,
   PRIMED_TNT_FUSE_SECS,
   rollDropsOfKind,
@@ -215,7 +212,13 @@ type WitherRuntimeFailure = ResultFailure<
   | ReturnType<typeof damageRuntimeWither>
   | ReturnType<typeof advanceWitherRuntime>
 >
-type FurnaceAdvanceFailure = ResultFailure<ReturnType<typeof planFurnaceAdvance>>
+type FurnaceStackFailure = ResultFailure<ReturnType<typeof itemStack>>
+type FurnaceStateConstructionFailure = FurnaceStackFailure | Schema.SchemaError | Readonly<{
+  readonly _tag: 'UnknownFurnaceItemType'
+  readonly slot: 'input' | 'fuel' | 'output'
+  readonly item: string
+}>
+type FurnaceAdvanceFailure = SimFurnaceFailure | FurnaceStateConstructionFailure
 type ExplosionPlanFailure = ResultFailure<ReturnType<typeof planExplosion>>
 type BlockRegistryFailure = ResultFailure<ReturnType<typeof propertyOfBlockId> | ReturnType<typeof blockTypeOfId>>
 type BlockIdFailure = ResultFailure<ReturnType<typeof BlockId.result>>
@@ -229,7 +232,8 @@ type NoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result
 type BlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
 type FishingEquipmentFailure = ResultFailure<ReturnType<typeof itemStack> | ReturnType<typeof equipmentItem>>
 type FishingLootFailure = Extract<ReturnType<typeof reelFishing>, { readonly _tag: 'InvalidLoot' }>
-type CraftingFailure = ResultFailure<typeof STARTER_RECIPES | ReturnType<typeof craftGrid> | ReturnType<typeof craftFromGrid>>
+type CraftingFailure = ResultFailure<typeof STARTER_RECIPES | ReturnType<typeof itemStack> | ReturnType<typeof craftGrid> | ReturnType<typeof craftFromGrid>>
+type CanonicalItemStackFailure = ResultFailure<ReturnType<typeof itemStack>>
 type ExperienceFailure = ResultFailure<ReturnType<typeof TotalExperience.result> | ReturnType<typeof ExperienceLevel.result>>
 type ProjectileFailure = ResultFailure<ReturnType<typeof raycastArrowBlock>>
 type AnvilPlanFailure = ResultFailure<ReturnType<typeof planAnvilOperation>>
@@ -256,6 +260,7 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'NoiseSeedBrandFailure'; failure: NoiseSeedFailure }>
   | Readonly<{ _tag: 'FishingEquipmentFailure'; failure: FishingEquipmentFailure }>
   | Readonly<{ _tag: 'FishingLootFailure'; failure: FishingLootFailure }>
+  | Readonly<{ _tag: 'ItemStackFailure'; failure: CanonicalItemStackFailure }>
   | Readonly<{ _tag: 'CraftingFailure'; failure: CraftingFailure }>
   | Readonly<{ _tag: 'ExperienceFailure'; failure: ExperienceFailure }>
   | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
@@ -570,6 +575,7 @@ interface MutableFurnaceState {
   fuel: ItemStack | null
   output: ItemStack | null
   burnTicksRemaining: number
+  burnTicksTotal: number
   cookTicks: number
 }
 
@@ -634,44 +640,67 @@ const containerSnapshot = (state: MutableContainerState): ContainerState => ({
   slots: state.slots.map(cloneStack),
 })
 const furnaceSnapshot = (state: MutableFurnaceState): FurnaceState => ({
-  ...state,
+  furnaceId: state.furnaceId,
   input: cloneStack(state.input),
   fuel: cloneStack(state.fuel),
   output: cloneStack(state.output),
+  burnTicksRemaining: state.burnTicksRemaining,
+  cookTicks: state.cookTicks,
 })
 
 type SimItemStack = NonNullable<SimFurnaceState['input']>
 
-const toSimulationStack = (stack: ItemStack | null): SimItemStack | null | undefined => {
-  if (stack === null) return null
-  if (!isItemType(stack.item)) return undefined
-  return { item: stack.item, count: StackCount(stack.count) }
+const toSimulationStack = (
+  stack: ItemStack | null,
+  slot: 'input' | 'fuel' | 'output',
+): Result.Result<SimItemStack | undefined, FurnaceStateConstructionFailure> => {
+  if (stack === null) return Result.succeed(undefined)
+  if (!isItemType(stack.item)) return Result.fail({ _tag: 'UnknownFurnaceItemType', slot, item: stack.item })
+  return itemStack(stack.item, stack.count)
 }
 
-const fromSimulationStack = (stack: SimItemStack | null): ItemStack | null =>
-  stack === null ? null : { item: stack.item, count: stack.count }
+const fromSimulationStack = (stack: SimItemStack | undefined): ItemStack | null =>
+  stack === undefined ? null : { item: stack.item, count: stack.count }
 
-const furnaceSimulationState = (state: MutableFurnaceState): SimFurnaceState | null => {
-  const input = toSimulationStack(state.input)
-  const fuel = toSimulationStack(state.fuel)
-  const output = toSimulationStack(state.output)
-  if (input === undefined || fuel === undefined || output === undefined) return null
-  return {
-    input,
-    fuel,
-    output,
-    burnRemainingSecs: state.burnTicksRemaining / 20,
-    cookElapsedSecs: state.cookTicks / 20,
-  }
+const furnaceSimulationState = (
+  state: MutableFurnaceState,
+): Result.Result<SimFurnaceState, FurnaceStateConstructionFailure> => {
+  const input = toSimulationStack(state.input, 'input')
+  if (Result.isFailure(input)) return Result.fail(input.failure)
+  const fuel = toSimulationStack(state.fuel, 'fuel')
+  if (Result.isFailure(fuel)) return Result.fail(fuel.failure)
+  const output = toSimulationStack(state.output, 'output')
+  if (Result.isFailure(output)) return Result.fail(output.failure)
+  return Schema.decodeUnknownResult(SimFurnaceStateSchema)({
+    station: 'furnace',
+    input: input.success,
+    fuel: fuel.success,
+    output: output.success,
+    fuelTimeRemainingSecs: state.burnTicksRemaining / 20,
+    fuelTimeTotalSecs: state.burnTicksTotal / 20,
+    cookProgressSecs: state.cookTicks / 20,
+  })
 }
 
 const applyFurnaceSimulationState = (target: MutableFurnaceState, state: SimFurnaceState): void => {
   target.input = fromSimulationStack(state.input)
   target.fuel = fromSimulationStack(state.fuel)
   target.output = fromSimulationStack(state.output)
-  target.burnTicksRemaining = Math.round(state.burnRemainingSecs * 20)
-  target.cookTicks = Math.round(state.cookElapsedSecs * 20)
+  target.burnTicksRemaining = Math.round(state.fuelTimeRemainingSecs * 20)
+  target.burnTicksTotal = Math.round(state.fuelTimeTotalSecs * 20)
+  target.cookTicks = Math.round(state.cookProgressSecs * 20)
 }
+
+const furnaceSimulationStateChanged = (before: SimFurnaceState, after: SimFurnaceState): boolean =>
+  before.input?.item !== after.input?.item
+  || before.input?.count !== after.input?.count
+  || before.fuel?.item !== after.fuel?.item
+  || before.fuel?.count !== after.fuel?.count
+  || before.output?.item !== after.output?.item
+  || before.output?.count !== after.output?.count
+  || before.fuelTimeRemainingSecs !== after.fuelTimeRemainingSecs
+  || before.fuelTimeTotalSecs !== after.fuelTimeTotalSecs
+  || before.cookProgressSecs !== after.cookProgressSecs
 
 const isAuthoritativeCommand = (message: NetworkMessage): message is AuthoritativeCommand =>
   message._tag === 'PlayerInventoryCommand' ||
@@ -832,6 +861,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       input: cloneStack(state.input),
       fuel: cloneStack(state.fuel),
       output: cloneStack(state.output),
+      // The wire snapshot stores remaining time only, so continue from that exact interval length.
+      burnTicksTotal: state.burnTicksRemaining,
     }]),
   )
   const brewingStands = new Map<string, Readonly<{ at: BlockPos; state: BrewingStandState }>>(
@@ -2846,22 +2877,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (input === undefined || offer.input.length !== 1 || !isItemType(input.item) || !isItemType(offer.output.item)) {
           return { accepted: false, reason: 'invalid-command' }
         }
-        const output = { ...offer.output, item: offer.output.item as ItemStack['item'] }
+        const inputStack = itemStack(input.item, input.count)
+        if (Result.isFailure(inputStack)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'ItemStackFailure', failure: inputStack.failure } }
+        }
+        const outputStack = itemStack(offer.output.item, offer.output.count)
+        if (Result.isFailure(outputStack)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'ItemStackFailure', failure: outputStack.failure } }
+        }
         const nextSlots = inventory.slots.map(cloneStack)
-        let remainingInput = input.count
+        let remainingInput = inputStack.success.count
         for (let slot = 0; slot < nextSlots.length && remainingInput > 0; slot += 1) {
           const current = nextSlots[slot]
-          if (current == null || current.item !== input.item) continue
+          if (current == null || current.item !== inputStack.success.item) continue
           const moved = Math.min(current.count, remainingInput)
           nextSlots[slot] = current.count === moved ? null : { ...current, count: current.count - moved }
           remainingInput -= moved
         }
         if (remainingInput > 0) return { accepted: false, reason: 'insufficient-items' }
-        let remainingOutput = output.count
-        const maxStackCount = maxStackCountOfItem(output.item as Parameters<typeof maxStackCountOfItem>[0])
+        let remainingOutput = outputStack.success.count
+        const maxStackCount = maxStackCountOfItem(outputStack.success.item)
         for (let slot = 0; slot < nextSlots.length && remainingOutput > 0; slot += 1) {
           const current = nextSlots[slot]
-          if (current == null || current.item !== output.item || current.count >= maxStackCount) continue
+          if (current == null || current.item !== outputStack.success.item || current.count >= maxStackCount) continue
           const moved = Math.min(maxStackCount - current.count, remainingOutput)
           nextSlots[slot] = { ...current, count: current.count + moved }
           remainingOutput -= moved
@@ -2869,7 +2907,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         for (let slot = 0; slot < nextSlots.length && remainingOutput > 0; slot += 1) {
           if (nextSlots[slot] != null) continue
           const moved = Math.min(maxStackCount, remainingOutput)
-          nextSlots[slot] = { item: output.item, count: moved }
+          nextSlots[slot] = { item: outputStack.success.item, count: moved }
           remainingOutput -= moved
         }
         if (remainingOutput > 0) return { accepted: false, reason: 'invalid-command' }
@@ -3149,7 +3187,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           || !Number.isSafeInteger(slot.count)
           || slot.count <= 0
           || slot.count > maxStackCountOfItem(slot.item)) return rejectCrafting('invalid-command')
-        craftingSlots.push({ item: slot.item, count: StackCount(slot.count) })
+        const stack = itemStack(slot.item, slot.count)
+        if (Result.isFailure(stack)) {
+          return rejectCrafting('invalid-command', 'invalid-command', {
+            _tag: 'CraftingFailure',
+            failure: stack.failure,
+          })
+        }
+        craftingSlots.push(stack.success)
       }
       const recipes = STARTER_RECIPES
       if (Result.isFailure(recipes)) {
@@ -3967,6 +4012,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             fuel: null,
             output: null,
             burnTicksRemaining: 0,
+            burnTicksTotal: 0,
             cookTicks: 0,
           })
         } else if (message.block === 'brewing_stand') {
@@ -4353,24 +4399,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
     if (elapsedSecs > 0) {
       for (const furnace of furnaces.values()) {
-        let current = furnaceSimulationState(furnace)
-        if (current === null) continue
-        let remainingSecs = elapsedSecs
-        let changed = false
-        while (remainingSecs > 0) {
-          const planResult = planFurnaceAdvance(current, remainingSecs)
-          if (Result.isFailure(planResult)) {
-            return Result.fail({ _tag: 'FurnaceAdvanceFailure', failure: planResult.failure })
-          }
-          const plan = planResult.success
-          const applied = applyFurnaceAdvance(current, plan)
-          if (applied._tag !== 'Applied') break
-          changed ||= furnaceAdvanceChanged(plan)
-          current = applied.state
-          remainingSecs = plan.deferredSecs
+        const current = furnaceSimulationState(furnace)
+        if (Result.isFailure(current)) {
+          return Result.fail({ _tag: 'FurnaceAdvanceFailure', failure: current.failure })
         }
-        if (!changed) continue
-        applyFurnaceSimulationState(furnace, current)
+        const advanced = advanceFurnace(current.success, elapsedSecs)
+        if (Result.isFailure(advanced)) {
+          return Result.fail({ _tag: 'FurnaceAdvanceFailure', failure: advanced.failure })
+        }
+        if (!furnaceSimulationStateChanged(current.success, advanced.success.state)) continue
+        applyFurnaceSimulationState(furnace, advanced.success.state)
         changedFurnaces.push(furnace)
       }
       if (timeChanged || changedFurnaces.length > 0) {

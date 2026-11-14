@@ -7,3 +7,5 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - '@nerima-games/mc-sim@0.11.0'
   - '@nerima-games/mc-worldgen@0.9.0'
+  - '@nerima-games/mx-multiplayer@0.16.0'
+  - '@nerima-games/mx-redstone@0.7.0'
