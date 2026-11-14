@@ -217,6 +217,20 @@ describe('authoritative multiplayer server core', () => {
     expect(fixture.server.snapshot().players.find((player) => player.player === playerId('alice'))?.at).toEqual({ x: 0, y: 64, z: 0 })
   })
 
+  it('rejects server-only replicated world messages from clients', () => {
+    const fixture = makeFixture()
+    fixture.connect('socket-a')
+    fixture.receive('socket-a', join('alice'))
+
+    expect(fixture.server.receive('socket-a', JSON.stringify({
+      _tag: 'ReplicatedWorldSnapshot',
+      world: 'world-1',
+      revision: 0,
+      blocks: [],
+      owners: [],
+    }) as WireText)).toEqual({ accepted: false, reason: 'identity-spoof' })
+  })
+
   it('updates movement and broadcasts movement and chat as authoritative events', () => {
     const fixture = makeFixture()
     const aliceFrames = fixture.connect('socket-a')

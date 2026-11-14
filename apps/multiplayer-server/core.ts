@@ -4123,6 +4123,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       case 'WitherCommandAccepted':
       case 'WitherCommandRejected':
       case 'WitherSnapshotDelta':
+      case 'ReplicatedWorldDelta':
+      case 'ReplicatedWorldSnapshot':
+      case 'ReplicatedWorldSnapshotStart':
+      case 'ReplicatedWorldSnapshotChunk':
+      case 'ReplicatedWorldSnapshotEnd':
         return { accepted: false, reason: 'identity-spoof' }
     }
   }
