@@ -227,6 +227,7 @@ type CameraOperationFailure = CameraPoseFailure | PositionFailure
 type NoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result>>
 type BlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
 type FishingEquipmentFailure = ResultFailure<ReturnType<typeof itemStack> | ReturnType<typeof equipmentItem>>
+type FishingLootFailure = Extract<ReturnType<typeof reelFishing>, { readonly _tag: 'InvalidLoot' }>
 type CraftingFailure = ResultFailure<typeof STARTER_RECIPES | ReturnType<typeof craftGrid> | ReturnType<typeof craftFromGrid>>
 type ExperienceFailure = ResultFailure<ReturnType<typeof TotalExperience.result> | ReturnType<typeof ExperienceLevel.result>>
 type ProjectileFailure = ResultFailure<ReturnType<typeof raycastArrowBlock>>
@@ -253,6 +254,7 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'PositionBrandFailure'; failure: PositionFailure }>
   | Readonly<{ _tag: 'NoiseSeedBrandFailure'; failure: NoiseSeedFailure }>
   | Readonly<{ _tag: 'FishingEquipmentFailure'; failure: FishingEquipmentFailure }>
+  | Readonly<{ _tag: 'FishingLootFailure'; failure: FishingLootFailure }>
   | Readonly<{ _tag: 'CraftingFailure'; failure: CraftingFailure }>
   | Readonly<{ _tag: 'ExperienceFailure'; failure: ExperienceFailure }>
   | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
@@ -2343,6 +2345,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const current = inventory.slots[active.slot]
         if (current?.item !== 'fishing_rod') {
           return { accepted: true, deltas: (nextRevision) => [{ _tag: 'PlayerFishingDelta', world: actor.world, revision: nextRevision, player: message.player, state: { phase: 'idle', result: 'cancelled' } }] }
+        }
+        if (result._tag === 'InvalidLoot') {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'FishingLootFailure', failure: result },
+          }
         }
         if (result.rod === null) {
           inventory.slots[active.slot] = null
