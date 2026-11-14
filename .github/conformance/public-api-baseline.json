@@ -52,11 +52,5 @@
     "file": "apps/multiplayer-server/redstone-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(runtime.drainTriggerEvents)"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.syncSnapshot({ dimension: realm.dimension, components }))"
   }
 ]

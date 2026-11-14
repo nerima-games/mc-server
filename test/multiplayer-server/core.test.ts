@@ -319,6 +319,7 @@ describe('authoritative multiplayer server core', () => {
       player: playerId('alice'),
       at: { x: 2, y: 65, z: 2 },
       block: 'stone',
+      state: 0,
     })).toEqual({ accepted: false, reason: 'identity-spoof' })
     expect(messages(bobFrames)).toEqual([
       expect.objectContaining({ _tag: 'BlockMutationRejected', reason: 'unauthorized-player', revision: 0 }),
@@ -336,7 +337,7 @@ describe('authoritative multiplayer server core', () => {
 
     const at = { x: 2, y: 65, z: 3 }
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block: 'stone',
+      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block: 'stone', state: 0,
     }).accepted).toBe(true)
     expect(messages(bobFrames)).toContainEqual(expect.objectContaining({ _tag: 'BlockPlace', at, block: 'stone' }))
     expect(fixture.server.snapshot()).toMatchObject({ revision: 1, blocks: [{ at, block: 'stone' }] })
@@ -357,13 +358,13 @@ describe('authoritative multiplayer server core', () => {
     aliceFrames.length = 0
 
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: near, block: 'stone',
+      _tag: 'BlockPlace', player: playerId('alice'), at: near, block: 'stone', state: 0,
     }).accepted).toBe(true)
     expect(fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), at: near,
     }).accepted).toBe(true)
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: far, block: 'dirt',
+      _tag: 'BlockPlace', player: playerId('alice'), at: far, block: 'dirt', state: 0,
     })).toEqual({ accepted: false, reason: 'invalid-mutation' })
     expect(fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), at: far,
@@ -387,7 +388,7 @@ describe('authoritative multiplayer server core', () => {
     aliceFrames.length = 0
 
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block,
+      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block, state: 0,
     })).toEqual({ accepted: false, reason: 'invalid-mutation' })
     expect(messages(aliceFrames)).toEqual([
       expect.objectContaining({ _tag: 'BlockMutationRejected', operation: 'place', reason, revision: 0 }),
@@ -402,7 +403,7 @@ describe('authoritative multiplayer server core', () => {
     aliceFrames.length = 0
 
     fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 1, y: 63, z: 1 }, block: 'dirt',
+      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 1, y: 63, z: 1 }, block: 'dirt', state: 0,
     })
     fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), at: { x: 3, y: 63, z: 0 },
@@ -418,7 +419,7 @@ describe('authoritative multiplayer server core', () => {
     fixture.receive('socket-a', join('alice'))
     fixture.receive('socket-b', join('bob'))
     fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 3, y: 64, z: 0 }, block: 'stone',
+      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 3, y: 64, z: 0 }, block: 'stone', state: 0,
     })
     aliceFrames.length = 0
 

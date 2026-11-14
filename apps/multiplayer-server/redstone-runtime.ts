@@ -5,6 +5,7 @@ import {
   planPistonTransition,
   RedstoneWorldRuntime,
   RedstoneWorldRuntimeLayer,
+  ContainerSlotSchema,
   type RedstoneComponentSnapshot,
   type RedstonePosition,
   type RedstoneWorldRuntimeService,
@@ -76,7 +77,7 @@ export interface MultiplayerRedstoneRealm {
 }
 
 export interface MultiplayerRedstoneRuntime {
-  readonly tick: (elapsedMs: number) => Result.Result<void, MultiplayerRedstoneTickFailure>
+  readonly tick: (elapsedMs: number) => Effect.Effect<Result.Result<void, MultiplayerRedstoneTickFailure>>
 }
 
 type RedstoneTickFailure = ReturnType<typeof DeltaTimeSecs.result> extends Result.Result<unknown, infer Failure> ? Failure : never
@@ -84,7 +85,7 @@ type RedstoneTickFailure = ReturnType<typeof DeltaTimeSecs.result> extends Resul
 export type MultiplayerRedstoneTickFailure =
   | Readonly<{ _tag: 'InvalidRedstoneTickDuration'; elapsedMs: number }>
   | Readonly<{ _tag: 'RedstoneDeltaTimeFailure'; failure: RedstoneTickFailure }>
-  | Readonly<{ _tag: 'RedstoneSchemaFailure'; operation: 'dimension' | 'position'; failure: Schema.SchemaError }>
+  | Readonly<{ _tag: 'RedstoneSchemaFailure'; operation: 'containerSlots' | 'dimension' | 'position'; failure: Schema.SchemaError }>
   | Readonly<{ _tag: 'RedstoneSnapshotSyncFailure'; failure: RedstoneSnapshotSyncFailure }>
   | Readonly<{ _tag: 'CoreBlockReadFailure'; failure: MultiplayerServerCoreFailure }>
   | Readonly<{ _tag: 'PistonCapabilityFailure'; failure: PistonCapabilityFailure }>
@@ -135,6 +136,12 @@ const componentForBlock = (
       }
       const containerSlots = core.readContainerSlots(inputFrom.success)
       if (Result.isFailure(containerSlots)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: containerSlots.failure })
+      const decodedContainerSlots = containerSlots.success === undefined
+        ? undefined
+        : Schema.decodeUnknownResult(Schema.Array(ContainerSlotSchema))(containerSlots.success)
+      if (decodedContainerSlots !== undefined && Result.isFailure(decodedContainerSlots)) {
+        return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'containerSlots', failure: decodedContainerSlots.failure })
+      }
       return Result.succeed({
         position,
         kind: 'comparator',
@@ -142,7 +149,7 @@ const componentForBlock = (
         outputTo: outputTo.success,
         sideInputs: [sideInputLeft.success, sideInputRight.success],
         mode: 'compare',
-        ...(containerSlots.success === undefined ? {} : { containerSlots: containerSlots.success }),
+        ...(decodedContainerSlots === undefined ? {} : { containerSlots: decodedContainerSlots.success }),
       })
     }
     case 'redstone_lamp':
@@ -185,98 +192,104 @@ export const makeMultiplayerRedstoneRuntime = async (
   return {
     tick: (elapsedMs) => {
       if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
-        return Result.fail({ _tag: 'InvalidRedstoneTickDuration', elapsedMs })
+        return Effect.succeed(Result.fail({ _tag: 'InvalidRedstoneTickDuration', elapsedMs }))
       }
       const elapsedSecsResult = DeltaTimeSecs.result(elapsedMs / 1_000)
       if (Result.isFailure(elapsedSecsResult)) {
-        return Result.fail({ _tag: 'RedstoneDeltaTimeFailure', failure: elapsedSecsResult.failure })
+        return Effect.succeed(Result.fail({ _tag: 'RedstoneDeltaTimeFailure', failure: elapsedSecsResult.failure }))
       }
-      for (const realm of realms) {
-        const components: Array<RedstoneComponentSnapshot> = []
-        for (const { at, block } of realm.core.snapshot().blocks) {
-          const component = componentForBlock(realm.core, block, at)
-          if (Result.isFailure(component)) return Result.fail(component.failure)
-          if (component.success !== undefined) components.push(component.success)
-        }
-        const dimension = Schema.decodeUnknownResult(DimensionIdSchema)(realm.dimension)
-        if (Result.isFailure(dimension)) {
-          return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'dimension', failure: dimension.failure })
-        }
-        const sync = Effect.runSync(Effect.result(runtime.syncSnapshot({ dimension: dimension.success, components })))
-        if (Result.isFailure(sync)) return Result.fail({ _tag: 'RedstoneSnapshotSyncFailure', failure: sync.failure })
-      }
-      for (const stage of stages) {
-        Effect.runSync(
-          stage.run(elapsedSecsResult.success).pipe(Effect.provide(ServerClockLayer)),
-        )
-      }
-      for (const event of Effect.runSync(runtime.drainHopperTransferEvents)) {
-        const result = realmsByDimension.get(event.dimension)?.core.applyHopperTransfer(event.position)
-        if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
-      }
-      for (const event of Effect.runSync(runtime.drainTriggerEvents)) {
-        const core = realmsByDimension.get(event.dimension)?.core
-        if (core === undefined) continue
-        let result: Result.Result<boolean, MultiplayerServerCoreFailure>
-        if (event.kind === 'dispenser') {
-          result = core.applyDispenserTrigger(event.position)
-        } else if (event.kind === 'dropper') {
-          result = core.applyDropperTrigger(event.position)
-        } else {
-          continue
-        }
-        if (Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
-      }
-      for (const event of Effect.runSync(runtime.drainLampTransitions)) {
-        const result = realmsByDimension.get(event.dimension)?.core.applyRedstoneBlockState(
-          event.position,
-          lampBlocks,
-          event.lit ? 'redstone_lamp_lit' : 'redstone_lamp',
-        )
-        if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
-      }
-      for (const event of Effect.runSync(runtime.drainPoweredComponentTransitions)) {
-        const core = realmsByDimension.get(event.dimension)?.core
-        if (event.kind === 'door') {
-          const result = core?.applyRedstoneBlockState(event.position, doorBlocks, event.powered ? 'door_open' : 'door')
-          if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
-        } else if (event.kind === 'powered-rail') {
-          const result = core?.applyPoweredRailState(event.position, event.powered)
-          if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
-        }
-      }
-      for (const event of Effect.runSync(runtime.drainPistonTransitions)) {
-        const realm = realmsByDimension.get(event.dimension)
-        if (realm === undefined) continue
-        const pistonCapabilities = makePistonCapabilities()
-        let pistonReadFailure: MultiplayerServerCoreFailure | undefined
-        const outcome = planPistonTransition(event, {
-          read: (at) => {
-            const read = realm.core.readPistonCell(at)
-            if (Result.isFailure(read)) {
-              pistonReadFailure ??= read.failure
-              return { kind: 'out-of-world' }
+      return Effect.gen(function* () {
+        for (const realm of realms) {
+          const components: Array<RedstoneComponentSnapshot> = []
+          for (const { at, block } of realm.core.snapshot().blocks) {
+            const position = Schema.decodeUnknownResult(BlockPositionSchema)(at)
+            if (Result.isFailure(position)) {
+              return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'position', failure: position.failure })
             }
-            return read.success
-          },
-        }, pistonCapabilities.capabilities)
-        if (pistonReadFailure !== undefined) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: pistonReadFailure })
-        const capabilityFailure = pistonCapabilities.failure()
-        if (capabilityFailure !== undefined) {
-          return Result.fail({ _tag: 'PistonCapabilityFailure', failure: capabilityFailure })
+            const component = componentForBlock(realm.core, block, position.success)
+            if (Result.isFailure(component)) return Result.fail(component.failure)
+            if (component.success !== undefined) components.push(component.success)
+          }
+          const dimension = Schema.decodeUnknownResult(DimensionIdSchema)(realm.dimension)
+          if (Result.isFailure(dimension)) {
+            return Result.fail({ _tag: 'RedstoneSchemaFailure', operation: 'dimension', failure: dimension.failure })
+          }
+          const sync = yield* Effect.result(runtime.syncSnapshot({ dimension: dimension.success, components }))
+          if (Result.isFailure(sync)) return Result.fail({ _tag: 'RedstoneSnapshotSyncFailure', failure: sync.failure })
         }
-        if (outcome.kind === 'failed') {
-          return Result.fail({
-            _tag: 'PistonCapabilityFailure',
-            failure: { _tag: 'BlockCapabilityResolutionFailure', failure: outcome.failure },
-          })
+        for (const stage of stages) {
+          Effect.runSync(
+            stage.run(elapsedSecsResult.success).pipe(Effect.provide(ServerClockLayer)),
+          )
         }
-        if (outcome.kind === 'move') {
-          const result = realm.core.applyPistonPlan(outcome.plan)
+        for (const event of Effect.runSync(runtime.drainHopperTransferEvents)) {
+          const result = realmsByDimension.get(event.dimension)?.core.applyHopperTransfer(event.position)
+          if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+        }
+        for (const event of Effect.runSync(runtime.drainTriggerEvents)) {
+          const core = realmsByDimension.get(event.dimension)?.core
+          if (core === undefined) continue
+          let result: Result.Result<boolean, MultiplayerServerCoreFailure>
+          if (event.kind === 'dispenser') {
+            result = core.applyDispenserTrigger(event.position)
+          } else if (event.kind === 'dropper') {
+            result = core.applyDropperTrigger(event.position)
+          } else {
+            continue
+          }
           if (Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
         }
-      }
-      return Result.succeed(undefined)
+        for (const event of Effect.runSync(runtime.drainLampTransitions)) {
+          const result = realmsByDimension.get(event.dimension)?.core.applyRedstoneBlockState(
+            event.position,
+            lampBlocks,
+            event.lit ? 'redstone_lamp_lit' : 'redstone_lamp',
+          )
+          if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+        }
+        for (const event of Effect.runSync(runtime.drainPoweredComponentTransitions)) {
+          const core = realmsByDimension.get(event.dimension)?.core
+          if (event.kind === 'door') {
+            const result = core?.applyRedstoneBlockState(event.position, doorBlocks, event.powered ? 'door_open' : 'door')
+            if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          } else if (event.kind === 'powered-rail') {
+            const result = core?.applyPoweredRailState(event.position, event.powered)
+            if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          }
+        }
+        for (const event of Effect.runSync(runtime.drainPistonTransitions)) {
+          const realm = realmsByDimension.get(event.dimension)
+          if (realm === undefined) continue
+          const pistonCapabilities = makePistonCapabilities()
+          let pistonReadFailure: MultiplayerServerCoreFailure | undefined
+          const outcome = planPistonTransition(event, {
+            read: (at) => {
+              const read = realm.core.readPistonCell(at)
+              if (Result.isFailure(read)) {
+                pistonReadFailure ??= read.failure
+                return { kind: 'out-of-world' }
+              }
+              return read.success
+            }
+          }, pistonCapabilities.capabilities)
+          if (pistonReadFailure !== undefined) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: pistonReadFailure })
+          const capabilityFailure = pistonCapabilities.failure()
+          if (capabilityFailure !== undefined) {
+            return Result.fail({ _tag: 'PistonCapabilityFailure', failure: capabilityFailure })
+          }
+          if (outcome.kind === 'failed') {
+            return Result.fail({
+              _tag: 'PistonCapabilityFailure',
+              failure: { _tag: 'BlockCapabilityResolutionFailure', failure: outcome.failure },
+            })
+          }
+          if (outcome.kind === 'move') {
+            const result = realm.core.applyPistonPlan(outcome.plan)
+            if (Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          }
+        }
+        return Result.succeed(undefined)
+      })
     },
   }
 }

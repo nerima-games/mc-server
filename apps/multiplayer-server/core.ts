@@ -8,6 +8,7 @@ import {
   type AuthoritativeEntityState,
   type AuthoritativeSnapshot,
   type BlockMutationRejected,
+  BlockPlace,
   type BlockPos,
   type CommandId,
   type CommandRejectionReason,
@@ -25,7 +26,7 @@ import {
   type HungerCommand,
   type HungerEvent,
 } from '@nerima-games/mx-multiplayer'
-import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type Dimension } from '@nerima-games/mc-worldgen'
 import { advanceFurnace, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
@@ -222,6 +223,7 @@ type FurnaceAdvanceFailure = SimFurnaceFailure | FurnaceStateConstructionFailure
 type ExplosionPlanFailure = ResultFailure<ReturnType<typeof planExplosion>>
 type BlockRegistryFailure = ResultFailure<ReturnType<typeof propertyOfBlockId> | ReturnType<typeof blockTypeOfId>>
 type BlockIdFailure = ResultFailure<ReturnType<typeof BlockId.result>>
+type StackCountFailure = ResultFailure<ReturnType<typeof StackCount.result>>
 type GeneratedBlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
 type GeneratedNoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result>>
 type GeneratedChunkFailure = ResultFailure<ReturnType<typeof generateChunkAt>>
@@ -261,6 +263,8 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'FishingEquipmentFailure'; failure: FishingEquipmentFailure }>
   | Readonly<{ _tag: 'FishingLootFailure'; failure: FishingLootFailure }>
   | Readonly<{ _tag: 'ItemStackFailure'; failure: CanonicalItemStackFailure }>
+  | Readonly<{ _tag: 'StackCountFailure'; failure: StackCountFailure }>
+  | Readonly<{ _tag: 'BlockPlaceSchemaFailure'; failure: Schema.SchemaError }>
   | Readonly<{ _tag: 'CraftingFailure'; failure: CraftingFailure }>
   | Readonly<{ _tag: 'ExperienceFailure'; failure: ExperienceFailure }>
   | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
@@ -2274,6 +2278,28 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           replacement = 'bucket'
         }
 
+        let blockMessage: NetworkMessage
+        if (block === null) {
+          blockMessage = { _tag: 'BlockBreak', player: message.player, world: actor.world, at }
+        } else {
+          const placed = Schema.decodeUnknownResult(BlockPlace)({
+            _tag: 'BlockPlace',
+            player: message.player,
+            world: actor.world,
+            at,
+            block,
+            state: 0,
+          })
+          if (Result.isFailure(placed)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'BlockPlaceSchemaFailure', failure: placed.failure },
+            }
+          }
+          blockMessage = placed.success
+        }
+
         const nextSlots = inventory.slots.map((stack) => stack === null ? null : { ...stack })
         const nextDurability = inventory.durability.map((state) => state === null ? null : { ...state })
         if (selected.count === 1) {
@@ -2299,9 +2325,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             player: message.player,
             state: inventorySnapshot(inventory),
           }],
-          messages: () => [block === null
-            ? { _tag: 'BlockBreak' as const, player: message.player, world: actor.world, at }
-            : { _tag: 'BlockPlace' as const, player: message.player, world: actor.world, at, block }],
+          messages: () => [blockMessage],
         }
       }
       case 'FishingCommand': {
@@ -2891,7 +2915,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           const current = nextSlots[slot]
           if (current == null || current.item !== inputStack.success.item) continue
           const moved = Math.min(current.count, remainingInput)
-          nextSlots[slot] = current.count === moved ? null : { ...current, count: current.count - moved }
+          if (current.count === moved) {
+            nextSlots[slot] = null
+          } else {
+            const count = StackCount.result(current.count - moved)
+            if (Result.isFailure(count)) {
+              return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StackCountFailure', failure: count.failure } }
+            }
+            nextSlots[slot] = { ...current, count: count.success }
+          }
           remainingInput -= moved
         }
         if (remainingInput > 0) return { accepted: false, reason: 'insufficient-items' }
@@ -2901,13 +2933,21 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           const current = nextSlots[slot]
           if (current == null || current.item !== outputStack.success.item || current.count >= maxStackCount) continue
           const moved = Math.min(maxStackCount - current.count, remainingOutput)
-          nextSlots[slot] = { ...current, count: current.count + moved }
+          const count = StackCount.result(current.count + moved)
+          if (Result.isFailure(count)) {
+            return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StackCountFailure', failure: count.failure } }
+          }
+          nextSlots[slot] = { ...current, count: count.success }
           remainingOutput -= moved
         }
         for (let slot = 0; slot < nextSlots.length && remainingOutput > 0; slot += 1) {
           if (nextSlots[slot] != null) continue
           const moved = Math.min(maxStackCount, remainingOutput)
-          nextSlots[slot] = { item: outputStack.success.item, count: moved }
+          const count = StackCount.result(moved)
+          if (Result.isFailure(count)) {
+            return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StackCountFailure', failure: count.failure } }
+          }
+          nextSlots[slot] = { item: outputStack.success.item, count: count.success }
           remainingOutput -= moved
         }
         if (remainingOutput > 0) return { accepted: false, reason: 'invalid-command' }

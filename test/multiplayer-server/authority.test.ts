@@ -10,7 +10,7 @@ import {
   type WireText,
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
-import { Result } from 'effect'
+import { Effect, Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -3202,6 +3202,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 1, y: 64, z: 0 },
       block: 'chest',
+      state: 0,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'PlayerInventoryCommand',
@@ -3217,6 +3218,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 2, y: 64, z: 0 },
       block: 'furnace',
+      state: 0,
     }).accepted).toBe(true)
 
     expect(fixture.persisted.at(-1)).toMatchObject({
@@ -3291,7 +3293,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(400)
+    await Effect.runPromise(runtime.tick(400))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3307,7 +3309,7 @@ describe('multiplayer server authoritative state', () => {
     ]))
 
     fixture.sent.length = 0
-    runtime.tick(400)
+    await Effect.runPromise(runtime.tick(400))
 
     expect(fixture.persisted).toHaveLength(2)
     expect(fixture.persisted[1]).toMatchObject({
@@ -3338,7 +3340,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3375,7 +3377,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3410,7 +3412,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3442,7 +3444,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3506,7 +3508,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3529,7 +3531,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3558,7 +3560,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3573,7 +3575,7 @@ describe('multiplayer server authoritative state', () => {
       }),
     ]))
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
     expect(fixture.persisted).toHaveLength(1)
 
     expect(fixture.server.applyPoweredRailState({ x: 1, y: 64, z: 0 }, false)).toEqual(Result.succeed(true))
@@ -3598,7 +3600,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.server }])
 
-    runtime.tick(100)
+    await Effect.runPromise(runtime.tick(100))
 
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
@@ -3648,6 +3650,7 @@ describe('multiplayer server authoritative state', () => {
         world: worldId('world-1'),
         at: { x: 1, y: 64, z: 0 },
         block: kind,
+        state: 0,
       }).accepted).toBe(true)
       expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
         _tag: 'AuthoritativeSnapshot',
@@ -3670,6 +3673,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 1, y: 64, z: 0 },
       block: 'stone',
+      state: 0,
     })).toEqual({
       accepted: true,
       message: expect.objectContaining({ _tag: 'BlockPlace', block: 'stone' }),
@@ -3689,6 +3693,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 2, y: 64, z: 0 },
       block: 'stone',
+      state: 0,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3696,6 +3701,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 0, y: 64, z: 1 },
       block: 'stone',
+      state: 0,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3703,6 +3709,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 3, y: 64, z: 0 },
       block: 'stone',
+      state: 0,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3710,6 +3717,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 4, y: 64, z: 0 },
       block: 'stone',
+      state: 0,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3717,6 +3725,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 0, y: 64, z: 2 },
       block: 'stone',
+      state: 0,
     })).toEqual({ accepted: false, reason: 'invalid-mutation' })
     expect(fixture.persisted.at(-1)).toMatchObject({ revision: 9 })
   })

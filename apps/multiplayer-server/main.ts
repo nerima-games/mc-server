@@ -42,7 +42,7 @@ import {
   isValidBrewingStandState,
   isValidStatusEffectState,
 } from '@nerima-games/mx-gameplay'
-import { Result, Schema } from 'effect'
+import { Effect, Result, Schema } from 'effect'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import { isValidAnvilName } from '../multiplayer-shared/anvil-network.js'
@@ -924,24 +924,27 @@ export const startMultiplayerServer = async (
 
   const port = await listen(server, options.port, options.host)
   let lastTickAt = performance.now()
+  let pendingServerTick: Promise<void> = Promise.resolve()
   const serverTickTimer = setInterval(() => {
     const now = performance.now()
     const elapsedMs = now - lastTickAt
     lastTickAt = now
-    const redstoneResult = redstoneRuntime.tick(elapsedMs)
-    if (Result.isFailure(redstoneResult)) {
-      console.error('Multiplayer redstone tick failed', { failure: redstoneResult.failure })
-    }
-    for (const [worldId, core] of [
-      [options.worldId, overworldCore],
-      ['nether', netherCore],
-      ['end', endCore],
-    ] as const) {
-      const result = core.tick(elapsedMs)
-      if (Result.isFailure(result)) {
-        console.error('Multiplayer tick failed', { worldId, failure: result.failure })
+    pendingServerTick = pendingServerTick.then(async () => {
+      const redstoneResult = await Effect.runPromise(redstoneRuntime.tick(elapsedMs))
+      if (Result.isFailure(redstoneResult)) {
+        console.error('Multiplayer redstone tick failed', { failure: redstoneResult.failure })
       }
-    }
+      for (const [worldId, core] of [
+        [options.worldId, overworldCore],
+        ['nether', netherCore],
+        ['end', endCore],
+      ] as const) {
+        const result = core.tick(elapsedMs)
+        if (Result.isFailure(result)) {
+          console.error('Multiplayer tick failed', { worldId, failure: result.failure })
+        }
+      }
+    })
   }, 50)
   let closing: Promise<void> | undefined
   const signalHandlers = new Map<NodeJS.Signals, () => void>()
@@ -954,6 +957,7 @@ export const startMultiplayerServer = async (
       sockets.close()
       server.close((error) => error === undefined ? resolve() : reject(error))
     }).then(async () => {
+      await pendingServerTick
       await Promise.all([persistence?.drain(), netherPersistence?.drain(), endPersistence?.drain()])
     })
     return closing
