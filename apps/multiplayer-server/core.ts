@@ -2910,7 +2910,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'invalid-command', failure: { _tag: 'ItemStackFailure', failure: outputStack.failure } }
         }
         const nextSlots = inventory.slots.map(cloneStack)
-        let remainingInput = inputStack.success.count
+        let remainingInput: number = inputStack.success.count
         for (let slot = 0; slot < nextSlots.length && remainingInput > 0; slot += 1) {
           const current = nextSlots[slot]
           if (current == null || current.item !== inputStack.success.item) continue
@@ -2927,7 +2927,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           remainingInput -= moved
         }
         if (remainingInput > 0) return { accepted: false, reason: 'insufficient-items' }
-        let remainingOutput = outputStack.success.count
+        let remainingOutput: number = outputStack.success.count
         const maxStackCount = maxStackCountOfItem(outputStack.success.item)
         for (let slot = 0; slot < nextSlots.length && remainingOutput > 0; slot += 1) {
           const current = nextSlots[slot]
