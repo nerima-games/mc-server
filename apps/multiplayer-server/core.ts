@@ -25,10 +25,10 @@ import {
   type HungerCommand,
   type HungerEvent,
 } from '@nerima-games/mx-multiplayer'
-import { blockIdOf, blockTypeOfId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, propertyOfBlockId, StackCount, type ItemType } from '@nerima-games/mc-kernel'
+import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { END_PORTAL_BLOCK, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, nearestStrongholdSite, type Dimension } from '@nerima-games/mc-worldgen'
-import { EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, forwardVector, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, totalExperienceAtLevel, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
+import { END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type Dimension } from '@nerima-games/mc-worldgen'
+import { EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -129,7 +129,7 @@ import {
   type EnderDragonEncounterSnapshot,
   type EnchantedItem,
 } from '@nerima-games/mx-gameplay'
-import { Option } from 'effect'
+import { Option, Result } from 'effect'
 import {
   SleepAuthority,
   decodeSleepWireMessage,
@@ -204,6 +204,86 @@ import {
 export type ClientId = string
 export type SendFrame = (frame: WireText) => void
 
+type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
+type WitherOperation = 'match-summon' | 'summon' | 'damage' | 'advance'
+type WitherRuntimeFailure = ResultFailure<
+  | ReturnType<typeof matchRuntimeWitherSummon>
+  | ReturnType<typeof summonRuntimeWither>
+  | ReturnType<typeof damageRuntimeWither>
+  | ReturnType<typeof advanceWitherRuntime>
+>
+type FurnaceAdvanceFailure = ResultFailure<ReturnType<typeof planFurnaceAdvance>>
+type ExplosionPlanFailure = ResultFailure<ReturnType<typeof planExplosion>>
+type BlockRegistryFailure = ResultFailure<ReturnType<typeof propertyOfBlockId> | ReturnType<typeof blockTypeOfId>>
+type BlockIdFailure = ResultFailure<ReturnType<typeof BlockId.result>>
+type GeneratedBlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
+type GeneratedNoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result>>
+type GeneratedChunkFailure = ResultFailure<ReturnType<typeof generateChunkAt>>
+type CameraPoseFailure = ResultFailure<ReturnType<typeof targetBlockFromPlayerPose> | ReturnType<typeof forwardVector>>
+type PositionFailure = ResultFailure<ReturnType<typeof PositionAxis.result>>
+type CameraOperationFailure = CameraPoseFailure | PositionFailure
+type NoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result>>
+type BlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
+type FishingEquipmentFailure = ResultFailure<ReturnType<typeof itemStack> | ReturnType<typeof equipmentItem>>
+type CraftingFailure = ResultFailure<typeof STARTER_RECIPES | ReturnType<typeof craftGrid> | ReturnType<typeof craftFromGrid>>
+type ExperienceFailure = ResultFailure<ReturnType<typeof TotalExperience.result> | ReturnType<typeof ExperienceLevel.result>>
+type ProjectileFailure = ResultFailure<ReturnType<typeof raycastArrowBlock>>
+type AnvilPlanFailure = ResultFailure<ReturnType<typeof planAnvilOperation>>
+type AnvilExperienceSpendFailure = ResultFailure<ReturnType<typeof spendExperienceLevels>>
+
+export type GeneratedBlockReadFailure =
+  | Readonly<{ _tag: 'GeneratedNoiseSeedFailure'; failure: GeneratedNoiseSeedFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockAxisFailure'; axis: 'x' | 'y' | 'z'; failure: GeneratedBlockAxisFailure }>
+  | Readonly<{ _tag: 'GeneratedChunkFailure'; failure: GeneratedChunkFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockIdFailure'; failure: BlockIdFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockRegistryFailure'; failure: BlockRegistryFailure }>
+
+export type MultiplayerServerCoreFailure =
+  | Readonly<{ _tag: 'WitherRuntimeFailure'; operation: WitherOperation; failure: WitherRuntimeFailure }>
+  | Readonly<{ _tag: 'FurnaceAdvanceFailure'; failure: FurnaceAdvanceFailure }>
+  | Readonly<{ _tag: 'ExplosionPlanFailure'; failure: ExplosionPlanFailure }>
+  | Readonly<{ _tag: 'BlockRegistryFailure'; failure: BlockRegistryFailure }>
+  | Readonly<{ _tag: 'BlockRegistryLookupFailure'; operation: 'environmental-contact' | 'falling-block' | 'block-break'; block: string }>
+  | Readonly<{ _tag: 'BlockIdFailure'; failure: BlockIdFailure }>
+  | Readonly<{ _tag: 'UnresolvedBlockId'; blockId: number }>
+  | Readonly<{ _tag: 'CameraPoseFailure'; operation: 'target' | 'forward'; failure: CameraOperationFailure }>
+  | Readonly<{ _tag: 'BlockAxisBrandFailure'; axis: 'x' | 'z'; failure: BlockAxisFailure }>
+  | Readonly<{ _tag: 'PositionBrandFailure'; failure: PositionFailure }>
+  | Readonly<{ _tag: 'NoiseSeedBrandFailure'; failure: NoiseSeedFailure }>
+  | Readonly<{ _tag: 'FishingEquipmentFailure'; failure: FishingEquipmentFailure }>
+  | Readonly<{ _tag: 'CraftingFailure'; failure: CraftingFailure }>
+  | Readonly<{ _tag: 'ExperienceFailure'; failure: ExperienceFailure }>
+  | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
+  | Readonly<{ _tag: 'AnvilPlanFailure'; failure: AnvilPlanFailure }>
+  | Readonly<{ _tag: 'AnvilExperienceSpendFailure'; failure: AnvilExperienceSpendFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockReadFailure'; failure: GeneratedBlockReadFailure }>
+  | Readonly<{ _tag: 'InvalidServerTickDuration'; elapsedMs: number }>
+
+const positionFromNumbers = (x: number, y: number, z: number): Result.Result<Position, PositionFailure> => {
+  const brandedX = PositionAxis.result(x)
+  if (Result.isFailure(brandedX)) return Result.fail(brandedX.failure)
+  const brandedY = PositionAxis.result(y)
+  if (Result.isFailure(brandedY)) return Result.fail(brandedY.failure)
+  const brandedZ = PositionAxis.result(z)
+  if (Result.isFailure(brandedZ)) return Result.fail(brandedZ.failure)
+  return Result.succeed({ x: brandedX.success, y: brandedY.success, z: brandedZ.success })
+}
+
+const targetBlockFromNumbers = (
+  at: Readonly<{ x: number; y: number; z: number }>,
+  facing: Orientation,
+  maxDistance: number,
+  isTargetable: (x: number, y: number, z: number) => boolean,
+): Result.Result<Option.Option<BlockTarget>, CameraOperationFailure> => {
+  const position = positionFromNumbers(at.x, at.y, at.z)
+  if (Result.isFailure(position)) return Result.fail(position.failure)
+  return targetBlockFromPlayerPose({
+    feetPosition: position.success,
+    yawRadians: facing.yawRadians,
+    pitchRadians: facing.pitchRadians,
+  }, maxDistance, isTargetable)
+}
+
 export const playerDamageResultKey = (player: PlayerId, commandId: string): string =>
   JSON.stringify([player, commandId])
 
@@ -239,7 +319,7 @@ export interface MultiplayerServerOptions {
     minZ: number
     maxZ: number
   }>
-  readonly generatedBlockAt?: (position: BlockPos) => string | null
+  readonly generatedBlockAt?: (position: BlockPos) => Result.Result<string | null, GeneratedBlockReadFailure>
   readonly staticBlocks?: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null }>>
   readonly spawnAt: BlockPos
   readonly initialState?: MultiplayerServerState
@@ -302,7 +382,7 @@ export interface MultiplayerServerState {
 
 export type ReceiveResult =
   | Readonly<{ accepted: true; message: NetworkMessage | SleepWireMessage | WitherWireMessage | EnderDragonWireMessage | PlayerDamageWireMessage | CraftingCommand | BrewingCommand | AnvilCommand | EnchantingCommand }>
-  | Readonly<{ accepted: false; reason: 'unknown-client' | 'malformed-frame' | 'join-required' | 'duplicate-player' | 'identity-spoof' | 'wrong-world' | 'invalid-movement' | 'invalid-mutation' | 'invalid-command' }>
+  | Readonly<{ accepted: false; reason: 'unknown-client' | 'malformed-frame' | 'join-required' | 'duplicate-player' | 'identity-spoof' | 'wrong-world' | 'invalid-movement' | 'invalid-mutation' | 'invalid-command'; failure?: MultiplayerServerCoreFailure }>
 
 type RejectedReceiveReason = Extract<ReceiveResult, { accepted: false }>['reason']
 
@@ -488,7 +568,7 @@ interface MutableFurnaceState {
 }
 
 type CommandDecision =
-  | Readonly<{ accepted: false; reason: CommandRejectionReason }>
+  | Readonly<{ accepted: false; reason: CommandRejectionReason; failure?: MultiplayerServerCoreFailure }>
   | Readonly<{
       accepted: true
       deltas: (revision: number) => ReadonlyArray<AuthoritativeDelta>
@@ -536,9 +616,9 @@ const WITHER_TARGET_RANGE = 64
 const ENDER_DRAGON_INTERACTION_RANGE = 8
 const ENDER_DRAGON_ATTACK_DAMAGE = 4
 const ENDER_DRAGON_ATTACK_COOLDOWN_MS = 500
-const END_EXIT_PORTAL_BLOCK = blockTypeOfId(END_PORTAL_BLOCK.PORTAL) ?? 'end_portal'
-const END_PORTAL_FRAME_EMPTY_BLOCK = blockTypeOfId(END_PORTAL_BLOCK.FRAME_EMPTY) ?? 'end_portal_frame'
-const END_PORTAL_FRAME_FILLED_BLOCK = blockTypeOfId(END_PORTAL_BLOCK.FRAME_FILLED) ?? 'end_portal_frame_filled'
+const END_EXIT_PORTAL_BLOCK = 'end_portal'
+const END_PORTAL_FRAME_EMPTY_BLOCK = 'end_portal_frame'
+const END_PORTAL_FRAME_FILLED_BLOCK = 'end_portal_frame_filled'
 const positionKey = ({ x, y, z }: BlockPos): string => `${String(x)},${String(y)},${String(z)}`
 
 const vitalsSnapshot = (state: MutableVitalsState): VitalsState => ({ ...state })
@@ -633,21 +713,21 @@ export interface MultiplayerServerCore {
   readonly detachPlayer: (clientId: ClientId) => RealmTransferPlayer | undefined
   readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival) => boolean
   readonly snapshot: () => WorldSnapshot
-  readonly applyHopperTransfer: (at: BlockPos) => boolean
-  readonly applyDispenserTrigger: (at: BlockPos) => boolean
-  readonly applyDropperTrigger: (at: BlockPos) => boolean
+  readonly applyHopperTransfer: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyDispenserTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyDropperTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
   readonly applyRedstoneBlockState: (
     at: BlockPos,
     expectedBlocks: ReadonlySet<RedstoneStatefulBlock>,
     nextBlock: RedstoneStatefulBlock,
-  ) => boolean
-  readonly isPoweredRailPowered: (at: BlockPos) => boolean
-  readonly applyPoweredRailState: (at: BlockPos, powered: boolean) => boolean
-  readonly isLeverActive: (at: BlockPos) => boolean
-  readonly readContainerSlots: (at: BlockPos) => ReadonlyArray<ContainerSlotSnapshot> | undefined
-  readonly readPistonCell: (at: BlockPos) => PistonCellRead
-  readonly applyPistonPlan: (plan: PistonMovementPlan) => boolean
-  readonly tick: (elapsedMs: number) => void
+  ) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly isPoweredRailPowered: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyPoweredRailState: (at: BlockPos, powered: boolean) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly isLeverActive: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly readContainerSlots: (at: BlockPos) => Result.Result<ReadonlyArray<ContainerSlotSnapshot> | undefined, MultiplayerServerCoreFailure>
+  readonly readPistonCell: (at: BlockPos) => Result.Result<PistonCellRead, MultiplayerServerCoreFailure>
+  readonly applyPistonPlan: (plan: PistonMovementPlan) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly tick: (elapsedMs: number) => Result.Result<void, MultiplayerServerCoreFailure>
   readonly spawnEntity: (entity: AuthoritativeEntityState) => boolean
 }
 
@@ -863,6 +943,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const lastEnderDragonAttackMs = new Map<PlayerId, number>()
   const hungerActors = new Map<PlayerId, HungerActor>()
   let hungerTickRemainderMs = 0
+  let sleepBlockReadFailure: MultiplayerServerCoreFailure | undefined
   const sleepAuthority = new SleepAuthority({
     world: worldId,
     revision: 0,
@@ -885,7 +966,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         && Math.abs(entity.at.z - bed.z) <= 8)
       return {
         dimension: worldId,
-        bedValid: dimension === 'overworld' && withinReach && blockAt(bed) === 'bed',
+        bedValid: (() => {
+          if (dimension !== 'overworld' || !withinReach) return false
+          const block = blockAt(bed)
+          if (Result.isFailure(block)) {
+            sleepBlockReadFailure ??= block.failure
+            return false
+          }
+          return block.success === 'bed'
+        })(),
         nightOrThunder: timeWeather.weather === 'thunder' || timeWeather.timeOfDay >= 12_542,
         safe: !hostileNearby,
       }
@@ -894,7 +983,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
   const sendMessage = (client: ConnectedClient, message: NetworkMessage): void => {
     const encoded = encodeFrame(message)
-    if (encoded._tag === 'Right') client.send(encoded.right)
+    if (Result.isSuccess(encoded)) client.send(encoded.success)
   }
 
   const broadcast = (message: NetworkMessage, except?: ClientId): void => {
@@ -1110,12 +1199,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return Number.isFinite(distance) && distance <= BLOCK_INTERACTION_RANGE
   }
 
-  const blockAt = (at: BlockPos): string | null => {
+  const blockAt = (at: BlockPos): Result.Result<string | null, MultiplayerServerCoreFailure> => {
     const override = blocks.get(positionKey(at))
-    return override === undefined ? (options.generatedBlockAt?.(at) ?? null) : override.block
+    if (override !== undefined) return Result.succeed(override.block)
+    const generated = options.generatedBlockAt?.(at) ?? Result.succeed(null)
+    return Result.isFailure(generated)
+      ? Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: generated.failure })
+      : Result.succeed(generated.success)
   }
 
-  const environmentalContactsAt = (at: PlayerSnapshot['at']): ReadonlyArray<EnvironmentalContact> => {
+  const environmentalContactsAt = (at: PlayerSnapshot['at']): Result.Result<ReadonlyArray<EnvironmentalContact>, MultiplayerServerCoreFailure> => {
     const minX = at.x - PLAYER_HALF_WIDTH
     const maxX = at.x + PLAYER_HALF_WIDTH
     const minY = at.y
@@ -1134,10 +1227,19 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     for (let x = Math.floor(minX); x < Math.ceil(maxX); x += 1) {
       for (let y = Math.floor(minY); y < Math.ceil(maxY); y += 1) {
         for (let z = Math.floor(minZ); z < Math.ceil(maxZ); z += 1) {
-          const block = blockAt({ x, y, z })
+          const blockResult = blockAt({ x, y, z })
+          if (Result.isFailure(blockResult)) return Result.fail(blockResult.failure)
+          const block = blockResult.success
           if (block !== 'lava' && block !== 'cactus') continue
-          const contactDamage = propertyOfBlockId(blockIdOf(block), 'contactDamage')
-          if (contactDamage === undefined) continue
+          const blockId = blockIdOf(block)
+          if (Option.isNone(blockId)) {
+            return Result.fail({ _tag: 'BlockRegistryLookupFailure', operation: 'environmental-contact', block })
+          }
+          const contactDamageResult = propertyOfBlockId(blockId.value, 'contactDamage')
+          if (Result.isFailure(contactDamageResult)) {
+            return Result.fail({ _tag: 'BlockRegistryFailure', failure: contactDamageResult.failure })
+          }
+          const contactDamage = contactDamageResult.success
           const touches = block === 'lava'
             ? overlaps(minX, maxX, x) && overlaps(minY, maxY, y) && overlaps(minZ, maxZ, z)
             : overlaps(minY, maxY, y)
@@ -1147,29 +1249,34 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         }
       }
     }
-    return [...contacts.values()]
+    return Result.succeed([...contacts.values()])
   }
 
-  const readPistonCell = (at: BlockPos): PistonCellRead => {
-    if (!isInBounds(at)) return { kind: 'out-of-world' }
+  const readPistonCell = (at: BlockPos): Result.Result<PistonCellRead, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed({ kind: 'out-of-world' })
     const block = blockAt(at)
-    return block === null ? { kind: 'empty' } : { kind: 'block', block }
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === null ? { kind: 'empty' } : { kind: 'block', block: block.success })
   }
 
-  const fishingEnvironmentAt = (water: BlockPos) => {
+  const fishingEnvironmentAt = (water: BlockPos): Result.Result<Readonly<{ hasWater: boolean; hasSkyAccess: boolean; isRaining: boolean; isOpenWater: boolean }>, MultiplayerServerCoreFailure> => {
     let hasSkyAccess = true
     for (let y = water.y + 1; y <= bounds.maxY; y += 1) {
-      if (blockAt({ x: water.x, y, z: water.z }) !== null) {
+      const block = blockAt({ x: water.x, y, z: water.z })
+      if (Result.isFailure(block)) return Result.fail(block.failure)
+      if (block.success !== null) {
         hasSkyAccess = false
         break
       }
     }
-    return {
-      hasWater: blockAt(water) === 'water',
+    const block = blockAt(water)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed({
+      hasWater: block.success === 'water',
       hasSkyAccess,
       isRaining: timeWeather.weather === 'rain' || timeWeather.weather === 'thunder',
       isOpenWater: false,
-    }
+    })
   }
 
   const disturbFallingBlocks = (positions: Iterable<BlockPos>): void => {
@@ -1180,25 +1287,62 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
   }
 
-  const applyPendingFallingBlocks = (): boolean => {
+  const applyPendingFallingBlocks = (): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const targets = Array.from(fallingPending.values()).slice(0, FALLING_BLOCK_MOVES_PER_TICK)
-    for (const target of targets) fallingPending.delete(positionKey(target))
+    let registryLookupFailure: string | undefined
+    let blockReadFailure: MultiplayerServerCoreFailure | undefined
     const moves = planFallingBlockMoves(targets, (at) => {
       if (!isInBounds(at)) return undefined
-      const block = blockAt(at)
-      return block === null ? blockIdOf('air') : isBlockType(block) ? blockIdOf(block) : undefined
+      const blockResult = blockAt(at)
+      if (Result.isFailure(blockResult)) {
+        blockReadFailure ??= blockResult.failure
+        return undefined
+      }
+      const block = blockResult.success
+      if (block !== null && !isBlockType(block)) {
+        registryLookupFailure ??= block
+        return undefined
+      }
+      const blockId = blockIdOf(block ?? 'air')
+      if (Option.isNone(blockId)) {
+        registryLookupFailure ??= block ?? 'air'
+        return undefined
+      }
+      return blockId.value
     })
+    if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
+    if (registryLookupFailure !== undefined) {
+      return Result.fail({
+        _tag: 'BlockRegistryLookupFailure',
+        operation: 'falling-block',
+        block: registryLookupFailure,
+      })
+    }
+    const resolvedMoves: Array<Readonly<{ source: BlockPos; target: BlockPos; block: string }>> = []
     for (const move of moves) {
-      const block = blockTypeOfId(move.blockId)
-      if (block === undefined) continue
+      const blockId = BlockId.result(move.blockId)
+      if (Result.isFailure(blockId)) {
+        return Result.fail({ _tag: 'BlockIdFailure', failure: blockId.failure })
+      }
+      const blockResult = blockTypeOfId(blockId.success)
+      if (Result.isFailure(blockResult)) {
+        return Result.fail({ _tag: 'BlockRegistryFailure', failure: blockResult.failure })
+      }
+      if (blockResult.success === undefined) {
+        return Result.fail({ _tag: 'UnresolvedBlockId', blockId: move.blockId })
+      }
+      resolvedMoves.push({ source: move.source, target: move.target, block: blockResult.success })
+    }
+    for (const target of targets) fallingPending.delete(positionKey(target))
+    for (const move of resolvedMoves) {
       blocks.set(positionKey(move.source), { at: move.source, block: null })
-      blocks.set(positionKey(move.target), { at: move.target, block })
+      blocks.set(positionKey(move.target), { at: move.target, block: move.block })
       disturbFallingBlocks([
         { x: move.target.x, y: move.target.y - 1, z: move.target.z },
         move.source,
       ])
     }
-    return moves.length > 0
+    return Result.succeed(resolvedMoves.length > 0)
   }
 
   const containerIdAt = (at: BlockPos): string =>
@@ -1238,11 +1382,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     player: PlayerId,
     at: BlockPos,
     expectedBlock: ContainerKind | 'furnace' | 'brewing_stand',
-  ): CommandRejectionReason | null => {
+  ): Result.Result<CommandRejectionReason | null, MultiplayerServerCoreFailure> => {
     const actor = players.get(player)
-    if (actor === undefined) return 'resource-not-found'
-    if (actor.world !== worldId || blockAt(at) !== expectedBlock) return 'invalid-command'
-    return isBlockWithinReach(actor, at) ? null : 'out-of-range'
+    if (actor === undefined) return Result.succeed('resource-not-found')
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    if (actor.world !== worldId || block.success !== expectedBlock) return Result.succeed('invalid-command')
+    return Result.succeed(isBlockWithinReach(actor, at) ? null : 'out-of-range')
   }
 
   const brewingBottleFromItem = (item: string): BrewingBottle | undefined => {
@@ -1304,21 +1450,24 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
   const notifyStateChanged = (): void => options.onStateChanged?.(persistentState())
 
-  const containerAt = (position: BlockPos): MutableContainerState | undefined => {
-    if (!isInBounds(position)) return undefined
-    const expectedKind = containerKindForBlock(blockAt(position) ?? '')
+  const containerAt = (position: BlockPos): Result.Result<MutableContainerState | undefined, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(position)) return Result.succeed(undefined)
+    const block = blockAt(position)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    const expectedKind = containerKindForBlock(block.success ?? '')
     const container = containers.get(containerIdAt(position))
-    return expectedKind === undefined || container?.kind !== expectedKind ? undefined : container
+    return Result.succeed(expectedKind === undefined || container?.kind !== expectedKind ? undefined : container)
   }
 
-  const readContainerSlots = (at: BlockPos): ReadonlyArray<ContainerSlotSnapshot> | undefined => {
+  const readContainerSlots = (at: BlockPos): Result.Result<ReadonlyArray<ContainerSlotSnapshot> | undefined, MultiplayerServerCoreFailure> => {
     const container = containerAt(at)
-    return container?.slots.map((stack) => stack === null || stack === undefined
+    if (Result.isFailure(container)) return Result.fail(container.failure)
+    return Result.succeed(container.success?.slots.map((stack) => stack === null || stack === undefined
       ? { count: 0, maxStack: 64 }
-      : { count: stack.count, maxStack: isItemType(stack.item) ? maxStackCountOfItem(stack.item) : 64 })
+      : { count: stack.count, maxStack: isItemType(stack.item) ? maxStackCountOfItem(stack.item) : 64 }))
   }
 
-  const applyHopperTransfer = (at: BlockPos): boolean => {
+  const applyHopperTransfer = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const moveFirstStack = (source: MutableContainerState, destination: MutableContainerState): boolean => {
       for (let sourceIndex = 0; sourceIndex < source.slots.length; sourceIndex += 1) {
         if (source.slots[sourceIndex] === null || source.slots[sourceIndex] === undefined) continue
@@ -1334,23 +1483,34 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       return false
     }
 
-    const hopper = containerAt(at)
-    if (hopper?.kind !== 'hopper') return false
-    const below = containerAt({ x: at.x, y: at.y - 1, z: at.z })
-    if (below !== undefined && hopper.slots.some((stack) => stack !== null && stack !== undefined)) return moveFirstStack(hopper, below)
-    const above = containerAt({ x: at.x, y: at.y + 1, z: at.z })
-    return above === undefined ? false : moveFirstStack(above, hopper)
+    const hopperResult = containerAt(at)
+    if (Result.isFailure(hopperResult)) return Result.fail(hopperResult.failure)
+    const hopper = hopperResult.success
+    if (hopper?.kind !== 'hopper') return Result.succeed(false)
+    const belowResult = containerAt({ x: at.x, y: at.y - 1, z: at.z })
+    if (Result.isFailure(belowResult)) return Result.fail(belowResult.failure)
+    const below = belowResult.success
+    if (below !== undefined && hopper.slots.some((stack) => stack !== null && stack !== undefined)) {
+      return Result.succeed(moveFirstStack(hopper, below))
+    }
+    const aboveResult = containerAt({ x: at.x, y: at.y + 1, z: at.z })
+    if (Result.isFailure(aboveResult)) return Result.fail(aboveResult.failure)
+    const above = aboveResult.success
+    return Result.succeed(above === undefined ? false : moveFirstStack(above, hopper))
   }
 
-  const applyItemDropperTrigger = (at: BlockPos, kind: 'dispenser' | 'dropper'): boolean => {
-    if (!isInBounds(at) || blockAt(at) !== kind) return false
+  const applyItemDropperTrigger = (at: BlockPos, kind: 'dispenser' | 'dropper'): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed(false)
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    if (block.success !== kind) return Result.succeed(false)
     const container = containers.get(containerIdAt(at))
-    if (container?.kind !== kind) return false
+    if (container?.kind !== kind) return Result.succeed(false)
     const slot = container.slots.findIndex((stack) => stack !== null && stack !== undefined)
-    if (slot < 0) return false
+    if (slot < 0) return Result.succeed(false)
 
     const source = container.slots[slot]
-    if (source === null || source === undefined) return false
+    if (source === null || source === undefined) return Result.succeed(false)
     const entity: AuthoritativeEntityState = {
       _tag: 'item-drop',
       entityId: `${kind}:${positionKey(at)}:drop:${String(revision + 1)}:${String(slot)}` as AuthoritativeEntityState['entityId'],
@@ -1363,57 +1523,82 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     notifyStateChanged()
     broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(container) })
     broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity })
-    return true
+    return Result.succeed(true)
   }
 
-  const applyDispenserTrigger = (at: BlockPos): boolean => applyItemDropperTrigger(at, 'dispenser')
+  const applyDispenserTrigger = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => applyItemDropperTrigger(at, 'dispenser')
 
-  const applyDropperTrigger = (at: BlockPos): boolean => applyItemDropperTrigger(at, 'dropper')
+  const applyDropperTrigger = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => applyItemDropperTrigger(at, 'dropper')
 
   const applyRedstoneBlockState = (
     at: BlockPos,
     expectedBlocks: ReadonlySet<RedstoneStatefulBlock>,
     nextBlock: RedstoneStatefulBlock,
-  ): boolean => {
-    if (!isInBounds(at)) return false
+  ): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed(false)
     const currentBlock = blockAt(at)
-    if (!isRedstoneStatefulBlock(currentBlock) || !expectedBlocks.has(currentBlock) || currentBlock === nextBlock) return false
+    if (Result.isFailure(currentBlock)) return Result.fail(currentBlock.failure)
+    if (!isRedstoneStatefulBlock(currentBlock.success) || !expectedBlocks.has(currentBlock.success) || currentBlock.success === nextBlock) return Result.succeed(false)
 
     blocks.set(positionKey(at), { at: { ...at }, block: nextBlock })
     revision += 1
     notifyStateChanged()
     broadcast(snapshot())
-    return true
+    return Result.succeed(true)
   }
 
-  const isPoweredRailPowered = (at: BlockPos): boolean =>
-    blockAt(at) === 'powered_rail' && (poweredRails.get(positionKey(at))?.powered ?? false)
+  const isPoweredRailPowered = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === 'powered_rail' && (poweredRails.get(positionKey(at))?.powered ?? false))
+  }
 
-  const isLeverActive = (at: BlockPos): boolean =>
-    blockAt(at) === 'lever' && (levers.get(positionKey(at))?.active ?? false)
+  const isLeverActive = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === 'lever' && (levers.get(positionKey(at))?.active ?? false))
+  }
 
-  const applyPoweredRailState = (at: BlockPos, powered: boolean): boolean => {
-    if (!isInBounds(at) || blockAt(at) !== 'powered_rail') return false
+  const applyPoweredRailState = (at: BlockPos, powered: boolean): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed(false)
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    if (block.success !== 'powered_rail') return Result.succeed(false)
     const key = positionKey(at)
-    if ((poweredRails.get(key)?.powered ?? false) === powered) return false
+    if ((poweredRails.get(key)?.powered ?? false) === powered) return Result.succeed(false)
     poweredRails.set(key, { at: { ...at }, powered })
     revision += 1
     notifyStateChanged()
     broadcast(snapshot())
-    return true
+    return Result.succeed(true)
   }
 
   /** Commits a validated piston plan as one authoritative world revision. */
-  const applyPistonPlan = (plan: PistonMovementPlan): boolean => {
-    if (validatePistonPlan(plan) !== undefined || !isInBounds(plan.piston) || blockAt(plan.piston) !== 'piston') return false
+  const applyPistonPlan = (plan: PistonMovementPlan): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (validatePistonPlan(plan) !== undefined || !isInBounds(plan.piston)) return Result.succeed(false)
+    const piston = blockAt(plan.piston)
+    if (Result.isFailure(piston)) return Result.fail(piston.failure)
+    if (piston.success !== 'piston') return Result.succeed(false)
 
     const head = pistonPositionAt(plan.piston, plan.facing, 1)
-    if (!isInBounds(head) || (plan.fromState === 'extended' && blockAt(head) !== 'piston_head')) return false
-    if (plan.moves.some((move) => !isInBounds(move.from) || !isInBounds(move.to) || blockAt(move.from) !== move.block)) return false
+    if (!isInBounds(head)) return Result.succeed(false)
+    if (plan.fromState === 'extended') {
+      const headBlock = blockAt(head)
+      if (Result.isFailure(headBlock)) return Result.fail(headBlock.failure)
+      if (headBlock.success !== 'piston_head') return Result.succeed(false)
+    }
+    for (const move of plan.moves) {
+      if (!isInBounds(move.from) || !isInBounds(move.to)) return Result.succeed(false)
+      const block = blockAt(move.from)
+      if (Result.isFailure(block)) return Result.fail(block.failure)
+      if (block.success !== move.block) return Result.succeed(false)
+    }
 
     if (plan.toState === 'extended') {
       const finalTarget = plan.moves[0]?.to ?? head
-      if (blockAt(finalTarget) !== null) return false
+      const block = blockAt(finalTarget)
+      if (Result.isFailure(block)) return Result.fail(block.failure)
+      if (block.success !== null) return Result.succeed(false)
     }
 
     for (const move of plan.moves) {
@@ -1431,7 +1616,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     revision += 1
     notifyStateChanged()
     broadcast(snapshot())
-    return true
+    return Result.succeed(true)
   }
 
   const ensurePlayerState = (player: PlayerId): void => {
@@ -1603,6 +1788,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const decideCommand = (message: AuthoritativeCommand): CommandDecision => {
     const inventory = inventories.get(message.player)
     if (inventory === undefined) return { accepted: false, reason: 'resource-not-found' }
+    const rejectBlockRead = (failure: MultiplayerServerCoreFailure): CommandDecision => ({
+      accepted: false,
+      reason: 'invalid-command',
+      failure,
+    })
 
     switch (message._tag) {
       case 'ToggleLeverCommand': {
@@ -1611,9 +1801,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.lever) || !isBlockWithinReach(actor, message.lever)) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        if (blockAt(message.lever) !== 'lever') return { accepted: false, reason: 'invalid-command' }
+        const block = blockAt(message.lever)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'lever') return { accepted: false, reason: 'invalid-command' }
         const key = positionKey(message.lever)
-        levers.set(key, { at: { ...message.lever }, active: !isLeverActive(message.lever) })
+        levers.set(key, { at: { ...message.lever }, active: !(levers.get(key)?.active ?? false) })
         return { accepted: true, deltas: () => [], snapshotBroadcastRequired: true }
       }
       case 'ThrowEyeOfEnderCommand': {
@@ -1628,7 +1820,23 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'insufficient-items' }
         }
 
-        const site = nearestStrongholdSite(options.seed, actor.at.x, actor.at.z)
+        const seedResult = WorldgenNoiseSeed.result(options.seed)
+        if (Result.isFailure(seedResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'NoiseSeedBrandFailure', failure: seedResult.failure },
+          }
+        }
+        const x = BlockAxis.result(actor.at.x)
+        if (Result.isFailure(x)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'x', failure: x.failure } }
+        }
+        const z = BlockAxis.result(actor.at.z)
+        if (Result.isFailure(z)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'z', failure: z.failure } }
+        }
+        const site = nearestStrongholdSite(seedResult.success, x.success, z.success)
         if (Option.isNone(site)) return { accepted: false, reason: 'invalid-command' }
         const origin = { x: actor.at.x, y: actor.at.y + EYE_LEVEL_OFFSET, z: actor.at.z }
         const target = endPortalCenterForStronghold(site.value)
@@ -1676,7 +1884,23 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         ) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        const site = nearestStrongholdSite(options.seed, message.frame.x, message.frame.z)
+        const seedResult = WorldgenNoiseSeed.result(options.seed)
+        if (Result.isFailure(seedResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'NoiseSeedBrandFailure', failure: seedResult.failure },
+          }
+        }
+        const x = BlockAxis.result(message.frame.x)
+        if (Result.isFailure(x)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'x', failure: x.failure } }
+        }
+        const z = BlockAxis.result(message.frame.z)
+        if (Result.isFailure(z)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'z', failure: z.failure } }
+        }
+        const site = nearestStrongholdSite(seedResult.success, x.success, z.success)
         if (Option.isNone(site)) return { accepted: false, reason: 'invalid-command' }
         const center = endPortalCenterForStronghold(site.value)
         const isPortalFrame = END_PORTAL_FRAME_OFFSETS.some(
@@ -1685,7 +1909,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             message.frame.y === center.y &&
             message.frame.z === center.z + dz,
         )
-        if (!isPortalFrame || blockAt(message.frame) !== END_PORTAL_FRAME_EMPTY_BLOCK) {
+        const frameBlock = blockAt(message.frame)
+        if (Result.isFailure(frameBlock)) return rejectBlockRead(frameBlock.failure)
+        if (!isPortalFrame || frameBlock.success !== END_PORTAL_FRAME_EMPTY_BLOCK) {
           return { accepted: false, reason: 'invalid-command' }
         }
 
@@ -1695,6 +1921,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (selected?.item !== 'eye_of_ender') {
           return { accepted: false, reason: 'insufficient-items' }
         }
+        const portalFrameBlocks: Array<Readonly<{ at: BlockPos; block: string | null }>> = []
+        for (const { dx, dz } of END_PORTAL_FRAME_OFFSETS) {
+          const at = { x: center.x + dx, y: center.y, z: center.z + dz }
+          const block = blockAt(at)
+          if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+          portalFrameBlocks.push({ at, block: block.success })
+        }
+        const framePositionKey = positionKey(message.frame)
+        const completed = portalFrameBlocks.every(({ at, block }) =>
+          positionKey(at) === framePositionKey || block === END_PORTAL_FRAME_FILLED_BLOCK,
+        )
         inventory.slots[inventory.selectedSlot] = selected.count === 1
           ? null
           : { ...selected, count: selected.count - 1 }
@@ -1704,10 +1941,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           block: END_PORTAL_FRAME_FILLED_BLOCK,
         })
 
-        const completed = END_PORTAL_FRAME_OFFSETS.every(({ dx, dz }) =>
-          blockAt({ x: center.x + dx, y: center.y, z: center.z + dz }) ===
-          END_PORTAL_FRAME_FILLED_BLOCK,
-        )
         if (completed) {
           for (let x = -1; x <= 1; x += 1) {
             for (let z = -1; z <= 1; z += 1) {
@@ -1734,7 +1967,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.portal) || !isBlockWithinReach(actor, message.portal)) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        if (blockAt(message.portal) !== 'end_portal' || options.onEndPortalUse === undefined) {
+        const block = blockAt(message.portal)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'end_portal' || options.onEndPortalUse === undefined) {
           return { accepted: false, reason: 'invalid-command' }
         }
         return { accepted: true, deltas: () => [] }
@@ -1745,7 +1980,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.portal) || !isBlockWithinReach(actor, message.portal)) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        if (blockAt(message.portal) !== 'nether_portal' || options.onNetherPortalUse === undefined) {
+        const block = blockAt(message.portal)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'nether_portal' || options.onNetherPortalUse === undefined) {
           return { accepted: false, reason: 'invalid-command' }
         }
         return { accepted: true, deltas: () => [] }
@@ -1820,7 +2057,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (selected?.item !== 'flint_and_steel' && selected?.item !== 'fire_charge') {
           return { accepted: false, reason: 'invalid-command' }
         }
-        if (blockAt(message.at) !== 'tnt') return { accepted: false, reason: 'invalid-command' }
+        const block = blockAt(message.at)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'tnt') return { accepted: false, reason: 'invalid-command' }
         if (selected.item === 'fire_charge') {
           inventory.slots[inventory.selectedSlot] = selected.count === 1
             ? null
@@ -1855,11 +2094,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const selected = inventory.slots[inventory.selectedSlot]
         if (selected?.item !== 'ender_pearl') return { accepted: false, reason: 'invalid-command' }
 
-        const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-          feetPosition: actor.at,
-          yawRadians: actor.facing.yawRadians,
-          pitchRadians: actor.facing.pitchRadians,
-        }, ENDER_PEARL_MAX_DISTANCE, (x, y, z) => blockAt({ x, y, z }) !== null))
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const targetResult = targetBlockFromNumbers(
+          actor.at,
+          actor.facing,
+          ENDER_PEARL_MAX_DISTANCE,
+          (x, y, z) => {
+            const block = blockAt({ x, y, z })
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return false
+            }
+            return block.success !== null
+          },
+        )
+        if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+        if (Result.isFailure(targetResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+          }
+        }
+        const target = Option.getOrUndefined(targetResult.success)
         const origin = { x: actor.at.x, y: actor.at.y + EYE_LEVEL_OFFSET, z: actor.at.z }
         const hitDistance = target === undefined
           ? undefined
@@ -1868,7 +2125,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               target.position.y + 0.5 - origin.y,
               target.position.z + 0.5 - origin.z,
             )
-        const direction = forwardVector(actor.facing)
+        const directionResult = forwardVector(actor.facing)
+        if (Result.isFailure(directionResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'forward', failure: directionResult.failure },
+          }
+        }
+        const direction = directionResult.success
         const displacement = enderPearlDisplacement(direction.x, direction.y, direction.z, hitDistance)
         if (displacement === undefined) return { accepted: false, reason: 'invalid-command' }
 
@@ -1925,16 +2190,26 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'invalid-command' }
         }
 
-        const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-          feetPosition: actor.at,
-          yawRadians: actor.facing.yawRadians,
-          pitchRadians: actor.facing.pitchRadians,
-        }, BLOCK_INTERACTION_RANGE, (x, y, z) => {
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const targetResult = targetBlockFromNumbers(actor.at, actor.facing, BLOCK_INTERACTION_RANGE, (x, y, z) => {
           const block = blockAt({ x, y, z })
+          if (Result.isFailure(block)) {
+            blockReadFailure ??= block.failure
+            return false
+          }
           return selected.item === 'bucket'
-            ? block === 'water' || block === 'lava'
-            : block !== null
-        }))
+            ? block.success === 'water' || block.success === 'lava'
+            : block.success !== null
+        })
+        if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+        if (Result.isFailure(targetResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+          }
+        }
+        const target = Option.getOrUndefined(targetResult.success)
         if (target === undefined) return { accepted: false, reason: 'invalid-command' }
 
         let at: BlockPos
@@ -1942,14 +2217,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         let replacement: BucketItemType
         if (selected.item === 'bucket') {
           const source = blockAt(target.position)
-          if (source !== 'water' && source !== 'lava') return { accepted: false, reason: 'invalid-command' }
+          if (Result.isFailure(source)) return rejectBlockRead(source.failure)
+          if (source.success !== 'water' && source.success !== 'lava') return { accepted: false, reason: 'invalid-command' }
           at = target.position
           block = null
-          replacement = source === 'water' ? 'water_bucket' : 'lava_bucket'
+          replacement = source.success === 'water' ? 'water_bucket' : 'lava_bucket'
         } else {
-          if (!isInBounds(target.adjacentPosition) || blockAt(target.adjacentPosition) !== null) {
+          if (!isInBounds(target.adjacentPosition)) {
             return { accepted: false, reason: 'invalid-command' }
           }
+          const adjacent = blockAt(target.adjacentPosition)
+          if (Result.isFailure(adjacent)) return rejectBlockRead(adjacent.failure)
+          if (adjacent.success !== null) return { accepted: false, reason: 'invalid-command' }
           at = target.adjacentPosition
           block = selected.item === 'water_bucket' ? 'water' : 'lava'
           replacement = 'bucket'
@@ -1996,16 +2275,51 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if (selected?.item !== 'fishing_rod' || selected.count !== 1 || durability === null || !isValidDurabilityForItem('fishing_rod', durability)) {
             return { accepted: true, deltas: (nextRevision) => [{ _tag: 'PlayerFishingDelta', world: actor.world, revision: nextRevision, player: message.player, state: { phase: 'idle', result: 'invalid-rod' } }] }
           }
-          const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-            feetPosition: actor.at,
-            yawRadians: actor.facing.yawRadians,
-            pitchRadians: actor.facing.pitchRadians,
-          }, BLOCK_INTERACTION_RANGE, (x, y, z) => blockAt({ x, y, z }) === 'water'))
+          let blockReadFailure: MultiplayerServerCoreFailure | undefined
+          const targetResult = targetBlockFromNumbers(
+            actor.at,
+            actor.facing,
+            BLOCK_INTERACTION_RANGE,
+            (x, y, z) => {
+              const block = blockAt({ x, y, z })
+              if (Result.isFailure(block)) {
+                blockReadFailure ??= block.failure
+                return false
+              }
+              return block.success === 'water'
+            },
+          )
+          if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+          if (Result.isFailure(targetResult)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+            }
+          }
+          const target = Option.getOrUndefined(targetResult.success)
           if (target === undefined) {
             return { accepted: true, deltas: (nextRevision) => [{ _tag: 'PlayerFishingDelta', world: actor.world, revision: nextRevision, player: message.player, state: { phase: 'idle', result: 'no-water' } }] }
           }
-          const rod = equipmentItem(itemStack('fishing_rod', selected.count), durability)
-          const cast = castFishing(rod, fishingEnvironmentAt(target.position), {
+          const rodStack = itemStack('fishing_rod', selected.count)
+          if (Result.isFailure(rodStack)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'FishingEquipmentFailure', failure: rodStack.failure },
+            }
+          }
+          const rodResult = equipmentItem(rodStack.success, durability)
+          if (Result.isFailure(rodResult)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'FishingEquipmentFailure', failure: rodResult.failure },
+            }
+          }
+          const environment = fishingEnvironmentAt(target.position)
+          if (Result.isFailure(environment)) return rejectBlockRead(environment.failure)
+          const cast = castFishing(rodResult.success, environment.success, {
             wait: deterministicRoll(`${String(message.player)}:${String(message.commandId)}:wait`),
             category: deterministicRoll(`${String(message.player)}:${String(message.commandId)}:category`),
             item: deterministicRoll(`${String(message.player)}:${String(message.commandId)}:item`),
@@ -2188,16 +2502,35 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'invalid-command' }
         }
 
-        const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-          feetPosition: actor.at,
-          yawRadians: actor.facing.yawRadians,
-          pitchRadians: actor.facing.pitchRadians,
-        }, BLOCK_INTERACTION_RANGE, (x, y, z) => blockAt({ x, y, z }) !== null))
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const targetResult = targetBlockFromNumbers(
+          actor.at,
+          actor.facing,
+          BLOCK_INTERACTION_RANGE,
+          (x, y, z) => {
+            const block = blockAt({ x, y, z })
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return false
+            }
+            return block.success !== null
+          },
+        )
+        if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+        if (Result.isFailure(targetResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+          }
+        }
+        const target = Option.getOrUndefined(targetResult.success)
         if (target === undefined) return { accepted: false, reason: 'invalid-command' }
 
         const targetBlock = blockAt(target.position)
+        if (Result.isFailure(targetBlock)) return rejectBlockRead(targetBlock.failure)
         const placedOnRail = vehicleType === 'minecart' &&
-          (targetBlock === 'rail' || targetBlock === 'powered_rail')
+          (targetBlock.success === 'rail' || targetBlock.success === 'powered_rail')
         // A boat aimed at open water lands AT the water block's own cell,
         // the same reason a minecart lands at the rail's own cell rather
         // than beside it — see apps/web/main.ts's single-player VehicleUseCommand
@@ -2206,10 +2539,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         // above it, and `target.adjacentPosition` for the common straight-down
         // placement aim is one cell above the water, never detected as
         // in-water).
-        const placedOnWater = vehicleType === 'boat' && targetBlock === 'water'
+        const placedOnWater = vehicleType === 'boat' && targetBlock.success === 'water'
         const at = placedOnRail || placedOnWater ? target.position : target.adjacentPosition
-        if (!isInBounds(at) || (!placedOnRail && !placedOnWater && blockAt(at) !== null)) {
+        if (!isInBounds(at)) {
           return { accepted: false, reason: 'invalid-command' }
+        }
+        if (!placedOnRail && !placedOnWater) {
+          const placement = blockAt(at)
+          if (Result.isFailure(placement)) return rejectBlockRead(placement.failure)
+          if (placement.success !== null) return { accepted: false, reason: 'invalid-command' }
         }
 
         inventory.slots[inventory.selectedSlot] = selected.count === 1
@@ -2260,7 +2598,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           updated = { ...entity, occupant: null }
         } else {
           if (entity.occupant !== message.player) return { accepted: false, reason: 'not-mounted' }
-          const forward = forwardVector(actor.facing)
+          const forwardResult = forwardVector(actor.facing)
+          if (Result.isFailure(forwardResult)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'CameraPoseFailure', operation: 'forward', failure: forwardResult.failure },
+            }
+          }
+          const forward = forwardResult.success
           const horizontalLength = Math.hypot(forward.x, forward.z)
           if (horizontalLength === 0) return { accepted: false, reason: 'invalid-command' }
           const direction = message.action.direction === 'forward' ? 1 : -1
@@ -2269,7 +2615,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             y: entity.at.y,
             z: entity.at.z + direction * VEHICLE_MOVE_DISTANCE * forward.z / horizontalLength,
           }
-          if (!isValidVehicleMovement(entity.at, at)) return { accepted: false, reason: 'out-of-range' }
+          const validMovement = isValidVehicleMovement(entity.at, at)
+          if (Result.isFailure(validMovement)) return rejectBlockRead(validMovement.failure)
+          if (!validMovement.success) return { accepted: false, reason: 'out-of-range' }
           if (!tryConsumeMovementBudget(message.player, movementDistance(entity.at, at))) return { accepted: false, reason: 'out-of-range' }
           updated = { ...entity, at }
           actor.at = at
@@ -2392,8 +2740,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (at === null) return { accepted: false, reason: 'invalid-command' }
         const container = containers.get(message.containerId)
         if (container === undefined) return { accepted: false, reason: 'resource-not-found' }
-        const inaccessibleReason = facilityIsAccessible(message.player, at, container.kind)
-        if (inaccessibleReason !== null) return { accepted: false, reason: inaccessibleReason }
+        const access = facilityIsAccessible(message.player, at, container.kind)
+        if (Result.isFailure(access)) return rejectBlockRead(access.failure)
+        if (access.success !== null) return { accepted: false, reason: access.success }
         if (message.action._tag === 'move-item') {
           const playerIsSource = message.action.source._tag === 'player-slot'
           const playerSlot = playerIsSource ? message.action.source.slot : message.action.destination.slot
@@ -2428,8 +2777,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       case 'FurnaceCommand': {
         const at = parseFurnaceId(message.furnaceId)
         if (at === null) return { accepted: false, reason: 'invalid-command' }
-        const inaccessibleReason = facilityIsAccessible(message.player, at, 'furnace')
-        if (inaccessibleReason !== null) return { accepted: false, reason: inaccessibleReason }
+        const access = facilityIsAccessible(message.player, at, 'furnace')
+        if (Result.isFailure(access)) return rejectBlockRead(access.failure)
+        if (access.success !== null) return { accepted: false, reason: access.success }
         const furnace = furnaces.get(message.furnaceId)
         if (furnace === undefined) return { accepted: false, reason: 'resource-not-found' }
         const source = message.action.source
@@ -2543,6 +2893,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     reason: CommandRejectionReason,
     cache = true,
     receiveReason: RejectedReceiveReason = reason === 'unauthorized-player' ? 'identity-spoof' : 'invalid-command',
+    failure?: MultiplayerServerCoreFailure,
   ): ReceiveResult => {
     const result: AuthoritativeCommandResult = {
       _tag: 'AuthoritativeCommandRejected',
@@ -2552,9 +2903,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       reason,
       resyncRequired: reason === 'stale-revision' || reason === 'snapshot-required',
     }
-    if (cache) cacheCommandResult(message, result)
+    if (cache && failure === undefined) cacheCommandResult(message, result)
     sendMessage(client, result)
-    return { accepted: false, reason: receiveReason }
+    return failure === undefined
+      ? { accepted: false, reason: receiveReason }
+      : { accepted: false, reason: receiveReason, failure }
   }
 
   const handleCommand = (clientId: ClientId, client: ConnectedClient, message: AuthoritativeCommand): ReceiveResult => {
@@ -2577,7 +2930,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (message.expectedRevision !== revision) return rejectCommand(client, message, 'stale-revision')
 
     const decision = decideCommand(message)
-    if (!decision.accepted) return rejectCommand(client, message, decision.reason)
+    if (!decision.accepted) return rejectCommand(client, message, decision.reason, true, undefined, decision.failure)
     const nextRevision = revision + 1
     const deltas = decision.deltas(nextRevision)
     const outboundMessages = decision.messages?.(nextRevision) ?? []
@@ -2613,7 +2966,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const movementDistance = (from: PlayerSnapshot['at'], at: PlayerSnapshot['at']): number =>
     Math.hypot(at.x - from.x, at.y - from.y, at.z - from.z)
 
-  const isPlayerPositionPassable = (at: PlayerSnapshot['at']): boolean => {
+  const isPlayerPositionPassable = (at: PlayerSnapshot['at']): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const minX = Math.floor(at.x - PLAYER_HALF_WIDTH)
     const maxX = Math.floor(at.x + PLAYER_HALF_WIDTH - COLLISION_EPSILON)
     const minY = Math.floor(at.y)
@@ -2624,53 +2977,57 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       for (let y = minY; y <= maxY; y += 1) {
         for (let z = minZ; z <= maxZ; z += 1) {
           const position = { x, y, z }
-          if (!isInBounds(position)) return false
+          if (!isInBounds(position)) return Result.succeed(false)
           const block = blockAt(position)
-          if (block !== null && !options.passableBlocks?.has(block)) return false
+          if (Result.isFailure(block)) return Result.fail(block.failure)
+          if (block.success !== null && !options.passableBlocks?.has(block.success)) return Result.succeed(false)
         }
       }
     }
-    return true
+    return Result.succeed(true)
   }
 
-  const isVehiclePositionPassable = (at: PlayerSnapshot['at']): boolean => {
+  const isVehiclePositionPassable = (at: PlayerSnapshot['at']): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const position = { x: Math.floor(at.x), y: Math.floor(at.y), z: Math.floor(at.z) }
-    if (!isInBounds(position)) return false
+    if (!isInBounds(position)) return Result.succeed(false)
     const block = blockAt(position)
-    return block === null || options.passableBlocks?.has(block) === true
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === null || options.passableBlocks?.has(block.success) === true)
   }
 
   const isMovementPathPassable = (
     from: PlayerSnapshot['at'],
     at: PlayerSnapshot['at'],
-    isPositionPassable: (position: PlayerSnapshot['at']) => boolean,
-  ): boolean => {
+    isPositionPassable: (position: PlayerSnapshot['at']) => Result.Result<boolean, MultiplayerServerCoreFailure>,
+  ): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const samples = Math.max(1, Math.ceil(movementDistance(from, at) / MOVEMENT_COLLISION_SAMPLE_DISTANCE))
     for (let sample = 1; sample <= samples; sample += 1) {
       const ratio = sample / samples
-      if (!isPositionPassable({
+      const passable = isPositionPassable({
         x: from.x + (at.x - from.x) * ratio,
         y: from.y + (at.y - from.y) * ratio,
         z: from.z + (at.z - from.z) * ratio,
-      })) return false
+      })
+      if (Result.isFailure(passable)) return Result.fail(passable.failure)
+      if (!passable.success) return Result.succeed(false)
     }
-    return true
+    return Result.succeed(true)
   }
 
-  const isValidMovement = (player: MutablePlayer, at: PlayerSnapshot['at']): boolean => {
-    if (![at.x, at.y, at.z].every(Number.isFinite)) return false
+  const isValidMovement = (player: MutablePlayer, at: PlayerSnapshot['at']): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (![at.x, at.y, at.z].every(Number.isFinite)) return Result.succeed(false)
     const maximum = options.maxMoveDistance ?? DEFAULT_MAX_MOVE_DISTANCE
-    if (movementDistance(player.at, at) > maximum) return false
+    if (movementDistance(player.at, at) > maximum) return Result.succeed(false)
     return isMovementPathPassable(player.at, at, isPlayerPositionPassable)
   }
 
   const isValidVehicleMovement = (
     from: PlayerSnapshot['at'],
     at: PlayerSnapshot['at'],
-  ): boolean => {
-    if (![at.x, at.y, at.z].every(Number.isFinite)) return false
+  ): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (![at.x, at.y, at.z].every(Number.isFinite)) return Result.succeed(false)
     const maximum = Math.min(options.maxMoveDistance ?? DEFAULT_MAX_MOVE_DISTANCE, DEFAULT_MAX_VEHICLE_MOVE_DISTANCE)
-    if (movementDistance(from, at) > maximum) return false
+    if (movementDistance(from, at) > maximum) return Result.succeed(false)
     return isMovementPathPassable(from, at, isVehiclePositionPassable)
   }
 
@@ -2693,6 +3050,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     message: Extract<NetworkMessage, { _tag: 'BlockPlace' | 'BlockBreak' }>,
     reason: BlockMutationRejected['reason'],
     receiveReason: RejectedReceiveReason = reason === 'unauthorized-player' ? 'identity-spoof' : 'invalid-mutation',
+    failure?: MultiplayerServerCoreFailure,
   ): ReceiveResult => {
     sendMessage(client, {
       _tag: 'BlockMutationRejected',
@@ -2703,7 +3061,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       reason,
       revision,
     })
-    return { accepted: false, reason: receiveReason }
+    return failure === undefined
+      ? { accepted: false, reason: receiveReason }
+      : { accepted: false, reason: receiveReason, failure }
   }
 
   const removePlayer = (clientId: ClientId, client: ConnectedClient): void => {
@@ -2744,11 +3104,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendCrafting(client, cached.result)
         return cached.result.accepted ? { accepted: true, message: craftingMessage } : { accepted: false, reason: receiveReasonForRejection(cached.result.reason) }
       }
-      const rejectCrafting = (reason: NonNullable<CraftingCommandResult['reason']>, receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command'): ReceiveResult => {
+      const rejectCrafting = (
+        reason: NonNullable<CraftingCommandResult['reason']>,
+        receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
+      ): ReceiveResult => {
         const result: CraftingCommandResult = { _tag: 'CraftingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheCraftingResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheCraftingResult(resultKey, fingerprint, result)
         sendCrafting(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== client.playerId) return rejectCrafting('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectCrafting('wrong-world', 'wrong-world')
@@ -2769,9 +3135,30 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           || slot.count > maxStackCountOfItem(slot.item)) return rejectCrafting('invalid-command')
         craftingSlots.push({ item: slot.item, count: StackCount(slot.count) })
       }
-      const outcome = craftFromGrid({
+      const recipes = STARTER_RECIPES
+      if (Result.isFailure(recipes)) {
+        return rejectCrafting('invalid-command', 'invalid-command', {
+          _tag: 'CraftingFailure',
+          failure: recipes.failure,
+        })
+      }
+      const grid = craftGrid(command.grid.width, command.grid.height, command.grid.cells.map((cell) => cell ?? undefined))
+      if (Result.isFailure(grid)) {
+        return rejectCrafting('invalid-command', 'invalid-command', {
+          _tag: 'CraftingFailure',
+          failure: grid.failure,
+        })
+      }
+      const outcomeResult = craftFromGrid({
         slots: craftingSlots,
-      }, STARTER_RECIPES, craftGrid(command.grid.width, command.grid.height, command.grid.cells.map((cell) => cell ?? undefined)))
+      }, recipes.success, grid.success)
+      if (Result.isFailure(outcomeResult)) {
+        return rejectCrafting('invalid-command', 'invalid-command', {
+          _tag: 'CraftingFailure',
+          failure: outcomeResult.failure,
+        })
+      }
+      const outcome = outcomeResult.success
       if (outcome.result._tag !== 'Crafted') return rejectCrafting(outcome.result._tag === 'NoMatch' ? 'no-match' : outcome.result._tag === 'MissingIngredients' ? 'missing-ingredients' : 'no-room')
       const oldSlots = [...inventory.slots]
       const oldDurability = [...inventory.durability]
@@ -2803,11 +3190,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const rejectAnvil = (
         reason: Extract<AnvilCommandResult, { accepted: false }>['reason'],
         receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
       ): ReceiveResult => {
         const result: AnvilCommandResult = { _tag: 'AnvilCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheAnvilResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheAnvilResult(resultKey, fingerprint, result)
         sendAnvil(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== playerId) return rejectAnvil('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectAnvil('wrong-world', 'wrong-world')
@@ -2846,7 +3236,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           ? {}
           : { material }),
       }
-      const plan = planAnvilOperation(operationInput)
+      const planResult = planAnvilOperation(operationInput)
+      if (Result.isFailure(planResult)) {
+        return rejectAnvil('invalid-command', 'invalid-command', {
+          _tag: 'AnvilPlanFailure',
+          failure: planResult.failure,
+        })
+      }
+      const plan = planResult.success
       if (!plan.ok) {
         const reason = plan.reason === 'nothing-to-do'
           ? 'no-change'
@@ -2858,7 +3255,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       if (plan.materialCost > 0 && (usableIron === undefined || usableIron.count < plan.materialCost)) {
         return rejectAnvil('missing-iron')
       }
-      const remainingExperience = spendExperienceLevels(playerVitals.experience, plan.levelCost)
+      const remainingExperienceResult = spendExperienceLevels(playerVitals.experience, plan.levelCost)
+      if (Result.isFailure(remainingExperienceResult)) {
+        return rejectAnvil('invalid-command', 'invalid-command', {
+          _tag: 'AnvilExperienceSpendFailure',
+          failure: remainingExperienceResult.failure,
+        })
+      }
+      const remainingExperience = remainingExperienceResult.success
       if (remainingExperience === undefined) return rejectAnvil('insufficient-experience')
       const outputEnchantment = enchantedItemFromAnvilOutput(plan.output)
       if (plan.output.enchantments.length > 0 && outputEnchantment === undefined) return rejectAnvil('invalid-command')
@@ -2903,11 +3307,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const rejectEnchanting = (
         reason: Extract<EnchantingCommandResult, { accepted: false }>['reason'],
         receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
       ): ReceiveResult => {
         const result: EnchantingCommandResult = { _tag: 'EnchantingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheEnchantingResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheEnchantingResult(resultKey, fingerprint, result)
         sendEnchanting(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== playerId) return rejectEnchanting('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectEnchanting('wrong-world', 'wrong-world')
@@ -2926,6 +3333,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         enchantments: current.items.get(command.slot)?.enchantments ?? [],
       })
       if (!item.ok) return rejectEnchanting('invalid-item')
+      const totalExperienceResult = TotalExperience.result(playerVitals.experience)
+      if (Result.isFailure(totalExperienceResult)) {
+        return rejectEnchanting('invalid-command', 'invalid-command', {
+          _tag: 'ExperienceFailure',
+          failure: totalExperienceResult.failure,
+        })
+      }
       const lapis = inventory.slots.reduce(
         (total, candidate) => total + (candidate?.item === 'lapis_lazuli' ? candidate.count : 0),
         0,
@@ -2933,7 +3347,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const outcome = applyEnchantmentOffer({
         seed: current.seed,
         bookshelfCount: 15,
-        playerLevel: levelForTotalExperience(playerVitals.experience),
+        playerLevel: levelForTotalExperience(totalExperienceResult.success),
         lapis,
         item: item.value,
       }, enchantmentOffers(current.seed, 15)[command.offer])
@@ -2955,6 +3369,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         return rejectEnchanting(reason)
       }
       if (outcome.state.item === null) return rejectEnchanting('no-item')
+      const experienceLevelResult = ExperienceLevel.result(outcome.state.playerLevel)
+      if (Result.isFailure(experienceLevelResult)) {
+        return rejectEnchanting('invalid-command', 'invalid-command', {
+          _tag: 'ExperienceFailure',
+          failure: experienceLevelResult.failure,
+        })
+      }
+      const updatedTotalExperience = totalExperienceAtLevel(experienceLevelResult.success)
       let remainingLapis = lapis - outcome.state.lapis
       for (let slot = 0; slot < inventory.slots.length && remainingLapis > 0; slot += 1) {
         const candidate = inventory.slots[slot]
@@ -2968,7 +3390,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       current.seed = outcome.state.seed
       current.items.set(command.slot, outcome.state.item)
       enchantments.set(playerId, current)
-      playerVitals.experience = totalExperienceAtLevel(outcome.state.playerLevel)
+      playerVitals.experience = updatedTotalExperience
       revision += 1
       const result: EnchantingCommandResult = { _tag: 'EnchantingCommandResult', commandId: command.commandId, accepted: true, revision }
       cacheEnchantingResult(resultKey, fingerprint, result)
@@ -2991,11 +3413,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendBrewing(client, cached.result)
         return cached.result.accepted ? { accepted: true, message: brewingMessage } : { accepted: false, reason: receiveReasonForRejection(cached.result.reason) }
       }
-      const rejectBrewing = (reason: Extract<BrewingCommandResult, { accepted: false }>['reason'], receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command'): ReceiveResult => {
+      const rejectBrewing = (
+        reason: Extract<BrewingCommandResult, { accepted: false }>['reason'],
+        receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
+      ): ReceiveResult => {
         const result: BrewingCommandResult = { _tag: 'BrewingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheBrewingResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheBrewingResult(resultKey, fingerprint, result)
         sendBrewing(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== client.playerId) return rejectBrewing('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectBrewing('wrong-world', 'wrong-world')
@@ -3006,8 +3434,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const playerVitals = vitals.get(playerId)
       if (inventory === undefined || presence === undefined || playerVitals === undefined || playerVitals.health <= 0) return rejectBrewing('invalid-command')
       const at = { ...command.at }
-      const inaccessibleReason = facilityIsAccessible(playerId, at, 'brewing_stand')
-      if (inaccessibleReason !== null) return rejectBrewing('invalid-command')
+      const access = facilityIsAccessible(playerId, at, 'brewing_stand')
+      if (Result.isFailure(access)) return rejectBrewing('invalid-command', 'invalid-command', access.failure)
+      if (access.success !== null) return rejectBrewing('invalid-command')
       const current = brewingStands.get(positionKey(at))?.state
       if (current === undefined) return rejectBrewing('invalid-command')
       if (command.action._tag === 'open') {
@@ -3158,6 +3587,20 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendWither(client, result)
         return { accepted: false, reason: 'invalid-command' }
       }
+      const rejectWitherFailure = (operation: WitherOperation, failure: WitherRuntimeFailure): ReceiveResult => {
+        const result = { _tag: 'WitherCommandResult', requestId: command.requestId, accepted: false, revision: witherRevision, reason: 'invalid-command' } as const
+        sendWither(client, result)
+        return {
+          accepted: false,
+          reason: 'invalid-command',
+          failure: { _tag: 'WitherRuntimeFailure', operation, failure },
+        }
+      }
+      const rejectWitherBlockReadFailure = (failure: MultiplayerServerCoreFailure): ReceiveResult => {
+        const result = { _tag: 'WitherCommandResult', requestId: command.requestId, accepted: false, revision: witherRevision, reason: 'invalid-command' } as const
+        sendWither(client, result)
+        return { accepted: false, reason: 'invalid-command', failure }
+      }
       if (command.expectedRevision !== witherRevision) {
         return rejectWither('stale-revision')
       }
@@ -3167,10 +3610,21 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const hasIntegerPosition = Number.isInteger(command.position.x)
           && Number.isInteger(command.position.y)
           && Number.isInteger(command.position.z)
-        const summon = matchRuntimeWitherSummon(
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const summonResult = matchRuntimeWitherSummon(
           { x: Math.floor(command.position.x), y: Math.floor(command.position.y), z: Math.floor(command.position.z) },
-          (position) => blockAt(position) ?? undefined,
+          (position) => {
+            const block = blockAt(position)
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return undefined
+            }
+            return block.success ?? undefined
+          },
         )
+        if (blockReadFailure !== undefined) return rejectWitherBlockReadFailure(blockReadFailure)
+        if (Result.isFailure(summonResult)) return rejectWitherFailure('match-summon', summonResult.failure)
+        const summon = summonResult.success
         if (!hasIntegerPosition || actor === undefined || summon === undefined || Math.hypot(
           actor.at.x - command.position.x,
           actor.at.y - command.position.y,
@@ -3178,11 +3632,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         ) > WITHER_INTERACTION_RANGE) {
           return rejectWither('invalid-command')
         }
+        const summonState = summonRuntimeWither(witherState, command.dimension, summon.spawnPosition)
+        if (Result.isFailure(summonState)) return rejectWitherFailure('summon', summonState.failure)
         for (const position of summon.consumedBlocks) blocks.set(positionKey(position), { at: position, block: null })
         disturbFallingBlocks(summon.consumedBlocks)
         revision += 1
         broadcast(snapshot())
-        witherState = summonRuntimeWither(witherState, command.dimension, summon.spawnPosition)
+        witherState = summonState.success
       } else {
         const actor = players.get(command.actor as PlayerId)
         const actorVitals = vitals.get(command.actor as PlayerId)
@@ -3197,15 +3653,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         ) > WITHER_INTERACTION_RANGE) {
           return rejectWither('invalid-command')
         }
+        const damageResult = damageRuntimeWither(witherState, command.id, WITHER_ATTACK_DAMAGE, 'melee')
+        if (Result.isFailure(damageResult)) return rejectWitherFailure('damage', damageResult.failure)
         lastWitherAttackMs.set(command.actor as PlayerId, options.now?.() ?? Date.now())
-        const damage = damageRuntimeWither(witherState, command.id, WITHER_ATTACK_DAMAGE, 'melee')
-        witherState = damage.state
-        if (damage.death !== undefined) {
+        witherState = damageResult.success.state
+        if (damageResult.success.death !== undefined) {
           const drop: AuthoritativeEntityState = {
             _tag: 'item-drop',
             entityId: `${command.id}:drop:${String(witherRevision + 1)}` as AuthoritativeEntityState['entityId'],
-            at: damage.death.drop.position,
-            stack: { item: damage.death.drop.item, count: damage.death.drop.count },
+            at: damageResult.success.death.drop.position,
+            stack: { item: damageResult.success.death.drop.item, count: damageResult.success.death.drop.count },
           }
           entities.set(drop.entityId, drop)
           revision += 1
@@ -3296,8 +3753,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (sleepMessage?._tag === 'SleepCommand') {
       if (client.playerId === null) return { accepted: false, reason: 'join-required' }
       if (sleepMessage.command.actor !== client.playerId) return { accepted: false, reason: 'identity-spoof' }
+      sleepBlockReadFailure = undefined
       const result = sleepAuthority.execute(sleepMessage.command)
       sendSleep(client, { _tag: 'SleepCommandResult', result })
+      if (sleepBlockReadFailure !== undefined) {
+        const failure = sleepBlockReadFailure
+        sleepBlockReadFailure = undefined
+        return { accepted: false, reason: 'invalid-command', failure }
+      }
       if (result.accepted) {
         broadcastSleep({ _tag: 'SleepEvents', revision: result.revision, events: result.events })
         if (result.events.some((event) => event._tag === 'NightSkipped')) {
@@ -3317,8 +3780,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         : { accepted: false, reason: 'invalid-command' }
     }
     const decoded = decodeFrame(frame)
-    if (decoded._tag === 'Left') return { accepted: false, reason: 'malformed-frame' }
-    const message = decoded.right
+    if (Result.isFailure(decoded)) return { accepted: false, reason: 'malformed-frame' }
+    const message = decoded.success
 
     if (message._tag === 'PlayerJoin') {
       if (client.playerId !== null) {
@@ -3410,7 +3873,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (message.world !== undefined && message.world !== worldId) return { accepted: false, reason: 'wrong-world' }
         const player = players.get(message.player)
         if (player === undefined) return { accepted: false, reason: 'join-required' }
-        if (!isValidMovement(player, message.at)) {
+        const validMovement = isValidMovement(player, message.at)
+        if (Result.isFailure(validMovement)) {
+          sendMessage(client, {
+            _tag: 'PlayerMove',
+            player: player.player,
+            world: worldId,
+            at: player.at,
+            facing: player.facing,
+          })
+          return { accepted: false, reason: 'invalid-movement', failure: validMovement.failure }
+        }
+        if (!validMovement.success) {
           sendMessage(client, {
             _tag: 'PlayerMove',
             player: player.player,
@@ -3449,7 +3923,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const player = players.get(message.player)
         if (player === undefined || !isBlockWithinReach(player, message.at)) return rejectMutation(client, message, 'unauthorized-player', 'invalid-mutation')
         if (message.block === 'air' || !options.allowedBlocks.has(message.block)) return rejectMutation(client, message, 'unknown-block')
-        if (blockAt(message.at) !== null) return rejectMutation(client, message, 'occupied')
+        const existingBlock = blockAt(message.at)
+        if (Result.isFailure(existingBlock)) {
+          return rejectMutation(client, message, 'occupied', 'invalid-mutation', existingBlock.failure)
+        }
+        if (existingBlock.success !== null) return rejectMutation(client, message, 'occupied')
         const inventory = inventories.get(message.player)
         const sourceSlot = inventory?.selectedSlot ?? -1
         const sourceStack = sourceSlot >= 0 ? inventory?.slots[sourceSlot] : undefined
@@ -3499,8 +3977,24 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.at)) return rejectMutation(client, message, 'out-of-bounds')
         const player = players.get(message.player)
         if (player === undefined || !isBlockWithinReach(player, message.at)) return rejectMutation(client, message, 'unauthorized-player', 'invalid-mutation')
-        const brokenBlock = blockAt(message.at)
+        const brokenBlockResult = blockAt(message.at)
+        if (Result.isFailure(brokenBlockResult)) {
+          return rejectMutation(client, message, 'missing-block', 'invalid-mutation', brokenBlockResult.failure)
+        }
+        const brokenBlock = brokenBlockResult.success
         if (brokenBlock === null) return rejectMutation(client, message, 'missing-block')
+        let lootBlockId: BlockId | undefined
+        if (isBlockType(brokenBlock)) {
+          const blockId = blockIdOf(brokenBlock)
+          if (Option.isNone(blockId)) {
+            return rejectMutation(client, message, 'missing-block', 'invalid-mutation', {
+              _tag: 'BlockRegistryLookupFailure',
+              operation: 'block-break',
+              block: brokenBlock,
+            })
+          }
+          lootBlockId = blockId.value
+        }
         blocks.set(positionKey(message.at), { at: message.at, block: null })
         poweredRails.delete(positionKey(message.at))
         levers.delete(positionKey(message.at))
@@ -3537,9 +4031,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         revision += 1
         const inventory = inventories.get(message.player)
         const heldItem = inventory?.slots[inventory.selectedSlot]?.item
-        const blockDrops = isBlockType(brokenBlock)
+        const blockDrops = lootBlockId !== undefined
           ? blockLoot(
-              blockIdOf(brokenBlock),
+              lootBlockId,
               miningLootContextForItem(typeof heldItem === 'string' && isItemType(heldItem) ? heldItem : null),
               Array.from({ length: 4 }, (_, index) => deterministicRoll(
                 `block:${positionKey(message.at)}:${String(revision)}:${String(index)}`,
@@ -3739,13 +4233,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return true
   }
 
-  const tick = (elapsedMs: number): void => {
+  const tick = (elapsedMs: number): Result.Result<void, MultiplayerServerCoreFailure> => {
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
+      return Result.fail({ _tag: 'InvalidServerTickDuration', elapsedMs })
+    }
     let stateChanged = false
     let worldSnapshotRequired = false
     const postPersistenceDeltas: AuthoritativeDelta[] = []
     const changedFurnaces: MutableFurnaceState[] = []
-    const elapsedSecs = Number.isFinite(elapsedMs) && elapsedMs > 0 ? elapsedMs / 1_000 : 0
-    const validElapsedMs = elapsedSecs * 1_000
+    const elapsedSecs = elapsedMs / 1_000
+    const validElapsedMs = elapsedMs
     const elapsedTicks = Math.floor((timeTickRemainderMs + validElapsedMs) / MINECRAFT_TICK_MS)
     timeTickRemainderMs = timeTickRemainderMs + validElapsedMs - elapsedTicks * MINECRAFT_TICK_MS
     const timeChanged = elapsedTicks > 0
@@ -3759,7 +4256,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if (actor !== undefined) fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'idle', result: 'cancelled' } })
           continue
         }
-        const advanced = advanceFishing(active.session, elapsedSecs, { hasWater: blockAt(active.water) === 'water' })
+        const water = blockAt(active.water)
+        if (Result.isFailure(water)) return Result.fail(water.failure)
+        const advanced = advanceFishing(active.session, elapsedSecs, { hasWater: water.success === 'water' })
         if (advanced._tag === 'Cancelled') {
           fishingSessions.delete(player)
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'idle', result: 'lost-water' } })
@@ -3838,7 +4337,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         let remainingSecs = elapsedSecs
         let changed = false
         while (remainingSecs > 0) {
-          const plan = planFurnaceAdvance(current, remainingSecs)
+          const planResult = planFurnaceAdvance(current, remainingSecs)
+          if (Result.isFailure(planResult)) {
+            return Result.fail({ _tag: 'FurnaceAdvanceFailure', failure: planResult.failure })
+          }
+          const plan = planResult.success
           const applied = applyFurnaceAdvance(current, plan)
           if (applied._tag !== 'Applied') break
           changed ||= furnaceAdvanceChanged(plan)
@@ -3931,9 +4434,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           environmentalContactDamageStates.delete(player)
           continue
         }
+        const contactsResult = environmentalContactsAt(presence.at)
+        if (Result.isFailure(contactsResult)) return Result.fail(contactsResult.failure)
         const resolution = resolveEnvironmentalContactDamage(
           environmentalContactDamageStates.get(player) ?? INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-          environmentalContactsAt(presence.at),
+          contactsResult.success,
           simulationElapsedSecs,
         )
         environmentalContactDamageStates.set(player, resolution.state)
@@ -3969,7 +4474,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
 
     if (elapsedTicks > 0) {
-      if (applyPendingFallingBlocks()) {
+      const fallingBlocksResult = applyPendingFallingBlocks()
+      if (Result.isFailure(fallingBlocksResult)) return Result.fail(fallingBlocksResult.failure)
+      if (fallingBlocksResult.success) {
         revision += 1
         stateChanged = true
         worldSnapshotRequired = true
@@ -4024,24 +4531,38 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const applyExplosion = (
         center: Readonly<{ x: number; y: number; z: number }>,
         explosion: Explosion,
-      ): void => {
-        // Explosion resolution always needs a snapshot, including an empty crater.
-        worldChanged = true
+      ): Result.Result<void, MultiplayerServerCoreFailure> => {
+        const centerPosition = positionFromNumbers(center.x, center.y, center.z)
+        if (Result.isFailure(centerPosition)) {
+          return Result.fail({ _tag: 'PositionBrandFailure', failure: centerPosition.failure })
+        }
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
         const blockReader = (position: BlockPos) => {
           if (!isInBounds(position)) return undefined
           const block = blockAt(position)
-          return block === null ? { resistance: 0, destructible: false } : {
+          if (Result.isFailure(block)) {
+            blockReadFailure ??= block.failure
+            return undefined
+          }
+          return block.success === null ? { resistance: 0, destructible: false } : {
             resistance: 1,
-            destructible: block !== 'bedrock',
+            destructible: block.success !== 'bedrock',
           }
         }
-        const plan = planExplosion({
-          center,
+        const planResult = planExplosion({
+          center: centerPosition.success,
           radius: explosion.power,
           seed: revision,
           blocks: blockReader,
           entities: [],
         })
+        if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
+        if (Result.isFailure(planResult)) {
+          return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
+        }
+        const plan = planResult.success
+        // Explosion resolution always needs a snapshot, including an empty crater.
+        worldChanged = true
         for (const position of plan.destroyedBlocks) {
           blocks.set(positionKey(position), { at: position, block: null })
           disturbFallingBlocks([position])
@@ -4068,6 +4589,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           damagedPlayers.add(player)
           if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
         }
+        return Result.succeed(undefined)
       }
       for (const entity of entities.values()) {
         if (entity._tag === 'arrow') {
@@ -4083,12 +4605,30 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             y: at.y - entity.at.y,
             z: at.z - entity.at.z,
           }
-          const blockImpact = raycastArrowBlock(entity.at, at, (x, y, z) => {
+          const fromPosition = positionFromNumbers(entity.at.x, entity.at.y, entity.at.z)
+          if (Result.isFailure(fromPosition)) {
+            return Result.fail({ _tag: 'PositionBrandFailure', failure: fromPosition.failure })
+          }
+          const toPosition = positionFromNumbers(at.x, at.y, at.z)
+          if (Result.isFailure(toPosition)) {
+            return Result.fail({ _tag: 'PositionBrandFailure', failure: toPosition.failure })
+          }
+          let blockReadFailure: MultiplayerServerCoreFailure | undefined
+          const blockImpactResult = raycastArrowBlock(fromPosition.success, toPosition.success, (x, y, z) => {
             const position: BlockPos = { x, y, z }
             if (!isInBounds(position)) return true
             const block = blockAt(position)
-            return block !== null && options.passableBlocks?.has(block) !== true
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return true
+            }
+            return block.success !== null && options.passableBlocks?.has(block.success) !== true
           })
+          if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
+          if (Result.isFailure(blockImpactResult)) {
+            return Result.fail({ _tag: 'ArrowRaycastFailure', failure: blockImpactResult.failure })
+          }
+          const blockImpact = blockImpactResult.success
           const travelDistance = Math.hypot(travel.x, travel.y, travel.z)
           const blockProjection = Option.isNone(blockImpact) ? undefined : blockImpact.value.distance / travelDistance
           const blockWasHit = Option.isSome(blockImpact)
@@ -4190,9 +4730,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (entity._tag === 'primed-tnt') {
           const burnedSecs = entity.burnedSecs + elapsedSecs
           if (burnedSecs >= PRIMED_TNT_FUSE_SECS) {
+            const explosionResult = applyExplosion(entity.at, { source: 'tnt', power: TNT_EXPLOSION_POWER })
+            if (Result.isFailure(explosionResult)) return Result.fail(explosionResult.failure)
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
-            applyExplosion(entity.at, { source: 'tnt', power: TNT_EXPLOSION_POWER })
             continue
           }
           const updated = { ...entity, burnedSecs }
@@ -4239,9 +4780,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             creeperDeltaTime(elapsedSecs),
           )
           if (step.explosion !== undefined) {
+            const explosionResult = applyExplosion(entity.at, step.explosion)
+            if (Result.isFailure(explosionResult)) return Result.fail(explosionResult.failure)
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
-            applyExplosion(entity.at, step.explosion)
             continue
           }
           const mobState = creeperWireState(step.fuse, hostileMobState)
@@ -4271,6 +4813,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               // and `rolls` internally, and a cell array built from different positions
               // never matches what it looks up, so every candidate reads as unloaded and
               // the teleport is always refused.
+              let blockReadFailure: MultiplayerServerCoreFailure | undefined
               const cells: EndermanTeleportCell[] = endermanTeleportCandidateCells(entity.at, anchor, rolls)
                 .filter((position) => isInBounds({
                   x: Math.floor(position.x),
@@ -4284,12 +4827,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
                     z: Math.floor(position.z),
                   }
                   const block = blockAt(blockPosition)
+                  if (Result.isFailure(block)) {
+                    blockReadFailure ??= block.failure
+                    return { position, block: 'air', solid: true }
+                  }
                   return {
                     position,
-                    block: block ?? 'air',
-                    solid: block !== null && options.passableBlocks?.has(block) !== true,
+                    block: block.success ?? 'air',
+                    solid: block.success !== null && options.passableBlocks?.has(block.success) !== true,
                   }
                 })
+              if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
               at = resolveSafeEndermanTeleport(entity.at, anchor, rolls, cells)
             }
           }
@@ -4393,19 +4941,35 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           .filter((entry) => entry[2] <= WITHER_TARGET_RANGE)
           .sort((left, right) => left[2] - right[2])[0]
         const target = targetEntry?.[1].at ?? dimensionWithers[0]?.state.feetPosition ?? { x: 0, y: 64, z: 0 }
-        const result = advanceWitherRuntime(
+        let skullBlockReadFailure: MultiplayerServerCoreFailure | undefined
+        const advanceResult = advanceWitherRuntime(
           advanced,
           dimension,
           target,
           elapsedMs / 1_000,
-          (_skull, position) => blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) }) !== null,
+          (_skull, position) => {
+            const block = blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) })
+            if (Result.isFailure(block)) {
+              skullBlockReadFailure ??= block.failure
+              return false
+            }
+            return block.success !== null
+          },
         )
-        advanced = result.state
-        if (result.meleeDamage > 0 && targetEntry !== undefined) {
+        if (skullBlockReadFailure !== undefined) return Result.fail(skullBlockReadFailure)
+        if (Result.isFailure(advanceResult)) {
+          return Result.fail({
+            _tag: 'WitherRuntimeFailure',
+            operation: 'advance',
+            failure: advanceResult.failure,
+          })
+        }
+        advanced = advanceResult.success.state
+        if (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined) {
           const playerVitals = vitals.get(targetEntry[0])
           if (playerVitals !== undefined) {
             const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - result.meleeDamage)
+            playerVitals.health = Math.max(0, playerVitals.health - advanceResult.success.meleeDamage)
             const hungerActor = hungerActors.get(targetEntry[0])
             if (hungerActor !== undefined) hungerActors.set(targetEntry[0], {
               ...hungerActor,
@@ -4415,17 +4979,26 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
           }
         }
-        for (const explosion of result.explosions) {
+        for (const explosion of advanceResult.success.explosions) {
+          let explosionBlockReadFailure: MultiplayerServerCoreFailure | undefined
           const blockReader = (position: BlockPos) => {
             if (!isInBounds(position)) return undefined
             const block = blockAt(position)
-            return block === null ? { resistance: 0, destructible: false } : {
+            if (Result.isFailure(block)) {
+              explosionBlockReadFailure ??= block.failure
+              return undefined
+            }
+            return block.success === null ? { resistance: 0, destructible: false } : {
               resistance: explosion.destroysResistantBlocks ? 0 : 1,
-              destructible: block !== 'bedrock',
+              destructible: block.success !== 'bedrock',
             }
           }
-          const plan = planExplosion({ center: explosion.position, radius: explosion.power, seed: revision + witherRevision, blocks: blockReader, entities: [] })
-          for (const position of plan.destroyedBlocks) {
+          const planResult = planExplosion({ center: explosion.position, radius: explosion.power, seed: revision + witherRevision, blocks: blockReader, entities: [] })
+          if (explosionBlockReadFailure !== undefined) return Result.fail(explosionBlockReadFailure)
+          if (Result.isFailure(planResult)) {
+            return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
+          }
+          for (const position of planResult.success.destroyedBlocks) {
             blocks.set(positionKey(position), { at: position, block: null })
             disturbFallingBlocks([position])
             worldChanged = true
@@ -4516,6 +5089,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (stateChanged) notifyStateChanged()
     for (const delta of postPersistenceDeltas) broadcast(delta)
     if (worldSnapshotRequired) broadcast(snapshot())
+    return Result.succeed(undefined)
   }
 
   const spawnEntity = (entity: AuthoritativeEntityState): boolean => {

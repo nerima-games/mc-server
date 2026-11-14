@@ -8,6 +8,8 @@ import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 
 import {
+  BlockAxis,
+  BlockId,
   blockPosition,
   blockTypeOfId,
   chunkCoordOfBlock,
@@ -18,6 +20,7 @@ import {
   CHUNK_HEIGHT,
   generateChunkAt,
   getBlockAt,
+  NoiseSeed as WorldgenNoiseSeed,
   type Chunk,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -39,7 +42,7 @@ import {
   isValidBrewingStandState,
   isValidStatusEffectState,
 } from '@nerima-games/mx-gameplay'
-import { Schema } from 'effect'
+import { Result, Schema } from 'effect'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import { isValidAnvilName } from '../multiplayer-shared/anvil-network.js'
@@ -50,6 +53,7 @@ import {
   makeMultiplayerServerCore,
   type MultiplayerServerCore,
   type MultiplayerServerState,
+  type GeneratedBlockReadFailure,
 } from './core.js'
 import { loadLegacyPlayerClaims } from './legacy-player-claims.js'
 import { createReconnectAuth } from './reconnect-auth.js'
@@ -134,11 +138,11 @@ const decodePlayerResume = (frame: string): PlayerResume | undefined => {
     || (resume['token'] !== undefined && typeof resume['token'] !== 'string')
     || (resume['registrationToken'] !== undefined && typeof resume['registrationToken'] !== 'string')
   ) return undefined
-  const player = Schema.decodeUnknownEither(PlayerIdSchema)(resume['player'])
-  if (player._tag === 'Left') return undefined
+  const player = Schema.decodeUnknownResult(PlayerIdSchema)(resume['player'])
+  if (Result.isFailure(player)) return undefined
   return {
     _tag: 'PlayerResume',
-    player: player.right,
+    player: player.success,
     ...(resume['token'] === undefined ? {} : { token: resume['token'] }),
     ...(resume['registrationToken'] === undefined ? {} : { registrationToken: resume['registrationToken'] }),
   }
@@ -249,8 +253,8 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     ? []
     : playerPositionsValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isPlayerPosition(entry['at']) || !isOrientation(entry['facing'])) return []
-        const player = Schema.decodeUnknownEither(PlayerIdSchema)(entry['player'])
-        return player._tag === 'Left' ? [] : [{ player: player.right, at: entry['at'], facing: entry['facing'] }]
+        const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
+        return Result.isFailure(player) ? [] : [{ player: player.success, at: entry['at'], facing: entry['facing'] }]
       })
   if (playerPositionsValue !== undefined && playerPositions.length !== playerPositionsValue.length) return undefined
 
@@ -261,10 +265,10 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     : eyeOfEnderRecoveriesValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isPlayerPosition(entry['at']) || typeof entry['remainingSecs'] !== 'number'
           || !Number.isFinite(entry['remainingSecs']) || entry['remainingSecs'] <= 0) return []
-        const entityId = Schema.decodeUnknownEither(EntityIdSchema)(entry['entityId'])
-        return entityId._tag === 'Left'
+        const entityId = Schema.decodeUnknownResult(EntityIdSchema)(entry['entityId'])
+        return Result.isFailure(entityId)
           ? []
-          : [{ entityId: entityId.right, at: entry['at'], remainingSecs: entry['remainingSecs'] }]
+          : [{ entityId: entityId.success, at: entry['at'], remainingSecs: entry['remainingSecs'] }]
       })
   if (eyeOfEnderRecoveriesValue !== undefined && eyeOfEnderRecoveries.length !== eyeOfEnderRecoveriesValue.length) return undefined
 
@@ -321,8 +325,8 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     ? []
     : statusEffectsValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isValidStatusEffectState(entry['state'])) return []
-        const player = Schema.decodeUnknownEither(PlayerIdSchema)(entry['player'])
-        return player._tag === 'Left' ? [] : [{ player: player.right, state: entry['state'] }]
+        const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
+        return Result.isFailure(player) ? [] : [{ player: player.success, state: entry['state'] }]
       })
   if (statusEffectsValue !== undefined && statusEffects.length !== statusEffectsValue.length) return undefined
 
@@ -332,14 +336,14 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     ? []
     : anvilNamesValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !Array.isArray(entry['names'])) return []
-        const player = Schema.decodeUnknownEither(PlayerIdSchema)(entry['player'])
-        if (player._tag === 'Left') return []
+        const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
+        if (Result.isFailure(player)) return []
         const names = entry['names'].flatMap((nameEntry: unknown) => {
           if (!isRecord(nameEntry) || !isNonNegativeSafeInteger(nameEntry['slot']) || !isValidAnvilName(nameEntry['name'])) return []
           return [{ slot: nameEntry['slot'], name: nameEntry['name'] }]
         })
         if (names.length !== entry['names'].length) return []
-        return [{ player: player.right, names }]
+        return [{ player: player.success, names }]
       })
   if (anvilNamesValue !== undefined && anvilNames.length !== anvilNamesValue.length) return undefined
 
@@ -349,19 +353,19 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     ? []
     : enchantmentsValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isNonNegativeSafeInteger(entry['seed']) || !Array.isArray(entry['items'])) return []
-        const player = Schema.decodeUnknownEither(PlayerIdSchema)(entry['player'])
-        if (player._tag === 'Left') return []
+        const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
+        if (Result.isFailure(player)) return []
         const items = entry['items'].flatMap((itemEntry: unknown) => {
           if (!isRecord(itemEntry) || !isNonNegativeSafeInteger(itemEntry['slot'])) return []
           const decoded = decodeEnchantedItem(itemEntry['item'])
           return decoded.ok ? [{ slot: itemEntry['slot'], item: decoded.value }] : []
         })
         if (items.length !== entry['items'].length) return []
-        return [{ player: player.right, seed: entry['seed'], items }]
+        return [{ player: player.success, seed: entry['seed'], items }]
       })
   if (enchantmentsValue !== undefined && enchantments.length !== enchantmentsValue.length) return undefined
 
-  const decoded = Schema.decodeUnknownEither(AuthoritativeSnapshot)({
+  const decoded = Schema.decodeUnknownResult(AuthoritativeSnapshot)({
     _tag: 'AuthoritativeSnapshot',
     world: worldId,
     revision,
@@ -383,8 +387,8 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     villagerTrades: state['villagerTrades'] ?? [],
     entities: state['entities'] ?? [],
   })
-  if (decoded._tag === 'Left') return undefined
-  const snapshot = decoded.right
+  if (Result.isFailure(decoded)) return undefined
+  const snapshot = decoded.success
   return {
     revision: snapshot.revision,
     blocks,
@@ -510,33 +514,62 @@ export const createLatestStatePersistence = <State>(
   }
 }
 
-export const makeGeneratedBlockAt = (seed: number): ((position: BlockPos) => string | null) => {
+export const makeGeneratedBlockAt = (
+  seed: number,
+): ((position: BlockPos) => Result.Result<string | null, GeneratedBlockReadFailure>) => {
+  const seedResult = WorldgenNoiseSeed.result(seed)
   const chunks = new Map<string, Chunk>()
   return (at) => {
-    if (!Number.isInteger(at.x) || !Number.isInteger(at.y) || !Number.isInteger(at.z) || at.y < 0 || at.y >= CHUNK_HEIGHT) return null
-    const position = blockPosition(at.x, at.y, at.z)
+    if (Result.isFailure(seedResult)) {
+      return Result.fail({ _tag: 'GeneratedNoiseSeedFailure', failure: seedResult.failure })
+    }
+    const x = BlockAxis.result(at.x)
+    if (Result.isFailure(x)) return Result.fail({ _tag: 'GeneratedBlockAxisFailure', axis: 'x', failure: x.failure })
+    const y = BlockAxis.result(at.y)
+    if (Result.isFailure(y)) return Result.fail({ _tag: 'GeneratedBlockAxisFailure', axis: 'y', failure: y.failure })
+    const z = BlockAxis.result(at.z)
+    if (Result.isFailure(z)) return Result.fail({ _tag: 'GeneratedBlockAxisFailure', axis: 'z', failure: z.failure })
+    if (y.success < 0 || y.success >= CHUNK_HEIGHT) return Result.succeed(null)
+    const position = blockPosition(x.success, y.success, z.success)
     const coordinate = chunkCoordOfBlock(position)
     const key = `${String(coordinate.cx)},${String(coordinate.cz)}`
     let chunk = chunks.get(key)
     if (chunk === undefined) {
-      chunk = generateChunkAt(seed, coordinate.cx, coordinate.cz)
+      const chunkResult = generateChunkAt(seedResult.success, coordinate.cx, coordinate.cz)
+      if (Result.isFailure(chunkResult)) {
+        return Result.fail({ _tag: 'GeneratedChunkFailure', failure: chunkResult.failure })
+      }
+      chunk = chunkResult.success
       chunks.set(key, chunk)
     }
     const local = localCoordOfBlock(position)
-    const block = blockTypeOfId(getBlockAt(chunk, local.lx, local.ly, local.lz))
-    return block === undefined || block === 'air' ? null : block
+    const blockId = BlockId.result(getBlockAt(chunk, local.lx, local.ly, local.lz))
+    if (Result.isFailure(blockId)) {
+      return Result.fail({ _tag: 'GeneratedBlockIdFailure', failure: blockId.failure })
+    }
+    const block = blockTypeOfId(blockId.success)
+    if (Result.isFailure(block)) {
+      return Result.fail({ _tag: 'GeneratedBlockRegistryFailure', failure: block.failure })
+    }
+    return Result.succeed(block.success === undefined || block.success === 'air' ? null : block.success)
   }
 }
 
-const findSpawnAt = (generatedBlockAt: (position: BlockPos) => string | null): BlockPos => {
+const findSpawnAt = (
+  generatedBlockAt: (position: BlockPos) => Result.Result<string | null, GeneratedBlockReadFailure>,
+): Result.Result<BlockPos, GeneratedBlockReadFailure> => {
   for (let y = CHUNK_HEIGHT - 2; y >= 0; y -= 1) {
-    if (
-      generatedBlockAt({ x: 0, y, z: 0 }) !== null
-      && generatedBlockAt({ x: 0, y: y + 1, z: 0 }) === null
-      && generatedBlockAt({ x: 0, y: y + 2, z: 0 }) === null
-    ) return { x: 0, y: y + 1, z: 0 }
+    const ground = generatedBlockAt({ x: 0, y, z: 0 })
+    if (Result.isFailure(ground)) return Result.fail(ground.failure)
+    const feet = generatedBlockAt({ x: 0, y: y + 1, z: 0 })
+    if (Result.isFailure(feet)) return Result.fail(feet.failure)
+    const head = generatedBlockAt({ x: 0, y: y + 2, z: 0 })
+    if (Result.isFailure(head)) return Result.fail(head.failure)
+    if (ground.success !== null && feet.success === null && head.success === null) {
+      return Result.succeed({ x: 0, y: y + 1, z: 0 })
+    }
   }
-  return { x: 0, y: 64, z: 0 }
+  return Result.succeed({ x: 0, y: 64, z: 0 })
 }
 
 const listen = (server: HttpServer, port: number, host: string): Promise<number> =>
@@ -554,7 +587,16 @@ const listen = (server: HttpServer, port: number, host: string): Promise<number>
     })
   })
 
-export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions): Promise<MultiplayerRuntime> => {
+export const startMultiplayerServer = async (
+  options: MultiplayerRuntimeOptions,
+): Promise<Result.Result<MultiplayerRuntime, GeneratedBlockReadFailure>> => {
+  const generatedBlockAt = makeGeneratedBlockAt(options.seed)
+  const overworldSpawnResult = findSpawnAt(generatedBlockAt)
+  if (Result.isFailure(overworldSpawnResult)) return Result.fail(overworldSpawnResult.failure)
+  const netherSpawnResult = findSpawnAt(generatedBlockAt)
+  if (Result.isFailure(netherSpawnResult)) return Result.fail(netherSpawnResult.failure)
+  const overworldSpawnAt = overworldSpawnResult.success
+  const netherSpawnAt = netherSpawnResult.success
   const transportSecurity = resolveTransportSecurity(options)
   const stateFile = options.stateFile
   const initialState = stateFile === undefined
@@ -592,9 +634,6 @@ export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions)
     : createLatestStatePersistence((state: MultiplayerServerState) =>
         writeServerState(netherStateFile, 'nether', options.seed, state),
       )
-  const generatedBlockAt = makeGeneratedBlockAt(options.seed)
-  const overworldSpawnAt = findSpawnAt(generatedBlockAt)
-  const netherSpawnAt = findSpawnAt(generatedBlockAt)
   const endSpawnAt: BlockPos = { x: 0, y: 64, z: 0 }
   const overworldNetherPortalAt: BlockPos = { x: overworldSpawnAt.x - 1, y: overworldSpawnAt.y, z: overworldSpawnAt.z }
   const netherPortalAt: BlockPos = { x: netherSpawnAt.x + 1, y: netherSpawnAt.y, z: netherSpawnAt.z }
@@ -662,7 +701,7 @@ export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions)
     dimension: 'end',
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
-    generatedBlockAt: () => null,
+    generatedBlockAt: () => Result.succeed(null),
     spawnAt: endSpawnAt,
     staticBlocks: endStaticBlocks,
     ...(endInitialState === undefined ? {} : { initialState: endInitialState }),
@@ -825,6 +864,9 @@ export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions)
             return
           }
           const result = realm.receive(clientId, frame)
+          if (!result.accepted && result.failure !== undefined) {
+            console.error('Multiplayer command failed', { clientId, failure: result.failure })
+          }
           if (result.accepted && result.message._tag === 'PlayerLeave') {
             disconnect()
             if (socket.readyState === WebSocket.OPEN) socket.close(1000, 'player left')
@@ -853,9 +895,9 @@ export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions)
         }
         const decoded = decodeFrame(frame)
         if (
-          decoded._tag === 'Left'
-          || decoded.right._tag !== 'PlayerJoin'
-          || decoded.right.player !== authenticatedPlayer
+          Result.isFailure(decoded)
+          || decoded.success._tag !== 'PlayerJoin'
+          || decoded.success.player !== authenticatedPlayer
         ) {
           reservedPlayers.delete(authenticatedPlayer)
           rejectHandshake('player join did not match authenticated identity')
@@ -884,12 +926,22 @@ export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions)
   let lastTickAt = performance.now()
   const serverTickTimer = setInterval(() => {
     const now = performance.now()
-    const elapsedMs = Math.max(0, now - lastTickAt)
+    const elapsedMs = now - lastTickAt
     lastTickAt = now
-    redstoneRuntime.tick(elapsedMs)
-    overworldCore.tick(elapsedMs)
-    netherCore.tick(elapsedMs)
-    endCore.tick(elapsedMs)
+    const redstoneResult = redstoneRuntime.tick(elapsedMs)
+    if (Result.isFailure(redstoneResult)) {
+      console.error('Multiplayer redstone tick failed', { failure: redstoneResult.failure })
+    }
+    for (const [worldId, core] of [
+      [options.worldId, overworldCore],
+      ['nether', netherCore],
+      ['end', endCore],
+    ] as const) {
+      const result = core.tick(elapsedMs)
+      if (Result.isFailure(result)) {
+        console.error('Multiplayer tick failed', { worldId, failure: result.failure })
+      }
+    }
   }, 50)
   let closing: Promise<void> | undefined
   const signalHandlers = new Map<NodeJS.Signals, () => void>()
@@ -917,13 +969,18 @@ export const startMultiplayerServer = async (options: MultiplayerRuntimeOptions)
     }
   }
 
-  return { host: options.host, port, close }
+  return Result.succeed({ host: options.host, port, close })
 }
 
 const entryPoint = process.argv[1]
 if (entryPoint !== undefined && import.meta.url === pathToFileURL(entryPoint).href) {
   const options = resolveMultiplayerRuntimeOptions()
   const runtime = await startMultiplayerServer(options)
-  const scheme = options.tlsCert === undefined ? 'ws' : 'wss'
-  process.stdout.write(`multiplayer server listening on ${scheme}://${runtime.host}:${String(runtime.port)}/ws\n`)
+  if (Result.isFailure(runtime)) {
+    console.error('Multiplayer server startup failed', { failure: runtime.failure })
+    process.exitCode = 1
+  } else {
+    const scheme = options.tlsCert === undefined ? 'ws' : 'wss'
+    process.stdout.write(`multiplayer server listening on ${scheme}://${runtime.success.host}:${String(runtime.success.port)}/ws\n`)
+  }
 }

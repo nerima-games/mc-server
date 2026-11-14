@@ -10,6 +10,7 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import type { Dimension } from '@nerima-games/mc-worldgen'
+import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import { makeMultiplayerServerCore, type MultiplayerServerOptions, type MultiplayerServerState, type ReceiveResult } from '../../apps/multiplayer-server/core'
@@ -26,15 +27,15 @@ const worldId = (value: string): WorldId => value as WorldId
 
 const frame = (message: NetworkMessage): WireText => {
   const result = encodeFrame(message)
-  if (result._tag === 'Left') throw result.left
-  return result.right
+  if (result._tag === 'Failure') throw result.failure
+  return result.success
 }
 
 const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage> =>
   frames.filter((wire) => decodeSleepWireMessage(wire) === undefined && decodeWitherWireMessage(wire) === undefined && decodeEnderDragonWireMessage(wire) === undefined && decodeBrewingWireMessage(wire) === undefined && decodeAnvilWireMessage(wire) === undefined && decodeEnchantingWireMessage(wire) === undefined).map((wire) => {
     const result = decodeFrame(wire)
-    if (result._tag === 'Left') throw result.left
-    return result.right
+    if (result._tag === 'Failure') throw result.failure
+    return result.success
   })
 
 const sleepMessages = (frames: ReadonlyArray<WireText>): ReadonlyArray<SleepWireMessage> =>
@@ -74,7 +75,7 @@ const join = (player: string, name = player): Extract<NetworkMessage, { readonly
   at: { x: 0, y: 64, z: 0 },
 })
 
-const witherStructureAt = ({ x, y, z }: { x: number; y: number; z: number }): string | null => {
+const witherStructureAt: NonNullable<MultiplayerServerOptions['generatedBlockAt']> = ({ x, y, z }) => {
   const blocks = new Map([
     ['0,64,0', 'soul_sand'],
     ['-1,65,0', 'soul_sand'],
@@ -84,11 +85,11 @@ const witherStructureAt = ({ x, y, z }: { x: number; y: number; z: number }): st
     ['0,66,0', 'wither_skeleton_skull'],
     ['1,66,0', 'wither_skeleton_skull'],
   ])
-  return blocks.get(`${String(x)},${String(y)},${String(z)}`) ?? null
+  return Result.succeed(blocks.get(`${String(x)},${String(y)},${String(z)}`) ?? null)
 }
 
 const makeFixture = (
-  generatedBlockAt: (at: { x: number; y: number; z: number }) => string | null = () => null,
+  generatedBlockAt: NonNullable<MultiplayerServerOptions['generatedBlockAt']> = () => Result.succeed(null),
   timeOfDay = 6_000,
   spawnAt: { x: number; y: number; z: number } = { x: 0, y: 64, z: 0 },
   initialWeather: 'clear' | 'rain' | 'thunder' = 'clear',

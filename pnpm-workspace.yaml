@@ -3,3 +3,7 @@ packages:
 
 allowBuilds:
   esbuild: true
+
+minimumReleaseAgeExclude:
+  - '@nerima-games/mc-sim@0.11.0'
+  - '@nerima-games/mc-worldgen@0.9.0'
