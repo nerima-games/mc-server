@@ -1,3 +1,5 @@
+import { Brand, Result } from 'effect'
+import { DeltaTimeSecs, PositionAxis, position, type Position } from '@nerima-games/mc-kernel'
 import {
   createWither,
   damageWither,
@@ -6,15 +8,22 @@ import {
   serializeWither,
   stepWither,
   witherSkullProjectile,
+  WitherExplosionPower,
+  WitherProjectileSpeed,
+  WitherSummonMaterial,
+  WitherChargeRemainingSecs,
+  WitherHealthPoints,
   type WitherDamageKind,
   type BlockCell,
   type WitherDeathDescriptor,
-  type WitherPhase,
   type WitherSkullProjectileDescriptor,
   type WitherSkullVariant,
   type WitherSnapshot,
   type WitherState,
+  type WitherSummonMatch,
 } from '@nerima-games/mc-sim'
+
+type NumericPosition = Readonly<{ x: number; y: number; z: number }>
 
 export type RuntimeWither = Readonly<{
   id: string
@@ -30,7 +39,7 @@ export type RuntimeWitherSkull = Readonly<{
   ownerId: string
   dimension: string
   descriptor: WitherSkullProjectileDescriptor
-  position: Readonly<{ x: number; y: number; z: number }>
+  position: Position
   ageSecs: number
 }>
 
@@ -59,12 +68,12 @@ export type WitherRenderDescriptor = Readonly<{
   id: string
   kind: 'wither' | 'wither_skull'
   category: 'hostile'
-  feetPosition: Readonly<{ x: number; y: number; z: number }>
+  feetPosition: Position
   facingRadians?: number
 }>
 
 export type WitherExplosion = Readonly<{
-  position: Readonly<{ x: number; y: number; z: number }>
+  position: Position
   power: number
   destroysResistantBlocks: boolean
 }>
@@ -96,38 +105,54 @@ const isNonNegativeSafeInteger = (value: unknown): value is number =>
 const isIdentifier = (value: unknown): value is string =>
   typeof value === 'string' && value.trim().length > 0 && !/[\u0000-\u001f\u007f]/u.test(value)
 
-const isPosition = (value: unknown): value is Readonly<{ x: number; y: number; z: number }> =>
-  isRecord(value)
-  && hasExactlyKeys(value, ['x', 'y', 'z'])
-  && typeof value['x'] === 'number'
-  && Number.isFinite(value['x'])
-  && typeof value['y'] === 'number'
-  && Number.isFinite(value['y'])
-  && typeof value['z'] === 'number'
-  && Number.isFinite(value['z'])
-
-const isWitherPhase = (value: unknown): value is WitherPhase =>
+const isWitherPhase = (value: unknown): value is WitherState['phase'] =>
   value === 'charging' || value === 'airborne' || value === 'armoured' || value === 'dead'
+
+const makePosition = (value: NumericPosition): Result.Result<Position, Brand.BrandError> =>
+  Result.flatMap(PositionAxis.result(value.x), (x) =>
+    Result.flatMap(PositionAxis.result(value.y), (y) =>
+      Result.map(PositionAxis.result(value.z), (z) => position(x, y, z)),
+    ),
+  )
+
+const decodePosition = (value: unknown): Position | undefined => {
+  if (!isRecord(value) || !hasExactlyKeys(value, ['x', 'y', 'z'])) return undefined
+  const { x, y, z } = value
+  if (typeof x !== 'number' || !Number.isFinite(x)
+    || typeof y !== 'number' || !Number.isFinite(y)
+    || typeof z !== 'number' || !Number.isFinite(z)) return undefined
+  const decoded = makePosition({ x, y, z })
+  return Result.isFailure(decoded) ? undefined : decoded.success
+}
 
 const isWitherSkullVariant = (value: unknown): value is WitherSkullVariant =>
   value === 'normal' || value === 'blue'
 
-const isWitherSnapshot = (value: unknown): value is WitherSnapshot =>
-  isRecord(value)
-  && hasExactlyKeys(value, ['kind', 'version', 'state'])
-  && value['kind'] === 'wither'
-  && value['version'] === 1
-  && isRecord(value['state'])
-  && hasExactlyKeys(value['state'], ['phase', 'healthPoints', 'chargeRemainingSecs', 'feetPosition', 'velocity'])
-  && isWitherPhase(value['state']['phase'])
-  && isNonNegativeFiniteNumber(value['state']['healthPoints'])
-  && isNonNegativeFiniteNumber(value['state']['chargeRemainingSecs'])
-  && isPosition(value['state']['feetPosition'])
-  && isPosition(value['state']['velocity'])
+const decodeWitherSnapshot = (value: unknown): WitherSnapshot | undefined => {
+  if (!isRecord(value) || !hasExactlyKeys(value, ['kind', 'version', 'state'])
+    || value['kind'] !== 'wither' || value['version'] !== 1 || !isRecord(value['state'])
+    || !hasExactlyKeys(value['state'], ['phase', 'healthPoints', 'chargeRemainingSecs', 'feetPosition', 'velocity'])) return undefined
 
-const isWitherSkullDescriptor = (value: unknown): value is WitherSkullProjectileDescriptor =>
-  isRecord(value)
-  && hasExactlyKeys(value, [
+  const feetPosition = decodePosition(value['state']['feetPosition'])
+  const velocity = decodePosition(value['state']['velocity'])
+  if (feetPosition === undefined || velocity === undefined) return undefined
+
+  const phase = value['state']['phase']
+  const healthPoints = value['state']['healthPoints']
+  const chargeRemainingSecs = value['state']['chargeRemainingSecs']
+  if (!isWitherPhase(phase) || typeof healthPoints !== 'number' || typeof chargeRemainingSecs !== 'number') return undefined
+  const decodedHealth = WitherHealthPoints.result(healthPoints)
+  const decodedCharge = WitherChargeRemainingSecs.result(chargeRemainingSecs)
+  if (Result.isFailure(decodedHealth) || Result.isFailure(decodedCharge)) return undefined
+  return {
+    kind: 'wither',
+    version: 1,
+    state: { phase, healthPoints: decodedHealth.success, chargeRemainingSecs: decodedCharge.success, feetPosition, velocity },
+  }
+}
+
+const decodeWitherSkullDescriptor = (value: unknown): WitherSkullProjectileDescriptor | undefined => {
+  if (!isRecord(value) || !hasExactlyKeys(value, [
     'kind',
     'variant',
     'origin',
@@ -135,43 +160,61 @@ const isWitherSkullDescriptor = (value: unknown): value is WitherSkullProjectile
     'speed',
     'explosivePower',
     'destroysResistantBlocks',
-  ])
-  && value['kind'] === 'wither_skull'
-  && isWitherSkullVariant(value['variant'])
-  && isPosition(value['origin'])
-  && isPosition(value['direction'])
-  && isNonNegativeFiniteNumber(value['speed'])
-  && isNonNegativeFiniteNumber(value['explosivePower'])
-  && typeof value['destroysResistantBlocks'] === 'boolean'
+  ]) || value['kind'] !== 'wither_skull' || !isWitherSkullVariant(value['variant'])
+    || typeof value['destroysResistantBlocks'] !== 'boolean') return undefined
 
-const isRuntimeWitherSnapshot = (
+  const origin = decodePosition(value['origin'])
+  const direction = decodePosition(value['direction'])
+  const speedValue = value['speed']
+  const explosivePowerValue = value['explosivePower']
+  if (typeof speedValue !== 'number' || typeof explosivePowerValue !== 'number') return undefined
+  const speed = WitherProjectileSpeed.result(speedValue)
+  const explosivePower = WitherExplosionPower.result(explosivePowerValue)
+  if (origin === undefined || direction === undefined || Result.isFailure(speed)
+    || Result.isFailure(explosivePower)) return undefined
+
+  return {
+    kind: 'wither_skull',
+    variant: value['variant'],
+    origin,
+    direction,
+    speed: speed.success,
+    explosivePower: explosivePower.success,
+    destroysResistantBlocks: value['destroysResistantBlocks'],
+  }
+}
+
+const decodeRuntimeWitherSnapshot = (
   value: unknown,
-): value is WitherRuntimeSnapshot['withers'][number] =>
-  isRecord(value)
-  && hasExactlyKeys(value, [
+): WitherRuntimeSnapshot['withers'][number] | undefined => {
+  if (!isRecord(value) || !hasExactlyKeys(value, [
     'id',
     'dimension',
     'snapshot',
     'rangedCooldownSecs',
     'meleeCooldownSecs',
     'shotsFired',
-  ])
-  && isIdentifier(value['id'])
-  && isIdentifier(value['dimension'])
-  && isWitherSnapshot(value['snapshot'])
-  && isNonNegativeFiniteNumber(value['rangedCooldownSecs'])
-  && isNonNegativeFiniteNumber(value['meleeCooldownSecs'])
-  && isNonNegativeSafeInteger(value['shotsFired'])
+  ])) return undefined
 
-const isRuntimeWitherSkull = (value: unknown): value is RuntimeWitherSkull =>
-  isRecord(value)
-  && hasExactlyKeys(value, ['id', 'ownerId', 'dimension', 'descriptor', 'position', 'ageSecs'])
-  && isIdentifier(value['id'])
-  && isIdentifier(value['ownerId'])
-  && isIdentifier(value['dimension'])
-  && isWitherSkullDescriptor(value['descriptor'])
-  && isPosition(value['position'])
-  && isNonNegativeFiniteNumber(value['ageSecs'])
+  const snapshot = decodeWitherSnapshot(value['snapshot'])
+  const rangedCooldownSecs = value['rangedCooldownSecs']
+  const meleeCooldownSecs = value['meleeCooldownSecs']
+  const shotsFired = value['shotsFired']
+  if (!isIdentifier(value['id']) || !isIdentifier(value['dimension']) || snapshot === undefined
+    || !isNonNegativeFiniteNumber(rangedCooldownSecs) || !isNonNegativeFiniteNumber(meleeCooldownSecs)
+    || !isNonNegativeSafeInteger(shotsFired)) return undefined
+  return { id: value['id'], dimension: value['dimension'], snapshot, rangedCooldownSecs, meleeCooldownSecs, shotsFired }
+}
+
+const decodeRuntimeWitherSkull = (value: unknown): RuntimeWitherSkull | undefined => {
+  if (!isRecord(value) || !hasExactlyKeys(value, ['id', 'ownerId', 'dimension', 'descriptor', 'position', 'ageSecs'])) return undefined
+  const descriptor = decodeWitherSkullDescriptor(value['descriptor'])
+  const position = decodePosition(value['position'])
+  const ageSecs = value['ageSecs']
+  if (!isIdentifier(value['id']) || !isIdentifier(value['ownerId']) || !isIdentifier(value['dimension'])
+    || descriptor === undefined || position === undefined || !isNonNegativeFiniteNumber(ageSecs)) return undefined
+  return { id: value['id'], ownerId: value['ownerId'], dimension: value['dimension'], descriptor, position, ageSecs }
+}
 
 export const isValidWitherRuntimeSnapshot = (value: unknown): value is WitherRuntimeSnapshot =>
   isRecord(value)
@@ -179,9 +222,9 @@ export const isValidWitherRuntimeSnapshot = (value: unknown): value is WitherRun
   && isNonNegativeSafeInteger(value['nextWitherId'])
   && isNonNegativeSafeInteger(value['nextSkullId'])
   && Array.isArray(value['withers'])
-  && value['withers'].every(isRuntimeWitherSnapshot)
+  && value['withers'].every((entry) => decodeRuntimeWitherSnapshot(entry) !== undefined)
   && Array.isArray(value['skulls'])
-  && value['skulls'].every(isRuntimeWitherSkull)
+  && value['skulls'].every((entry) => decodeRuntimeWitherSkull(entry) !== undefined)
 
 export const initialWitherRuntimeState = (): WitherRuntimeState => ({
   nextWitherId: 0,
@@ -193,27 +236,28 @@ export const initialWitherRuntimeState = (): WitherRuntimeState => ({
 export const summonRuntimeWither = (
   runtime: WitherRuntimeState,
   dimension: string,
-  position: Readonly<{ x: number; y: number; z: number }>,
-): WitherRuntimeState => {
-  const nextWitherId = runtime.nextWitherId + 1
-  return {
-    ...runtime,
-    nextWitherId,
-    withers: [...runtime.withers, {
-      id: `wither-${String(nextWitherId)}`,
-      dimension,
-      state: createWither(position),
-      rangedCooldownSecs: RANGED_INTERVAL_SECS,
-      meleeCooldownSecs: MELEE_INTERVAL_SECS,
-      shotsFired: 0,
-    }],
-  }
-}
+  position: NumericPosition,
+): Result.Result<WitherRuntimeState, Brand.BrandError> =>
+  Result.map(makePosition(position), (feetPosition) => {
+    const nextWitherId = runtime.nextWitherId + 1
+    return {
+      ...runtime,
+      nextWitherId,
+      withers: [...runtime.withers, {
+        id: `wither-${String(nextWitherId)}`,
+        dimension,
+        state: createWither(feetPosition),
+        rangedCooldownSecs: RANGED_INTERVAL_SECS,
+        meleeCooldownSecs: MELEE_INTERVAL_SECS,
+        shotsFired: 0,
+      }],
+    }
+  })
 
 export const matchRuntimeWitherSummon = (
-  placedSkull: BlockCell,
+  placedSkull: NumericPosition,
   blockAt: (cell: BlockCell) => string | undefined,
-): ReturnType<typeof matchWitherSummon> => {
+): Result.Result<WitherSummonMatch | undefined, Brand.BrandError> => {
   for (const base of [
     { x: placedSkull.x, y: placedSkull.y - 2, z: placedSkull.z },
     { x: placedSkull.x - 1, y: placedSkull.y - 2, z: placedSkull.z },
@@ -221,10 +265,25 @@ export const matchRuntimeWitherSummon = (
     { x: placedSkull.x, y: placedSkull.y - 2, z: placedSkull.z - 1 },
     { x: placedSkull.x, y: placedSkull.y - 2, z: placedSkull.z + 1 },
   ]) {
-    const match = matchWitherSummon(base, blockAt)
-    if (match !== undefined) return match
+    const positionedBase = makePosition(base)
+    if (Result.isFailure(positionedBase)) return Result.fail(positionedBase.failure)
+
+    let materialFailure: Brand.BrandError | undefined
+    const match = matchWitherSummon(positionedBase.success, (cell) => {
+      const value = blockAt(cell)
+      if (value !== 'soul_sand' && value !== 'soul_soil') return undefined
+      const material = WitherSummonMaterial.result(value)
+      if (Result.isFailure(material)) {
+        materialFailure = material.failure
+        return undefined
+      }
+      return material.success
+    })
+    if (materialFailure !== undefined) return Result.fail(materialFailure)
+    if (Result.isFailure(match)) return match
+    if (match.success !== undefined) return match
   }
-  return undefined
+  return Result.succeed(undefined)
 }
 
 export const damageRuntimeWither = (
@@ -232,30 +291,41 @@ export const damageRuntimeWither = (
   id: string,
   amount: number,
   kind: WitherDamageKind,
-): Readonly<{ state: WitherRuntimeState; death: WitherDeathDescriptor | undefined }> => {
+): Result.Result<Readonly<{ state: WitherRuntimeState; death: WitherDeathDescriptor | undefined }>, Brand.BrandError> => {
   let death: WitherDeathDescriptor | undefined
-  const withers = runtime.withers.flatMap((wither) => {
-    if (wither.id !== id) return [wither]
+  const withers: RuntimeWither[] = []
+  for (const wither of runtime.withers) {
+    if (wither.id !== id) {
+      withers.push(wither)
+      continue
+    }
     const result = damageWither(wither.state, amount, kind)
-    death = result.death
-    return result.death === undefined ? [{ ...wither, state: result.state }] : []
-  })
-  return { state: { ...runtime, withers }, death }
+    if (Result.isFailure(result)) return Result.fail(result.failure)
+    death = result.success.death
+    if (result.success.death === undefined) withers.push({ ...wither, state: result.success.state })
+  }
+  return Result.succeed({ state: { ...runtime, withers }, death })
 }
 
 const distance = (
-  left: Readonly<{ x: number; y: number; z: number }>,
-  right: Readonly<{ x: number; y: number; z: number }>,
+  left: NumericPosition,
+  right: NumericPosition,
 ): number => Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z)
 
 export const advanceWitherRuntime = (
   runtime: WitherRuntimeState,
   dimension: string,
-  target: Readonly<{ x: number; y: number; z: number }>,
+  target: NumericPosition,
   deltaSecs: number,
-  skullHitsWorld: (from: RuntimeWitherSkull, to: Readonly<{ x: number; y: number; z: number }>) => boolean,
-): WitherRuntimeAdvance => {
-  const delta = Math.max(0, Number.isFinite(deltaSecs) ? deltaSecs : 0)
+  skullHitsWorld: (from: RuntimeWitherSkull, to: Position) => boolean,
+): Result.Result<WitherRuntimeAdvance, Brand.BrandError> => {
+  const delta = DeltaTimeSecs.result(deltaSecs)
+  if (Result.isFailure(delta)) return Result.fail(delta.failure)
+  const targetPosition = makePosition(target)
+  if (Result.isFailure(targetPosition)) return Result.fail(targetPosition.failure)
+  const targetHead = makePosition({ ...target, y: target.y + 0.9 })
+  if (Result.isFailure(targetHead)) return Result.fail(targetHead.failure)
+
   const explosions: WitherExplosion[] = []
   const withers: RuntimeWither[] = []
   const launched: RuntimeWitherSkull[] = []
@@ -269,9 +339,11 @@ export const advanceWitherRuntime = (
       continue
     }
     const activeDelta = wither.state.phase === 'charging'
-      ? Math.max(0, delta - wither.state.chargeRemainingSecs)
-      : delta
-    const stepped = stepWither(wither.state, delta, target)
+      ? Math.max(0, delta.success - wither.state.chargeRemainingSecs)
+      : delta.success
+    const steppedResult = stepWither(wither.state, delta.success, targetPosition.success)
+    if (Result.isFailure(steppedResult)) return Result.fail(steppedResult.failure)
+    const stepped = steppedResult.success
     if (stepped.spawnExplosion !== undefined) {
       explosions.push({ ...stepped.spawnExplosion, destroysResistantBlocks: false })
     }
@@ -285,9 +357,14 @@ export const advanceWitherRuntime = (
     if (rangedCooldownSecs <= 0) {
       nextSkullId += 1
       shotsFired += 1
+      const origin = makePosition({
+        ...stepped.state.feetPosition,
+        y: stepped.state.feetPosition.y + 2,
+      })
+      if (Result.isFailure(origin)) return Result.fail(origin.failure)
       const descriptor = witherSkullProjectile(
-        { ...stepped.state.feetPosition, y: stepped.state.feetPosition.y + 2 },
-        { ...target, y: target.y + 0.9 },
+        origin.success,
+        targetHead.success,
         shotsFired % 3 === 0 ? 'blue' : 'normal',
       )
       const skull: RuntimeWitherSkull = {
@@ -304,7 +381,7 @@ export const advanceWitherRuntime = (
     }
 
     let meleeCooldownSecs = Math.max(0, wither.meleeCooldownSecs - activeDelta)
-    if (meleeCooldownSecs === 0 && distance(stepped.state.feetPosition, target) <= MELEE_RANGE) {
+    if (meleeCooldownSecs === 0 && distance(stepped.state.feetPosition, targetPosition.success) <= MELEE_RANGE) {
       meleeDamage += MELEE_DAMAGE
       meleeCooldownSecs = MELEE_INTERVAL_SECS
     }
@@ -317,14 +394,16 @@ export const advanceWitherRuntime = (
       skulls.push(skull)
       continue
     }
-    const movementDelta = launchedDelta.get(skull.id) ?? delta
-    const position = {
+    const movementDelta = launchedDelta.get(skull.id) ?? delta.success
+    const nextPosition = makePosition({
       x: skull.position.x + skull.descriptor.direction.x * skull.descriptor.speed * movementDelta,
       y: skull.position.y + skull.descriptor.direction.y * skull.descriptor.speed * movementDelta,
       z: skull.position.z + skull.descriptor.direction.z * skull.descriptor.speed * movementDelta,
-    }
+    })
+    if (Result.isFailure(nextPosition)) return Result.fail(nextPosition.failure)
+    const position = nextPosition.success
     const ageSecs = skull.ageSecs + movementDelta
-    const hitPlayer = distance(position, { ...target, y: target.y + 0.9 }) <= 0.8
+    const hitPlayer = distance(position, targetHead.success) <= 0.8
     if (hitPlayer || skullHitsWorld(skull, position)) {
       explosions.push({
         position,
@@ -336,11 +415,11 @@ export const advanceWitherRuntime = (
     }
   }
 
-  return {
+  return Result.succeed({
     state: { ...runtime, nextSkullId, withers, skulls },
     explosions,
     meleeDamage,
-  }
+  })
 }
 
 export const snapshotWitherRuntime = (runtime: WitherRuntimeState): WitherRuntimeSnapshot => ({

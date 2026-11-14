@@ -1,3 +1,4 @@
+import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { blockIdOf, blockTypeOfId } from '@nerima-games/mc-kernel'
 import { isPlaceableItem } from '@nerima-games/mx-gameplay'
@@ -10,6 +11,11 @@ import {
   summonRuntimeWither,
   witherRenderDescriptors,
 } from '../apps/multiplayer-shared/wither-runtime'
+
+const valueOf = <A, E>(result: Result.Result<A, E>): A => {
+  if (Result.isFailure(result)) throw result.failure
+  return result.success
+}
 
 describe('wither gameplay integration', () => {
   it('exposes wither structure blocks through the host placement vocabulary', () => {
@@ -28,35 +34,35 @@ describe('wither gameplay integration', () => {
       ['4,42,8', 'wither_skeleton_skull'],
       ['5,42,8', 'wither_skeleton_skull'],
     ])
-    const match = matchRuntimeWitherSummon(
+    const match = valueOf(matchRuntimeWitherSummon(
       { x: 5, y: 42, z: 8 },
       ({ x, y, z }) => blocks.get(`${String(x)},${String(y)},${String(z)}`),
-    )
+    ))
     expect(match).toBeDefined()
     for (const position of match?.consumedBlocks ?? []) {
       blocks.delete(`${String(position.x)},${String(position.y)},${String(position.z)}`)
     }
     expect(blocks).toHaveLength(0)
 
-    let runtime = summonRuntimeWither(
+    let runtime = valueOf(summonRuntimeWither(
       initialWitherRuntimeState(),
       'overworld',
       match?.spawnPosition ?? { x: 4.5, y: 40, z: 8.5 },
-    )
-    const activated = advanceWitherRuntime(
+    ))
+    const activated = valueOf(advanceWitherRuntime(
       runtime,
       'overworld',
       { x: 14, y: 40, z: 8 },
       10,
       () => false,
-    )
+    ))
     expect(activated.explosions).toContainEqual(expect.objectContaining({ power: 7 }))
     expect(witherRenderDescriptors(activated.state, 'overworld')).toContainEqual(expect.objectContaining({
       id: 'wither-1', kind: 'wither', category: 'hostile',
     }))
 
     runtime = activated.state
-    const killed = damageRuntimeWither(runtime, 'wither-1', 300, 'melee')
+    const killed = valueOf(damageRuntimeWither(runtime, 'wither-1', 300, 'melee'))
     expect(killed.state.withers).toHaveLength(0)
     expect(killed.death?.drop).toEqual(expect.objectContaining({ item: 'nether_star', count: 1 }))
     expect(witherRenderDescriptors(killed.state, 'overworld')).toEqual([])

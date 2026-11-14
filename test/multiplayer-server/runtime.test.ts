@@ -3,6 +3,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { Result } from 'effect'
 import { decodeFrame, encodeFrame, type NetworkMessage, PlayerId, type PlayerName, WorldId } from '@nerima-games/mx-multiplayer'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
@@ -18,14 +19,23 @@ import { WITHER_MAX_WIRE_LENGTH } from '../../apps/multiplayer-shared/wither-net
 
 const runtimes: Array<MultiplayerRuntime> = []
 
+const valueOf = <A, E>(result: Result.Result<A, E>): A => {
+  if (Result.isFailure(result)) throw result.failure
+  return result.success
+}
+
+const startServer = async (
+  options: Parameters<typeof startMultiplayerServer>[0],
+): Promise<MultiplayerRuntime> => valueOf(await startMultiplayerServer(options))
+
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close()))
 })
 
 const encode = (message: NetworkMessage): string => {
   const result = encodeFrame(message)
-  if (result._tag === 'Left') throw result.left
-  return result.right
+  if (result._tag === 'Failure') throw result.failure
+  return result.success
 }
 
 const nextMessage = (socket: WebSocket): Promise<NetworkMessage> => new Promise((resolve, reject) => {
@@ -35,10 +45,10 @@ const nextMessage = (socket: WebSocket): Promise<NetworkMessage> => new Promise(
   }
   const handleMessage = (data: WebSocket.RawData): void => {
     const decoded = decodeFrame(data.toString())
-    if (decoded._tag === 'Left') return
+    if (decoded._tag === 'Failure') return
     socket.off('message', handleMessage)
     socket.off('error', handleError)
-    resolve(decoded.right)
+    resolve(decoded.success)
   }
   socket.once('error', handleError)
   socket.on('message', handleMessage)
@@ -51,10 +61,10 @@ const nextMessageWithTag = <Tag extends NetworkMessage['_tag']>(socket: WebSocke
   }
   const handleMessage = (data: WebSocket.RawData): void => {
     const decoded = decodeFrame(data.toString())
-    if (decoded._tag === 'Left' || decoded.right._tag !== tag) return
+    if (decoded._tag === 'Failure' || decoded.success._tag !== tag) return
     socket.off('message', handleMessage)
     socket.off('error', handleError)
-    resolve(decoded.right as Extract<NetworkMessage, { readonly _tag: Tag }>)
+    resolve(decoded.success as Extract<NetworkMessage, { readonly _tag: Tag }>)
   }
   socket.once('error', handleError)
   socket.on('message', handleMessage)
@@ -67,10 +77,10 @@ const nextAuthoritativeSnapshot = (socket: WebSocket): Promise<Extract<NetworkMe
   }
   const handleMessage = (data: WebSocket.RawData): void => {
     const decoded = decodeFrame(data.toString())
-    if (decoded._tag === 'Left' || decoded.right._tag !== 'AuthoritativeSnapshot') return
+    if (decoded._tag === 'Failure' || decoded.success._tag !== 'AuthoritativeSnapshot') return
     socket.off('message', handleMessage)
     socket.off('error', handleError)
-    resolve(decoded.right)
+    resolve(decoded.success)
   }
   socket.once('error', handleError)
   socket.on('message', handleMessage)
@@ -141,8 +151,31 @@ describe('multiplayer WebSocket runtime', () => {
     })).rejects.toThrow(/tls-cert/)
   })
 
+  it('propagates generated noise seed failures through block reads and spawn search', async () => {
+    const blockAt = makeGeneratedBlockAt(Number.NaN)
+    const blockResult = blockAt({ x: 0, y: 64, z: 0 })
+    expect(Result.isFailure(blockResult)).toBe(true)
+    if (!Result.isFailure(blockResult)) throw new Error('invalid noise seed unexpectedly generated a block')
+    expect(blockResult.failure._tag).toBe('GeneratedNoiseSeedFailure')
+
+    const startResult = await startMultiplayerServer({
+      host: '127.0.0.1',
+      port: 0,
+      worldId: 'invalid-noise-seed-world',
+      seed: Number.NaN,
+      installSignalHandlers: false,
+    })
+    expect(Result.isFailure(startResult)).toBe(true)
+    if (Result.isFailure(startResult)) {
+      expect(startResult.failure).toEqual(blockResult.failure)
+    } else {
+      await startResult.success.close()
+      throw new Error('invalid noise seed unexpectedly started the server')
+    }
+  })
+
   it('rejects text frames above the protocol limit before command processing', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'runtime-world',
@@ -172,7 +205,7 @@ describe('multiplayer WebSocket runtime', () => {
       }),
     },
   ])('closes an active socket for $name', async ({ frame }) => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'runtime-world',
@@ -203,7 +236,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('closes an active socket after PlayerLeave', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'runtime-world',
@@ -230,7 +263,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('keeps an active socket open after an application-level movement rejection', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'runtime-world',
@@ -271,7 +304,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('serves health and returns an authoritative snapshot after join', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'runtime-world',
@@ -316,7 +349,7 @@ describe('multiplayer WebSocket runtime', () => {
     const generatedBlockAt = makeGeneratedBlockAt(seed)
     const playerAt = { x: 0, y: 200, z: 0 }
 
-    const first = await startMultiplayerServer({
+    const first = await startServer({
       host: '127.0.0.1', port: 0, worldId, seed, stateFile, installSignalHandlers: false,
     })
     runtimes.push(first)
@@ -339,7 +372,10 @@ describe('multiplayer WebSocket runtime', () => {
     expect(spawnAt).toBeDefined()
     if (spawnAt === undefined) throw new Error('authoritative spawn was not present in the snapshot')
     const block = { x: spawnAt.x, y: spawnAt.y - 1, z: spawnAt.z }
-    expect(generatedBlockAt(block)).not.toBeNull()
+    const generatedBlockResult = generatedBlockAt(block)
+    expect(Result.isFailure(generatedBlockResult)).toBe(false)
+    if (Result.isFailure(generatedBlockResult)) throw generatedBlockResult.failure
+    expect(generatedBlockResult.success).not.toBeNull()
 
     const correction = nextMessageWithTag(socket, 'PlayerMove')
     socket.send(encode({
@@ -401,7 +437,7 @@ describe('multiplayer WebSocket runtime', () => {
     expect(sameProcess.readyState).toBe(WebSocket.OPEN)
     await first.close()
 
-    const second = await startMultiplayerServer({
+    const second = await startServer({
       host: '127.0.0.1', port: 0, worldId, seed, stateFile, installSignalHandlers: false,
     })
     runtimes.push(second)
@@ -428,7 +464,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('rejects active takeover, permits one lost-response recovery, and rejects replay and cross-player tokens', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1', port: 0, worldId: 'auth-world', seed: 73, installSignalHandlers: false,
     })
     runtimes.push(runtime)
@@ -487,7 +523,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('accepts a tokenless resume of a known but currently-inactive player id, and retires the old token', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1', port: 0, worldId: 'lost-token-world', seed: 73, installSignalHandlers: false,
     })
     runtimes.push(runtime)
@@ -531,7 +567,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('still rejects a tokenless resume while the same player id is actively connected', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1', port: 0, worldId: 'active-guard-world', seed: 73, installSignalHandlers: false,
     })
     runtimes.push(runtime)
@@ -599,7 +635,7 @@ describe('multiplayer WebSocket runtime', () => {
       }), 'utf8'),
     ])
 
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1', port: 0, worldId: 'legacy-claims-world', seed: 73,
       stateFile, legacyPlayerClaimsFile: claimsFile, installSignalHandlers: false,
     })
@@ -653,7 +689,7 @@ describe('multiplayer WebSocket runtime', () => {
       }), 'utf8')
     }
 
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1', port: 0, worldId: 'legacy-fail-closed-world', seed: 73,
       stateFile, ...(claimsFile === undefined ? {} : { legacyPlayerClaimsFile: claimsFile }),
       installSignalHandlers: false,
@@ -666,7 +702,7 @@ describe('multiplayer WebSocket runtime', () => {
   })
 
   it('rejects a non-string registration token during PlayerResume decoding', async () => {
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1', port: 0, worldId: 'strict-resume-world', seed: 73, installSignalHandlers: false,
     })
     runtimes.push(runtime)
@@ -685,7 +721,7 @@ describe('multiplayer WebSocket runtime', () => {
       state: { revision: 2, blocks: [{ at: { x: 1, y: 64, z: 1 }, block: null }] },
     }), 'utf8')
 
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'legacy-world',
@@ -724,7 +760,7 @@ describe('multiplayer WebSocket runtime', () => {
       },
     }), 'utf8')
 
-    const runtime = await startMultiplayerServer({
+    const runtime = await startServer({
       host: '127.0.0.1',
       port: 0,
       worldId: 'legacy-container-world',

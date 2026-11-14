@@ -1,55 +1,90 @@
-import {
-  AnvilCustomName,
-  AnvilEnchantmentId,
-  ITEM_TYPES,
-  isAnvilCustomName,
-  planAnvil,
-  type AnvilDurability,
-  type AnvilItemPayload,
-  type AnvilPlan,
-  type AnvilRuleSet,
-  type CanonicalAnvilItemPayload,
-  type ItemType,
-} from '@nerima-games/mc-kernel'
+import { Brand, Result } from 'effect'
+import { ITEM_TYPES, type ItemType } from '@nerima-games/mc-kernel'
 import {
   ENCHANTMENT_IDS,
   ENCHANTMENT_REGISTRY,
-  enchantmentAppliesTo,
   type EnchantedItem,
   type EnchantmentId,
 } from '@nerima-games/mx-gameplay'
 import {
+  AnvilCustomName,
+  AnvilEnchantmentId,
+  ExperienceLevel,
+  TotalExperience,
+  enchantmentRuleFor,
+  isAnvilCustomName,
+  planAnvil,
   durabilityForItem,
   experienceCostOfLevel,
   itemStack,
   levelForTotalExperience,
   totalExperienceAtLevel,
+  type AnvilCustomName as AnvilCustomNameValue,
+  type AnvilDurability,
+  type AnvilInputStack,
+  type AnvilItemPayload,
+  type AnvilPlan,
+  type AnvilPrimitiveFailure,
+  type AnvilRuleSet,
+  type CanonicalAnvilItemPayload,
+  type ItemStackFailure,
   type PlayerStorage,
 } from '@nerima-games/mc-sim'
 
 const isGameplayEnchantmentId = (value: string): value is EnchantmentId =>
-  ENCHANTMENT_IDS.includes(value as EnchantmentId)
+  ENCHANTMENT_IDS.some((id) => id === value)
 
-const anvilEnchantmentIdsByName = new Map<string, ReturnType<typeof AnvilEnchantmentId>>(
-  ENCHANTMENT_IDS.map((id) => [id, AnvilEnchantmentId(id)] as const),
-)
+export type AnvilRuleConfigurationFailure = {
+  readonly _tag: 'AnvilRuleConfigurationFailure'
+  readonly enchantmentId: EnchantmentId
+}
+
+export type AnvilOperationFailure =
+  | AnvilPrimitiveFailure
+  | AnvilRuleConfigurationFailure
+  | ItemStackFailure
+
+const buildAnvilEnchantmentRule = (
+  id: EnchantmentId,
+): Result.Result<
+  AnvilRuleSet['enchantments'][number],
+  AnvilRuleConfigurationFailure | AnvilPrimitiveFailure
+> => {
+  const sourceRule = enchantmentRuleFor(id)
+  if (sourceRule === undefined) {
+    return Result.fail({ _tag: 'AnvilRuleConfigurationFailure', enchantmentId: id })
+  }
+
+  const definition = ENCHANTMENT_REGISTRY[id]
+  return Result.map(Result.all(definition.incompatibleWith.map(AnvilEnchantmentId)), (incompatibleWith) => ({
+    id: sourceRule.id,
+    maxLevel: definition.maxLevel,
+    applicableItems: sourceRule.applicableItems,
+    incompatibleWith,
+    costPerLevel: 1,
+  }))
+}
 
 export const spendExperienceLevels = (
   totalExperience: number,
   levels: number,
-): number | undefined => {
-  if (!Number.isFinite(totalExperience) || totalExperience < 0) return undefined
-  if (!Number.isSafeInteger(levels) || levels < 0) return undefined
-  const currentLevel = levelForTotalExperience(totalExperience)
-  if (currentLevel < levels) return undefined
-  if (levels === 0) return totalExperience
+): Result.Result<number | undefined, Brand.BrandError> => {
+  const checkedExperience = TotalExperience.result(totalExperience)
+  if (Result.isFailure(checkedExperience)) return Result.fail(checkedExperience.failure)
+  const checkedLevels = ExperienceLevel.result(levels)
+  if (Result.isFailure(checkedLevels)) return Result.fail(checkedLevels.failure)
+
+  const currentLevel = levelForTotalExperience(checkedExperience.success)
+  if (currentLevel < checkedLevels.success) return Result.succeed(undefined)
+  if (levels === 0) return Result.succeed(checkedExperience.success)
 
   const progress = (
-    totalExperience - totalExperienceAtLevel(currentLevel)
+    checkedExperience.success - totalExperienceAtLevel(currentLevel)
   ) / experienceCostOfLevel(currentLevel)
-  const nextLevel = currentLevel - levels
-  return totalExperienceAtLevel(nextLevel)
-    + Math.floor(progress * experienceCostOfLevel(nextLevel))
+  const nextLevel = ExperienceLevel.result(currentLevel - checkedLevels.success)
+  if (Result.isFailure(nextLevel)) return Result.fail(nextLevel.failure)
+  return Result.succeed(totalExperienceAtLevel(nextLevel.success)
+    + Math.floor(progress * experienceCostOfLevel(nextLevel.success)))
 }
 
 export type AnvilOperationRequest = {
@@ -80,99 +115,101 @@ const invalidInput = (path: string, reason: string): AnvilPlan => ({
   issues: [{ path, reason }],
 })
 
-const anvilEnchantmentRules = ENCHANTMENT_IDS.map((id) => {
-  const definition = ENCHANTMENT_REGISTRY[id]
-  return {
-    id: AnvilEnchantmentId(id),
-    maxLevel: definition.maxLevel,
-    applicableItems: ITEM_TYPES.filter((item) => enchantmentAppliesTo(id, item)),
-    incompatibleWith: definition.incompatibleWith
-      .map((value) => anvilEnchantmentIdsByName.get(value))
-      .filter((value): value is ReturnType<typeof AnvilEnchantmentId> => value !== undefined),
-    costPerLevel: 1,
-  }
-})
-
 const anvilRepairMaterials = ITEM_TYPES.flatMap((item) => {
   const durability = durabilityForItem(item)
   return durability === null
     ? []
-    : [{ target: item, material: 'iron_ingot' as ItemType, durabilityPerUnit: durability.max }]
+    : [{ target: item, material: 'iron_ingot' as const, durabilityPerUnit: durability.max }]
 })
 
-export const ANVIL_RULES: AnvilRuleSet = Object.freeze({
-  enchantments: Object.freeze(anvilEnchantmentRules),
-  repairMaterials: Object.freeze(anvilRepairMaterials),
-})
+export const ANVIL_RULES: Result.Result<
+  AnvilRuleSet,
+  AnvilRuleConfigurationFailure | AnvilPrimitiveFailure
+> = Result.map(
+  Result.all(ENCHANTMENT_IDS.map(buildAnvilEnchantmentRule)),
+  (enchantments) => Object.freeze({
+    enchantments: Object.freeze(enchantments),
+    repairMaterials: Object.freeze(anvilRepairMaterials),
+  }),
+)
 
 const anvilPayload = (
   item: ItemType,
   durability: AnvilDurability | null,
   enchantments: ReadonlyArray<{ readonly id: string; readonly level: number }>,
-  customName: AnvilCustomName | null,
-): AnvilItemPayload => ({
-  item,
-  durability,
-  enchantments: enchantments.map((enchantment) => ({
-    id: AnvilEnchantmentId(enchantment.id),
-    level: enchantment.level,
-  })),
-  repairCost: 0,
-  customName,
-})
+  customName: AnvilCustomNameValue | null,
+): Result.Result<AnvilItemPayload, AnvilPrimitiveFailure> => Result.map(
+  Result.all(enchantments.map((enchantment) =>
+    Result.map(AnvilEnchantmentId(enchantment.id), (id) => ({ id, level: enchantment.level })),
+  )),
+  (convertedEnchantments) => ({
+    item,
+    durability,
+    enchantments: convertedEnchantments,
+    repairCost: 0,
+    customName,
+  }),
+)
 
 export const planAnvilOperation = (
   input: AnvilOperationInput,
-): AnvilPlan => {
-  if (typeof input.name !== 'string') return invalidInput('name', 'must be a string')
+): Result.Result<AnvilPlan, AnvilPrimitiveFailure | AnvilRuleConfigurationFailure> => {
+  if (typeof input.name !== 'string') return Result.succeed(invalidInput('name', 'must be a string'))
 
   const requestedName = input.name.trim()
   if (requestedName !== '' && !isAnvilCustomName(requestedName)) {
-    return invalidInput('name', 'must be at most 50 characters without control characters')
+    return Result.succeed(invalidInput('name', 'must be at most 50 characters without control characters'))
   }
   const existingName = input.currentName?.trim() ?? ''
   if (existingName !== '' && !isAnvilCustomName(existingName)) {
-    return invalidInput('currentName', 'must be at most 50 characters without control characters')
+    return Result.succeed(invalidInput('currentName', 'must be at most 50 characters without control characters'))
   }
 
   const enchantedItem = input.enchantedItem
   if (enchantedItem !== undefined && enchantedItem.item !== input.item) {
-    return invalidInput('enchantedItem.item', 'must match item')
+    return Result.succeed(invalidInput('enchantedItem.item', 'must match item'))
   }
 
   const enchantments = enchantedItem?.enchantments ?? []
   for (const [index, enchantment] of enchantments.entries()) {
     if (!isGameplayEnchantmentId(enchantment.id)) {
-      return invalidInput(`enchantedItem.enchantments[${index}].id`, 'unsupported enchantment')
+      return Result.succeed(invalidInput(`enchantedItem.enchantments[${index}].id`, 'unsupported enchantment'))
     }
   }
 
   const material = input.material
   if (material !== undefined && (!Number.isSafeInteger(material.count) || material.count <= 0)) {
-    return invalidInput('material.count', 'must be a positive safe integer')
+    return Result.succeed(invalidInput('material.count', 'must be a positive safe integer'))
   }
 
-  const left = anvilPayload(
-    input.item,
-    input.durability,
-    enchantments,
-    existingName === '' ? null : AnvilCustomName(existingName),
+  const requestedNameResult: Result.Result<AnvilCustomNameValue | null, AnvilPrimitiveFailure> = requestedName === ''
+    ? Result.succeed(null)
+    : AnvilCustomName(requestedName)
+  const existingNameResult: Result.Result<AnvilCustomNameValue | null, AnvilPrimitiveFailure> = existingName === ''
+    ? Result.succeed(null)
+    : AnvilCustomName(existingName)
+  const left = Result.flatMap(
+    existingNameResult,
+    (customName) => anvilPayload(input.item, input.durability, enchantments, customName),
   )
-  const right = material === undefined
-    ? null
-    : {
-      payload: anvilPayload(material.item, null, [], null),
-      count: material.count,
-    }
+  const right: Result.Result<AnvilInputStack | null, AnvilPrimitiveFailure> = material === undefined
+    ? Result.succeed(null)
+    : Result.map(anvilPayload(material.item, null, [], null), (payload) => ({
+        payload,
+        count: material.count,
+      }))
 
-  return planAnvil(
-    {
-      left,
-      right,
-      rename: requestedName === '' ? null : AnvilCustomName(requestedName),
-      experienceLevels: 0,
-    },
-    ANVIL_RULES,
+  return Result.map(
+    Result.all({ left, right, rename: requestedNameResult, rules: ANVIL_RULES }),
+    ({ left: leftPayload, right: rightInput, rename, rules }) => planAnvil(
+      {
+        left: leftPayload,
+        right: rightInput,
+        rename,
+        experienceLevels: 0,
+      },
+      rules,
+    ),
   )
 }
 
@@ -197,9 +234,9 @@ export const applyAnvilOperation = (
   storage: PlayerStorage,
   slotIndex: number,
   request: AnvilOperationRequest,
-): AppliedAnvilOperation | undefined => {
+): Result.Result<AppliedAnvilOperation | undefined, AnvilOperationFailure> => {
   const stack = storage.inventory.slots[slotIndex]
-  if (stack === undefined) return undefined
+  if (stack === undefined) return Result.succeed(undefined)
 
   const durability = storage.inventoryDurability[slotIndex] ?? null
   const needsRepair = durability !== null && durability.current < durability.max
@@ -214,30 +251,39 @@ export const applyAnvilOperation = (
     item: stack.item,
     durability,
   }
-  const plan = planAnvilOperation(
+  return Result.flatMap(planAnvilOperation(
     iron === undefined
       ? operationInput
       : { ...operationInput, material: { item: iron.item, count: iron.count } },
-  )
-  if (!plan.ok || (plan.materialCost > 0 && iron === undefined)) return undefined
-  const slots = [...storage.inventory.slots]
-  const inventoryDurability = [...storage.inventoryDurability]
-  if (iron !== undefined && plan.materialCost > 0) {
-    slots[ironIndex] = iron.count === plan.materialCost
-      ? undefined
-      : itemStack(iron.item, iron.count - plan.materialCost)
-    if (iron.count === plan.materialCost) inventoryDurability[ironIndex] = null
-  }
-  inventoryDurability[slotIndex] = plan.output.durability
+  ), (anvilPlan) => {
+    if (!anvilPlan.ok || (anvilPlan.materialCost > 0 && iron === undefined)) {
+      return Result.succeed(undefined)
+    }
 
-  return {
-    storage: {
-      ...storage,
-      inventory: { slots },
-      inventoryDurability,
-    },
-    output: plan.output,
-    levelCost: plan.levelCost,
-    materialCost: plan.materialCost,
-  }
+    const slots = [...storage.inventory.slots]
+    const inventoryDurability = [...storage.inventoryDurability]
+    const remainingStack = iron !== undefined && anvilPlan.materialCost > 0
+      && Number(iron.count) !== Number(anvilPlan.materialCost)
+      ? itemStack(iron.item, iron.count - anvilPlan.materialCost)
+      : Result.succeed(undefined)
+
+    return Result.map(remainingStack, (stackAfterConsumption) => {
+      if (iron !== undefined && anvilPlan.materialCost > 0) {
+        slots[ironIndex] = stackAfterConsumption
+        if (Number(iron.count) === Number(anvilPlan.materialCost)) inventoryDurability[ironIndex] = null
+      }
+      inventoryDurability[slotIndex] = anvilPlan.output.durability
+
+      return {
+        storage: {
+          ...storage,
+          inventory: { slots },
+          inventoryDurability,
+        },
+        output: anvilPlan.output,
+        levelCost: anvilPlan.levelCost,
+        materialCost: anvilPlan.materialCost,
+      }
+    })
+  })
 }
