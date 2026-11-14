@@ -17,8 +17,9 @@ import type { MultiplayerServerCore, MultiplayerServerCoreFailure } from './core
 const lampBlocks = new Set(['redstone_lamp', 'redstone_lamp_lit'] as const)
 const doorBlocks = new Set(['door', 'door_open'] as const)
 type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
-const pistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
-type PistonHeadOffsetFailure = ResultFailure<typeof pistonHeadOffsetResult>
+type PistonHeadOffsetResult = Result.Result<Schema.Schema.Type<typeof PistonBlockOffsetSchema>, Schema.SchemaError>
+const pistonHeadOffsetResult: PistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
+type PistonHeadOffsetFailure = ResultFailure<PistonHeadOffsetResult>
 type PistonCapabilityFailure =
   | Readonly<{ _tag: 'UnknownBlockType'; block: string }>
   | Readonly<{ _tag: 'UnregisteredBlockType'; block: string }>

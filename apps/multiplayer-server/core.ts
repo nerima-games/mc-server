@@ -205,8 +205,9 @@ export type ClientId = string
 export type SendFrame = (frame: WireText) => void
 
 type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
-const pistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
-type PistonHeadOffsetFailure = ResultFailure<typeof pistonHeadOffsetResult>
+type PistonHeadOffsetResult = Result.Result<Schema.Schema.Type<typeof PistonBlockOffsetSchema>, Schema.SchemaError>
+const pistonHeadOffsetResult: PistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
+type PistonHeadOffsetFailure = ResultFailure<PistonHeadOffsetResult>
 type WitherOperation = 'match-summon' | 'summon' | 'damage' | 'advance'
 type WitherRuntimeFailure = ResultFailure<
   | ReturnType<typeof matchRuntimeWitherSummon>
