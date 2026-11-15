@@ -7,7 +7,8 @@ import {
   emptyStatusEffectState,
   initialEnderDragonEncounter,
 } from '@nerima-games/mx-gameplay'
-import type { PlayerId } from '@nerima-games/mx-multiplayer'
+import { EntityId, type PlayerId } from '@nerima-games/mx-multiplayer'
+import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import type { MultiplayerServerState } from '../../apps/multiplayer-server/core'
@@ -154,7 +155,35 @@ describe('multiplayer state file round trip', () => {
     await writeServerState(stateFile, worldId, seed, written)
     const loaded = await loadServerState(stateFile, worldId, seed)
 
-    expect(loaded).toEqual(written)
+    expect(loaded).toEqual(Result.succeed(written))
+  })
+
+  const writeStateWithCow = async (mobState: Readonly<{ attackCooldownSecs: number; motionPhase: number; provoked: boolean }>): Promise<string> => {
+    const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-round-trip-')), 'state.json')
+    await writeServerState(stateFile, worldId, seed, {
+      revision: 1,
+      blocks: [],
+      inventories: [],
+      vitals: [],
+      timeWeather: { timeOfDay: 6_000, weather: 'clear' },
+      containers: [],
+      furnaces: [],
+      villagerTrades: [],
+      entities: [{
+        _tag: 'living', entityId: EntityId.make('cow-1'), entityType: 'cow', at: { x: 0, y: 64, z: 0 }, health: 10, maxHealth: 10, mobState,
+      }],
+    })
+    return stateFile
+  }
+
+  it('loads a mob whose saved state mx-gameplay can repair', async () => {
+    const loaded = await loadServerState(await writeStateWithCow({ attackCooldownSecs: 0, motionPhase: 3, provoked: false }), worldId, seed)
+    expect(Result.isSuccess(loaded)).toBe(true)
+  })
+
+  it('fails to load a mob whose saved motion phase exceeds the safe integer range', async () => {
+    const loaded = await loadServerState(await writeStateWithCow({ attackCooldownSecs: 0, motionPhase: 2 ** 60, provoked: false }), worldId, seed)
+    expect(loaded).toMatchObject(Result.fail({ _tag: 'MobStateRepairFailure', entityId: 'cow-1' }))
   })
 
   it('still loads a state file predating these fields, leaving the new categories empty', async () => {
@@ -171,7 +200,9 @@ describe('multiplayer state file round trip', () => {
     }
 
     await writeServerState(stateFile, worldId, seed, legacyState)
-    const loaded = await loadServerState(stateFile, worldId, seed)
+    const loadedResult = await loadServerState(stateFile, worldId, seed)
+    expect(Result.isSuccess(loadedResult)).toBe(true)
+    const loaded = Result.getOrThrow(loadedResult)
 
     expect(loaded).toMatchObject({
       revision: 1,

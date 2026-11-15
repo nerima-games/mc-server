@@ -1,6 +1,5 @@
 /* eslint-disable max-lines, no-magic-numbers -- Sleep synchronization is a small protocol adapter with explicit boundary validation. */
 import { BlockAxis, PositionAxis, type DimensionRevision, type SimulationTick } from '@nerima-games/mc-kernel'
-import type { Intent } from '@nerima-games/mc-sim'
 import {
   DEFAULT_BLOCK_REACH,
   enterSleep,
@@ -332,9 +331,6 @@ const awake = (actor: SurvivalActorState): SleepAwakeActor => {
 const isSleeper = (roster: SleepRuntimeState, actor: string): boolean =>
   roster.sleepers.some((sleeper) => sleeper.playerId === actor)
 
-const leavingActor = (intent: Intent): Result.Result<string, Intent> =>
-  intent.payload._tag === 'LeaveSleep' ? Result.succeed(intent.payload.actor) : Result.fail(intent)
-
 /**
  * Server-side sleep state. The sleeper roster is mx-gameplay state; the wire snapshot mirrors it,
  * and every accepted decision advances the revision once.
@@ -460,12 +456,10 @@ export class SleepAuthority {
     }, context.targetTick)
     // SurvivalAuthority supports LeaveSleep, so it rejects one only when header validation fails.
     if (!result.accepted) return { accepted: false, reason: 'invalid-command' }
-    // SurvivalAuthority maps a LeaveSleep command only to a LeaveSleep intent.
-    const leaving = Result.getOrThrow(leavingActor(result.intent))
     return this.#progress(
       [{ _tag: 'ActorSleepChanged', actor: actor.player, sleeping: null }],
       snapshot.actors,
-      leaveSleep(roster, leaving),
+      leaveSleep(roster, result.intent.payload.actor),
     )
   }
 

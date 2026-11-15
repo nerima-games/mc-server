@@ -1,3 +1,4 @@
+import { DeltaTimeSecs } from '@nerima-games/mc-kernel'
 import { ChunkCapacity, makeChunkStore } from '@nerima-games/mc-worldgen'
 import {
   makeInMemoryVitals,
@@ -37,7 +38,11 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
       const initial = yield* makeInMemoryVitals({ ...SPAWN_PLAYER_VITALS, ...vitals })
       return { version: SURVIVAL_HUNGER_STATE_VERSION, difficulty, vitals: yield* initial.snapshot }
     })),
-    addExhaustion: (state, amount) => Result.map(stepHunger(state, (runtime) => runtime.addExhaustion(amount)), (step) => step.state),
+    // A zero-length tick applies the submitted activity now; mx-gameplay drops it on peaceful difficulty.
+    activity: (state, input) => Result.map(stepHunger(state, (runtime) => Effect.gen(function* () {
+      yield* runtime.submit(input)
+      return yield* runtime.tick(yield* Effect.fromResult(DeltaTimeSecs.result(0)))
+    })), (step) => step.state),
     eat: (state, foodPoints, saturationModifier) =>
       Result.map(stepHunger(state, (runtime) => runtime.eat(foodPoints, saturationModifier)), (step) => step.state),
     respawn: (state) => Result.map(stepHunger(state, (runtime) => runtime.respawn), (step) => step.state),

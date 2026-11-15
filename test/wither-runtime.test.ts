@@ -1,4 +1,4 @@
-import { Result } from 'effect'
+import { Brand, Result } from 'effect'
 import fc from 'fast-check'
 import { describe, expect, it } from 'vitest'
 
@@ -17,6 +17,11 @@ import {
 const valueOf = <A, E>(result: Result.Result<A, E>): A => {
   if (Result.isFailure(result)) throw result.failure
   return result.success
+}
+
+const failureOf = <A, E>(result: Result.Result<A, E>): E => {
+  if (Result.isSuccess(result)) throw new Error('expected a failure result')
+  return result.failure
 }
 
 const isValidPosition = (position: Readonly<{ x: number; y: number; z: number }>): boolean =>
@@ -202,6 +207,62 @@ describe('wither runtime', () => {
     expect(Result.isFailure(advanceWitherRuntime(runtime, 'overworld', target, -Number.MIN_VALUE, () => false))).toBe(true)
     for (const deltaSecs of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
       expect(Result.isFailure(advanceWitherRuntime(runtime, 'overworld', target, deltaSecs, () => false))).toBe(true)
+    }
+  })
+
+  it('fails instead of moving a wither or skull past the finite coordinate range', () => {
+    const target = { x: 1_000, y: 64, z: 0 }
+    const summoned = valueOf(summonRuntimeWither(initialWitherRuntimeState(), 'overworld', { x: 0, y: 64, z: 0 }))
+    const airborne = valueOf(advanceWitherRuntime(summoned, 'overworld', target, 10, () => false)).state
+    expect(failureOf(advanceWitherRuntime(airborne, 'overworld', target, Number.MAX_VALUE, () => false)))
+      .toBeInstanceOf(Brand.BrandError)
+
+    const fired = valueOf(advanceWitherRuntime(airborne, 'overworld', target, 2, () => false)).state
+    const skullOnly = valueOf(damageRuntimeWither(fired, 'wither-1', 300, 'melee')).state
+    expect(skullOnly.withers).toEqual([])
+    expect(skullOnly.skulls).toHaveLength(1)
+    expect(failureOf(advanceWitherRuntime(skullOnly, 'overworld', target, Number.MAX_VALUE, () => false)))
+      .toBeInstanceOf(Brand.BrandError)
+  })
+
+  it('rejects persisted snapshots with malformed nested positions, states, and skull descriptors', () => {
+    const summoned = valueOf(summonRuntimeWither(initialWitherRuntimeState(), 'overworld', { x: 0, y: 64, z: 0 }))
+    const charged = valueOf(advanceWitherRuntime(summoned, 'overworld', { x: 8, y: 64, z: 0 }, 10, () => false)).state
+    const persisted = snapshotWitherRuntime(valueOf(advanceWitherRuntime(charged, 'overworld', { x: 8, y: 64, z: 0 }, 2, () => false)).state)
+    const [wither] = persisted.withers
+    const [skull] = persisted.skulls
+    if (wither === undefined || skull === undefined) throw new Error('expected one wither and one skull')
+    expect(isValidWitherRuntimeSnapshot(persisted)).toBe(true)
+
+    const witherState = wither.snapshot.state
+    const withState = (state: Readonly<Record<string, unknown>>): unknown => ({
+      ...persisted,
+      withers: [{ ...wither, snapshot: { ...wither.snapshot, state: { ...witherState, ...state } } }],
+    })
+    const withDescriptor = (descriptor: Readonly<Record<string, unknown>>): unknown => ({
+      ...persisted,
+      skulls: [{ ...skull, descriptor: { ...skull.descriptor, ...descriptor } }],
+    })
+
+    for (const invalid of [
+      { ...persisted, withers: [null] },
+      { ...persisted, skulls: [null] },
+      { ...persisted, withers: [{ ...wither, snapshot: null }] },
+      withState({ feetPosition: null }),
+      withState({ feetPosition: { ...witherState.feetPosition, w: 0 } }),
+      withState({ feetPosition: { ...witherState.feetPosition, x: Number.NaN } }),
+      withState({ velocity: { ...witherState.velocity, z: Number.POSITIVE_INFINITY } }),
+      withState({ velocity: null }),
+      withState({ healthPoints: -1 }),
+      withState({ chargeRemainingSecs: -1 }),
+      withDescriptor({ speed: 'fast' }),
+      withDescriptor({ explosivePower: null }),
+      withDescriptor({ speed: 0 }),
+      withDescriptor({ explosivePower: -1 }),
+      withDescriptor({ origin: null }),
+      withDescriptor({ direction: { x: 0, y: 0 } }),
+    ]) {
+      expect(isValidWitherRuntimeSnapshot(invalid)).toBe(false)
     }
   })
 })

@@ -1783,6 +1783,28 @@ describe('multiplayer server authoritative state', () => {
     }))
   })
 
+  it('lets mx-gameplay drop activity exhaustion on peaceful difficulty', () => {
+    const jumpFiveTimes = (difficulty: 'peaceful' | 'normal') => {
+      const fixture = makeFixture(initialState(), undefined, difficulty)
+      for (let index = 0; index < 5; index += 1) {
+        expect(fixture.receive({
+          _tag: 'PlayerVitalsCommand',
+          commandId: commandId(`jump-${String(index)}`),
+          player: playerId('alice'),
+          world: worldId('world-1'),
+          expectedRevision: 4 + index,
+          action: { _tag: 'activity', activity: 'jump', amount: 100 },
+        }).accepted).toBe(true)
+      }
+      return messages(fixture.sent).filter((message) => message._tag === 'PlayerVitalsDelta').at(-1)
+    }
+    // Five commands of 100 jumps add 5 x 100 x SURVIVAL_EXHAUSTION.jump = 25 exhaustion: more than the
+    // saturation of 2 can absorb, so normal difficulty spends hunger while peaceful spends nothing.
+    expect(jumpFiveTimes('peaceful')).toMatchObject({ revision: 9, state: { health: 3, hunger: 2, experience: 7 } })
+    const normal = jumpFiveTimes('normal')
+    expect(normal?._tag === 'PlayerVitalsDelta' ? normal.state.hunger : undefined).toBeLessThan(2)
+  })
+
   it('drops and clears inventory exactly once when starvation kills a player', () => {
     const fixture = makeFixture({
       ...initialState(),

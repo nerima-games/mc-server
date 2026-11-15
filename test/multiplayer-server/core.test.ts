@@ -155,6 +155,30 @@ const makeFixture = (
 }
 
 describe('authoritative multiplayer server core', () => {
+  it('validates a loaded chunk edit the same way whichever cell of the chunk is read', () => {
+    const server = makeMultiplayerServerCore({
+      worldId: 'world-1',
+      seed: 42,
+      allowedBlocks: new Set(['stone']),
+      spawnAt: { x: 0, y: 64, z: 0 },
+      chunkSource: airTerrain,
+      parts: makeMultiplayerServerCoreParts(),
+      initialState: {
+        revision: 0,
+        blocks: [{ at: { x: 0, y: 64, z: 0 }, block: 'legacy_unknown' }],
+        inventories: [],
+        vitals: [],
+        timeWeather: { timeOfDay: 6_000, weather: 'clear' },
+        containers: [],
+        furnaces: [],
+        villagerTrades: [],
+      },
+    })
+    const expected = Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { x: 0, y: 64, z: 0 }, block: 'legacy_unknown' })
+    expect(server.readPistonCell({ x: 0, y: 64, z: 0 })).toEqual(expected)
+    expect(server.readPistonCell({ x: 1, y: 64, z: 0 })).toEqual(expected)
+  })
+
   it('overrides the client-reported join position with spawn and self-corrects the player', () => {
     const spawnAt = { x: 3, y: 70, z: -4 }
     const fixture = makeFixture(() => null, 6_000, spawnAt)
@@ -429,6 +453,23 @@ describe('authoritative multiplayer server core', () => {
     expect(fixture.server.snapshot().revision).toBe(0)
   })
 
+  it('drops block mutations whose cell is not a safe integer before they reach SurvivalAuthority', () => {
+    const fixture = makeFixture()
+    const aliceFrames = fixture.connect('socket-a')
+    fixture.receive('socket-a', join('alice'))
+    aliceFrames.length = 0
+    // A C2 block address needs a safe integer on every axis; the wire decoder already enforces that.
+    const at = { x: 2 ** 60, y: 60, z: 0 }
+    const wire = (message: Readonly<Record<string, unknown>>) => JSON.stringify({ protocolVersion: PROTOCOL_VERSION, message }) as WireText
+
+    expect(fixture.server.receive('socket-a', wire({ _tag: 'BlockPlace', player: 'alice', world: 'world-1', at, block: 'stone', state: 0 })))
+      .toEqual({ accepted: false, reason: 'malformed-frame' })
+    expect(fixture.server.receive('socket-a', wire({ _tag: 'BlockBreak', player: 'alice', world: 'world-1', at })))
+      .toEqual({ accepted: false, reason: 'malformed-frame' })
+    expect(aliceFrames).toEqual([])
+    expect(fixture.server.snapshot().revision).toBe(0)
+  })
+
   it('rejects occupied placement and missing break from authoritative state', () => {
     const fixture = makeFixture(({ x, y, z }) => x === 1 && y === 63 && z === 1 ? 'stone' : null)
     const aliceFrames = fixture.connect('socket-a')
@@ -552,6 +593,38 @@ describe('authoritative multiplayer server core', () => {
       _tag: 'SleepEvents',
       events: expect.arrayContaining([expect.objectContaining({ _tag: 'ActorSleepChanged', sleeping: null })]),
     }))
+  })
+
+  it.each([
+    ['disconnects', (fixture: ReturnType<typeof makeFixture>) => { fixture.server.disconnect('socket-b') }],
+    ['sends PlayerLeave', (fixture: ReturnType<typeof makeFixture>) => { fixture.receive('socket-b', { _tag: 'PlayerLeave', player: playerId('bob') }) }],
+    ['transfers to another realm', (fixture: ReturnType<typeof makeFixture>) => { expect(fixture.server.detachPlayer('socket-b')).toBeDefined() }],
+  ] as const)('skips the night when the only awake player %s', (_case, removeBob) => {
+    const fixture = makeFixture(({ x, y, z }) => x === 0 && y === 64 && z === 1 ? 'bed' : null, 13_000)
+    const aliceFrames = fixture.connect('socket-a')
+    fixture.connect('socket-b')
+    fixture.receive('socket-a', join('alice'))
+    fixture.receive('socket-b', join('bob'))
+    expect(fixture.receiveSleep('socket-a', {
+      _tag: 'SleepCommand',
+      command: {
+        _tag: 'EnterSleep', actor: playerId('alice'), session: 'alice', requestId: 'sleep-a',
+        expectedRevision: 0, clientTick: 20, bed: { x: 0, y: 64, z: 1 },
+      },
+    }).accepted).toBe(true)
+    expect(messages(aliceFrames).some((message) => message._tag === 'WorldTimeWeatherDelta')).toBe(false)
+    aliceFrames.length = 0
+
+    removeBob(fixture)
+
+    expect(sleepMessages(aliceFrames)).toContainEqual(expect.objectContaining({
+      _tag: 'SleepEvents',
+      events: expect.arrayContaining([{ _tag: 'NightSkipped', sleeping: 1, required: 1 }]),
+    }))
+    expect(messages(aliceFrames)).toContainEqual({
+      _tag: 'WorldTimeWeatherDelta', world: 'world-1', revision: 1, state: { timeOfDay: 6_000, weather: 'clear' },
+    })
+    expect(fixture.server.snapshot().revision).toBe(1)
   })
 
   it('rejects sleep commands outside the overworld', () => {
@@ -837,8 +910,8 @@ describe('authoritative multiplayer server core', () => {
       entityId: 'blaze-1' as EntityId,
     })).toEqual(expect.objectContaining({ accepted: true }))
 
-    // mx-gameplay's BLAZE_DROPS is empty (blaze rods are absent from the kernel), so the kill
-    // despawns the Blaze and awards BLAZE_XP_REWARD (10) without an item drop.
+    // mx-gameplay 0.11.0 defines BLAZE_DROPS = [], so the kill despawns the Blaze and awards
+    // BLAZE_XP_REWARD (10) without an item drop.
     expect(messages(frames)).toEqual([
       expect.objectContaining({ _tag: 'AuthoritativeCommandAccepted', commandId: 'blaze-kill' }),
       expect.objectContaining({ _tag: 'EntityDespawnDelta', entityId: 'blaze-1' }),

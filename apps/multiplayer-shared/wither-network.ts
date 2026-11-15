@@ -91,11 +91,12 @@ const decodePosition = (value: unknown): Position | undefined => {
   if (typeof x !== 'number' || !Number.isFinite(x)
     || typeof y !== 'number' || !Number.isFinite(y)
     || typeof z !== 'number' || !Number.isFinite(z)) return undefined
-  const xAxis = PositionAxis.result(x)
-  const yAxis = PositionAxis.result(y)
-  const zAxis = PositionAxis.result(z)
-  if (Result.isFailure(xAxis) || Result.isFailure(yAxis) || Result.isFailure(zAxis)) return undefined
-  return position(xAxis.success, yAxis.success, zAxis.success)
+  // PositionAxis accepts every finite number, which the checks above already guarantee.
+  return position(
+    Result.getOrThrow(PositionAxis.result(x)),
+    Result.getOrThrow(PositionAxis.result(y)),
+    Result.getOrThrow(PositionAxis.result(z)),
+  )
 }
 
 const isWitherDamageKind = (value: unknown): value is WitherDamageKind =>

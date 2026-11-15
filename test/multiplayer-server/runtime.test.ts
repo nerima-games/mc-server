@@ -8,8 +8,11 @@ import { decodeFrame, encodeFrame, type NetworkMessage, PlayerId, type PlayerNam
 import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 
+import { generatedChunkSource, NoiseSeed } from '@nerima-games/mc-worldgen'
+
+import { makeTerrainReader } from '../../apps/multiplayer-server/core'
+import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
 import {
-  makeGeneratedBlockAt,
   resolveMultiplayerRuntimeOptions,
   startMultiplayerServer,
   type MultiplayerRuntime,
@@ -151,12 +154,10 @@ describe('multiplayer WebSocket runtime', () => {
     })).rejects.toThrow(/tls-cert/)
   })
 
-  it('propagates generated noise seed failures through block reads and spawn search', async () => {
-    const blockAt = makeGeneratedBlockAt(Number.NaN)
-    const blockResult = blockAt({ x: 0, y: 64, z: 0 })
-    expect(Result.isFailure(blockResult)).toBe(true)
-    if (!Result.isFailure(blockResult)) throw new Error('invalid noise seed unexpectedly generated a block')
-    expect(blockResult.failure._tag).toBe('GeneratedNoiseSeedFailure')
+  it('propagates an invalid generated noise seed as a typed startup failure', async () => {
+    const noiseSeed = NoiseSeed.result(Number.NaN)
+    expect(Result.isFailure(noiseSeed)).toBe(true)
+    if (!Result.isFailure(noiseSeed)) throw new Error('invalid noise seed unexpectedly produced a seed')
 
     const startResult = await startMultiplayerServer({
       host: '127.0.0.1',
@@ -167,7 +168,7 @@ describe('multiplayer WebSocket runtime', () => {
     })
     expect(Result.isFailure(startResult)).toBe(true)
     if (Result.isFailure(startResult)) {
-      expect(startResult.failure).toEqual(blockResult.failure)
+      expect(startResult.failure).toEqual({ _tag: 'GeneratedNoiseSeedFailure', failure: noiseSeed.failure })
     } else {
       await startResult.success.close()
       throw new Error('invalid noise seed unexpectedly started the server')
@@ -346,7 +347,7 @@ describe('multiplayer WebSocket runtime', () => {
     const worldId = 'persistent-world'
     const authoritativeWorld = WorldId.make(worldId)
     const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-server-')), 'state.json')
-    const generatedBlockAt = makeGeneratedBlockAt(seed)
+    const terrain = makeTerrainReader(generatedChunkSource(valueOf(NoiseSeed.result(seed))), makeMultiplayerServerCoreParts())
     const playerAt = { x: 0, y: 200, z: 0 }
 
     const first = await startServer({
@@ -372,7 +373,7 @@ describe('multiplayer WebSocket runtime', () => {
     expect(spawnAt).toBeDefined()
     if (spawnAt === undefined) throw new Error('authoritative spawn was not present in the snapshot')
     const block = { x: spawnAt.x, y: spawnAt.y - 1, z: spawnAt.z }
-    const generatedBlockResult = generatedBlockAt(block)
+    const generatedBlockResult = terrain.blockAt(block)
     expect(Result.isFailure(generatedBlockResult)).toBe(false)
     if (Result.isFailure(generatedBlockResult)) throw generatedBlockResult.failure
     expect(generatedBlockResult.success).not.toBeNull()

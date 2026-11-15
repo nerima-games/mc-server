@@ -7,23 +7,12 @@ import { dirname } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 
-import {
-  AIR_BLOCK_ID,
-  BlockAxis,
-  BlockId,
-  blockPosition,
-  blockTypeOfId,
-  chunkCoordOfBlock,
-  localCoordOfBlock,
-} from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID } from '@nerima-games/mc-kernel'
 import { CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
 import {
   CHUNK_HEIGHT,
-  generateChunkAt,
   generatedChunkSource,
-  getBlockAt,
   NoiseSeed as WorldgenNoiseSeed,
-  type Chunk,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
@@ -54,6 +43,10 @@ import {
   isWeatherClockState,
   chunkSourceFromBlocks,
   makeMultiplayerServerCore,
+  makeTerrainReader,
+  validateEcosystemMobStates,
+  type MultiplayerServerCoreFailure,
+  type WorldBlockReader,
   type MultiplayerServerCore,
   type MultiplayerServerState,
   type GeneratedBlockReadFailure,
@@ -423,12 +416,12 @@ export const loadServerState = async (
   path: string,
   worldId: string,
   seed: number,
-): Promise<MultiplayerServerState | undefined> => {
+): Promise<Result.Result<MultiplayerServerState | undefined, MultiplayerServerCoreFailure>> => {
   let source: string
   try {
     source = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Result.succeed(undefined)
     throw new Error(`Failed to read multiplayer state: ${path}`, { cause: error })
   }
   let value: unknown
@@ -446,7 +439,8 @@ export const loadServerState = async (
   if (state === undefined) {
     throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
   }
-  return state
+  // A saved mob state mx-gameplay cannot repair would otherwise stop every tick of this dimension.
+  return Result.map(validateEcosystemMobStates(state.entities ?? []), () => state)
 }
 
 export const writeServerState = async (
@@ -518,56 +512,15 @@ export const createLatestStatePersistence = <State>(
   }
 }
 
-export const makeGeneratedBlockAt = (
-  seed: number,
-): ((position: BlockPos) => Result.Result<string | null, GeneratedBlockReadFailure>) => {
-  const seedResult = WorldgenNoiseSeed.result(seed)
-  const chunks = new Map<string, Chunk>()
-  return (at) => {
-    if (Result.isFailure(seedResult)) {
-      return Result.fail({ _tag: 'GeneratedNoiseSeedFailure', failure: seedResult.failure })
-    }
-    const x = BlockAxis.result(at.x)
-    if (Result.isFailure(x)) return Result.fail({ _tag: 'GeneratedBlockAxisFailure', axis: 'x', failure: x.failure })
-    const y = BlockAxis.result(at.y)
-    if (Result.isFailure(y)) return Result.fail({ _tag: 'GeneratedBlockAxisFailure', axis: 'y', failure: y.failure })
-    const z = BlockAxis.result(at.z)
-    if (Result.isFailure(z)) return Result.fail({ _tag: 'GeneratedBlockAxisFailure', axis: 'z', failure: z.failure })
-    if (y.success < 0 || y.success >= CHUNK_HEIGHT) return Result.succeed(null)
-    const position = blockPosition(x.success, y.success, z.success)
-    const coordinate = chunkCoordOfBlock(position)
-    const key = `${String(coordinate.cx)},${String(coordinate.cz)}`
-    let chunk = chunks.get(key)
-    if (chunk === undefined) {
-      const chunkResult = generateChunkAt(seedResult.success, coordinate.cx, coordinate.cz)
-      if (Result.isFailure(chunkResult)) {
-        return Result.fail({ _tag: 'GeneratedChunkFailure', failure: chunkResult.failure })
-      }
-      chunk = chunkResult.success
-      chunks.set(key, chunk)
-    }
-    const local = localCoordOfBlock(position)
-    const blockId = BlockId.result(getBlockAt(chunk, local.lx, local.ly, local.lz))
-    if (Result.isFailure(blockId)) {
-      return Result.fail({ _tag: 'GeneratedBlockIdFailure', failure: blockId.failure })
-    }
-    const block = blockTypeOfId(blockId.success)
-    if (Result.isFailure(block)) {
-      return Result.fail({ _tag: 'GeneratedBlockRegistryFailure', failure: block.failure })
-    }
-    return Result.succeed(block.success === undefined || block.success === 'air' ? null : block.success)
-  }
-}
-
 const findSpawnAt = (
-  generatedBlockAt: (position: BlockPos) => Result.Result<string | null, GeneratedBlockReadFailure>,
-): Result.Result<BlockPos, GeneratedBlockReadFailure> => {
+  blockAt: WorldBlockReader['blockAt'],
+): Result.Result<BlockPos, MultiplayerServerCoreFailure> => {
   for (let y = CHUNK_HEIGHT - 2; y >= 0; y -= 1) {
-    const ground = generatedBlockAt({ x: 0, y, z: 0 })
+    const ground = blockAt({ x: 0, y, z: 0 })
     if (Result.isFailure(ground)) return Result.fail(ground.failure)
-    const feet = generatedBlockAt({ x: 0, y: y + 1, z: 0 })
+    const feet = blockAt({ x: 0, y: y + 1, z: 0 })
     if (Result.isFailure(feet)) return Result.fail(feet.failure)
-    const head = generatedBlockAt({ x: 0, y: y + 2, z: 0 })
+    const head = blockAt({ x: 0, y: y + 2, z: 0 })
     if (Result.isFailure(head)) return Result.fail(head.failure)
     if (ground.success !== null && feet.success === null && head.success === null) {
       return Result.succeed({ x: 0, y: y + 1, z: 0 })
@@ -593,24 +546,27 @@ const listen = (server: HttpServer, port: number, host: string): Promise<number>
 
 export const startMultiplayerServer = async (
   options: MultiplayerRuntimeOptions,
-): Promise<Result.Result<MultiplayerRuntime, GeneratedBlockReadFailure>> => {
-  const generatedBlockAt = makeGeneratedBlockAt(options.seed)
+): Promise<Result.Result<MultiplayerRuntime, GeneratedBlockReadFailure | MultiplayerServerCoreFailure>> => {
   const noiseSeed = WorldgenNoiseSeed.result(options.seed)
   if (Result.isFailure(noiseSeed)) return Result.fail({ _tag: 'GeneratedNoiseSeedFailure', failure: noiseSeed.failure })
   // Both realms have always generated from the overworld terrain generator; the End is only its static blocks.
   const terrainSource = generatedChunkSource(noiseSeed.success)
   const coreParts = makeMultiplayerServerCoreParts()
-  const overworldSpawnResult = findSpawnAt(generatedBlockAt)
+  // Spawn is chosen from generated terrain only, through the same reader the cores use.
+  const terrain = makeTerrainReader(terrainSource, coreParts)
+  const overworldSpawnResult = findSpawnAt(terrain.blockAt)
   if (Result.isFailure(overworldSpawnResult)) return Result.fail(overworldSpawnResult.failure)
-  const netherSpawnResult = findSpawnAt(generatedBlockAt)
+  const netherSpawnResult = findSpawnAt(terrain.blockAt)
   if (Result.isFailure(netherSpawnResult)) return Result.fail(netherSpawnResult.failure)
   const overworldSpawnAt = overworldSpawnResult.success
   const netherSpawnAt = netherSpawnResult.success
   const transportSecurity = resolveTransportSecurity(options)
   const stateFile = options.stateFile
-  const initialState = stateFile === undefined
-    ? undefined
+  const initialStateResult = stateFile === undefined
+    ? Result.succeed(undefined)
     : await loadServerState(stateFile, options.worldId, options.seed)
+  if (Result.isFailure(initialStateResult)) return Result.fail(initialStateResult.failure)
+  const initialState = initialStateResult.success
   const legacyPlayers = new Set([
     ...(initialState?.inventories.map(({ player }) => player) ?? []),
     ...(initialState?.vitals.map(({ player }) => player) ?? []),
@@ -626,18 +582,22 @@ export const startMultiplayerServer = async (
         writeServerState(stateFile, options.worldId, options.seed, state),
       )
   const endStateFile = stateFile === undefined ? undefined : `${stateFile}.end`
-  const endInitialState = endStateFile === undefined
-    ? undefined
+  const endInitialStateResult = endStateFile === undefined
+    ? Result.succeed(undefined)
     : await loadServerState(endStateFile, 'end', options.seed)
+  if (Result.isFailure(endInitialStateResult)) return Result.fail(endInitialStateResult.failure)
+  const endInitialState = endInitialStateResult.success
   const endPersistence = endStateFile === undefined
     ? undefined
     : createLatestStatePersistence((state: MultiplayerServerState) =>
         writeServerState(endStateFile, 'end', options.seed, state),
       )
   const netherStateFile = stateFile === undefined ? undefined : `${stateFile}.nether`
-  const netherInitialState = netherStateFile === undefined
-    ? undefined
+  const netherInitialStateResult = netherStateFile === undefined
+    ? Result.succeed(undefined)
     : await loadServerState(netherStateFile, 'nether', options.seed)
+  if (Result.isFailure(netherInitialStateResult)) return Result.fail(netherInitialStateResult.failure)
+  const netherInitialState = netherInitialStateResult.success
   const netherPersistence = netherStateFile === undefined
     ? undefined
     : createLatestStatePersistence((state: MultiplayerServerState) =>

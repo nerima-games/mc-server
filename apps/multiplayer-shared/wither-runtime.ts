@@ -121,8 +121,8 @@ const decodePosition = (value: unknown): Position | undefined => {
   if (typeof x !== 'number' || !Number.isFinite(x)
     || typeof y !== 'number' || !Number.isFinite(y)
     || typeof z !== 'number' || !Number.isFinite(z)) return undefined
-  const decoded = makePosition({ x, y, z })
-  return Result.isFailure(decoded) ? undefined : decoded.success
+  // PositionAxis accepts every finite number, which the checks above already guarantee.
+  return Result.getOrThrow(makePosition({ x, y, z }))
 }
 
 const isWitherSkullVariant = (value: unknown): value is WitherSkullVariant =>
@@ -268,21 +268,15 @@ export const matchRuntimeWitherSummon = (
     const positionedBase = makePosition(base)
     if (Result.isFailure(positionedBase)) return Result.fail(positionedBase.failure)
 
-    let materialFailure: Brand.BrandError | undefined
-    const match = matchWitherSummon(positionedBase.success, (cell) => {
+    // A finite base plus pattern offsets of at most two blocks stays finite, so matching cannot fail.
+    const match = Result.getOrThrow(matchWitherSummon(positionedBase.success, (cell) => {
       const value = blockAt(cell)
       // mc-sim matches both the body materials and the skulls through this reader.
       if (value === undefined) return undefined
-      const material = WitherSummonMaterial.result(value)
-      if (Result.isFailure(material)) {
-        materialFailure = material.failure
-        return undefined
-      }
-      return material.success
-    })
-    if (materialFailure !== undefined) return Result.fail(materialFailure)
-    if (Result.isFailure(match)) return match
-    if (match.success !== undefined) return match
+      // WitherSummonMaterial accepts every string, the only non-undefined type blockAt returns.
+      return Result.getOrThrow(WitherSummonMaterial.result(value))
+    }))
+    if (match !== undefined) return Result.succeed(match)
   }
   return Result.succeed(undefined)
 }
@@ -324,8 +318,8 @@ export const advanceWitherRuntime = (
   if (Result.isFailure(delta)) return Result.fail(delta.failure)
   const targetPosition = makePosition(target)
   if (Result.isFailure(targetPosition)) return Result.fail(targetPosition.failure)
-  const targetHead = makePosition({ ...target, y: target.y + 0.9 })
-  if (Result.isFailure(targetHead)) return Result.fail(targetHead.failure)
+  // target.y is finite here, and adding 0.9 rounds to at most Number.MAX_VALUE instead of overflowing.
+  const targetHead = Result.getOrThrow(makePosition({ ...target, y: target.y + 0.9 }))
 
   const explosions: WitherExplosion[] = []
   const withers: RuntimeWither[] = []
@@ -358,14 +352,14 @@ export const advanceWitherRuntime = (
     if (rangedCooldownSecs <= 0) {
       nextSkullId += 1
       shotsFired += 1
-      const origin = makePosition({
+      // Branded feet coordinates are finite, and adding 2 rounds to at most Number.MAX_VALUE.
+      const origin = Result.getOrThrow(makePosition({
         ...stepped.state.feetPosition,
         y: stepped.state.feetPosition.y + 2,
-      })
-      if (Result.isFailure(origin)) return Result.fail(origin.failure)
+      }))
       const descriptor = witherSkullProjectile(
-        origin.success,
-        targetHead.success,
+        origin,
+        targetHead,
         shotsFired % 3 === 0 ? 'blue' : 'normal',
       )
       const skull: RuntimeWitherSkull = {
@@ -404,7 +398,7 @@ export const advanceWitherRuntime = (
     if (Result.isFailure(nextPosition)) return Result.fail(nextPosition.failure)
     const position = nextPosition.success
     const ageSecs = skull.ageSecs + movementDelta
-    const hitPlayer = distance(position, targetHead.success) <= 0.8
+    const hitPlayer = distance(position, targetHead) <= 0.8
     if (hitPlayer || skullHitsWorld(skull, position)) {
       explosions.push({
         position,

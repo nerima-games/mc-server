@@ -242,6 +242,104 @@ describe('authoritative sleep network adapter', () => {
     expect(twice).toEqual(once)
   })
 
+  it('wakes a sleeper through the LeaveSleep intent and rejects a sleeper that is already awake', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
+    expect(authority.execute(command(alice, 'a', 'sleep-a', 0), context)).toMatchObject({ accepted: true, revision: 1 })
+    const leave: SleepCommand = { _tag: 'LeaveSleep', actor: alice, session: 'a', requestId: 'leave-a', expectedRevision: 1, clientTick: 6 }
+    expect(authority.execute(leave, context)).toEqual({
+      accepted: true,
+      requestId: 'leave-a',
+      revision: 2,
+      events: [
+        { _tag: 'ActorSleepChanged', actor: alice, sleeping: null },
+        { _tag: 'SleepProgress', sleeping: 0, required: 2, connected: 2, ready: false },
+      ],
+    })
+    expect(authority.snapshot().actors.every((candidate) => candidate.sleeping === undefined)).toBe(true)
+    expect(authority.execute({ ...leave, requestId: 'leave-again', expectedRevision: 2 }, context)).toEqual({
+      accepted: false, requestId: 'leave-again', revision: 2, reason: 'not-sleeping',
+    })
+  })
+
+  it('maps a LeaveSleep that SurvivalAuthority rejects to invalid-command', () => {
+    // SurvivalAuthority rejects a non-integer expected revision when it validates the command header.
+    const sleepingAlice = { ...actor(alice, 'a'), sleeping: { dimension: 'overworld', bed } }
+    const authority = makeAuthority({ ...snapshot(sleepingAlice, actor(bob, 'b')), revision: 0.5 }, options(100))
+    const leave: SleepCommand = { _tag: 'LeaveSleep', actor: alice, session: 'a', requestId: 'leave-a', expectedRevision: 0.5, clientTick: 6 }
+    expect(authority.execute(leave, context)).toEqual({ accepted: false, requestId: 'leave-a', revision: 0.5, reason: 'invalid-command' })
+  })
+
+  it('reconciles sleepers whose bed stops validating and leaves valid sleepers alone', () => {
+    let bedValid = true
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), {
+      ...options(100),
+      validateSleep: () => ({ dimension: 'overworld', bedValid, nightOrThunder: true, safe: true }),
+    })
+    expect(authority.execute(command(alice, 'a', 'sleep-a', 0), context)).toMatchObject({ accepted: true, revision: 1 })
+    expect(authority.reconcile()).toEqual([])
+    bedValid = false
+    expect(authority.reconcile()).toEqual([
+      { _tag: 'ActorSleepChanged', actor: alice, sleeping: null },
+      { _tag: 'SleepProgress', sleeping: 0, required: 2, connected: 2, ready: false },
+    ])
+    expect(authority.snapshot().revision).toBe(2)
+  })
+
+  it.each([
+    ['an empty request id', actor(alice, 'a'), { requestId: '' }, 'invalid-command'],
+    ['an actor outside the roster', actor(bob, 'b'), {}, 'unauthorized-actor'],
+    ['a dead actor', { ...actor(alice, 'a'), health: 0 }, {}, 'actor-dead'],
+    ['a creative actor', { ...actor(alice, 'a'), gameMode: 'creative' }, {}, 'invalid-game-mode'],
+    ['a fractional bed position', actor(alice, 'a'), { bed: { x: 0, y: 64.5, z: 1 } }, 'invalid-command'],
+  ] as const)('rejects EnterSleep from %s', (_case, rosterActor, override, reason) => {
+    const authority = makeAuthority(snapshot(rosterActor), options())
+    const request = { ...command(alice, 'a', 'sleep-check', 0), ...override }
+    expect(authority.execute(request, context)).toEqual({ accepted: false, requestId: request.requestId, revision: 0, reason })
+  })
+
+  it.each([
+    ['invalid-bed', { bedValid: false, nightOrThunder: true, safe: true }],
+    ['not-sleep-time', { bedValid: true, nightOrThunder: false, safe: true }],
+    ['sleep-unsafe', { bedValid: true, nightOrThunder: true, safe: false }],
+  ] as const)('rejects EnterSleep with %s when validateSleep refuses the bed', (reason, validation) => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), {
+      ...options(),
+      validateSleep: () => ({ dimension: 'overworld', ...validation }),
+    })
+    expect(authority.execute(command(alice, 'a', 'sleep-check', 0), context)).toEqual({
+      accepted: false, requestId: 'sleep-check', revision: 0, reason,
+    })
+  })
+
+  it('rejects EnterSleep from an actor who is already asleep', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
+    expect(authority.execute(command(alice, 'a', 'sleep-a', 0), context)).toMatchObject({ accepted: true, revision: 1 })
+    expect(authority.execute(command(alice, 'a', 'sleep-again', 1), context)).toEqual({
+      accepted: false, requestId: 'sleep-again', revision: 1, reason: 'already-sleeping',
+    })
+  })
+
+  it('fails to restore a sleeper whose bed is not a block position', () => {
+    const sleepingAlice = { ...actor(alice, 'a'), sleeping: { dimension: 'overworld', bed: { x: 0, y: 64.5, z: 1 } } }
+    const restored = SleepAuthority.make(snapshot(sleepingAlice), options())
+    expect(Result.isFailure(restored)).toBe(true)
+  })
+
+  it('rejoins one actor with a new session and leaves the other actors untouched', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options())
+    expect(authority.rejoin(alice, 'a', 'a-next')).toBe(true)
+    expect(authority.snapshot().actors).toEqual([actor(alice, 'a-next'), actor(bob, 'b')])
+  })
+
+  it('ignores disconnects and rejoins for actors it does not hold', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), options())
+    expect(authority.disconnect(bob)).toEqual([])
+    expect(authority.rejoin(alice, 'a', '')).toBe(false)
+    expect(authority.rejoin(alice, 'wrong', 'next')).toBe(false)
+    expect(authority.rejoin(bob, 'b', 'next')).toBe(false)
+    expect(authority.snapshot()).toEqual(snapshot(actor(alice, 'a')))
+  })
+
   it('removes sleepers on disconnect and restores snapshot state on rejoin', () => {
     const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
     authority.execute(command(alice, 'a', 'sleep-a', 0), context)
