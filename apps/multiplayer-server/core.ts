@@ -3644,7 +3644,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             failure: applied.failure,
           })
         }
-        statusEffects.set(playerId, applied.success)
+        statusEffects.set(playerId, applied.success.state)
         effectsChanged = true
       }
       brewingStands.set(positionKey(at), { at, state: next })
