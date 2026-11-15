@@ -26,7 +26,7 @@ import {
   type HungerCommand,
   type HungerEvent,
 } from '@nerima-games/mx-multiplayer'
-import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, EnchantmentLevel, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type Dimension } from '@nerima-games/mc-worldgen'
 import { advanceFurnace, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
@@ -203,6 +203,7 @@ export type ClientId = string
 export type SendFrame = (frame: WireText) => void
 
 type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
+type ResultSuccess<Value> = Value extends Result.Result<infer Success, unknown> ? Success : never
 type PistonHeadOffsetResult = Result.Result<Schema.Schema.Type<typeof PistonBlockOffsetSchema>, Schema.SchemaError>
 const pistonHeadOffsetResult: PistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
 type PistonHeadOffsetFailure = ResultFailure<PistonHeadOffsetResult>
@@ -240,6 +241,18 @@ type ExperienceFailure = ResultFailure<ReturnType<typeof TotalExperience.result>
 type ProjectileFailure = ResultFailure<ReturnType<typeof raycastArrowBlock>>
 type AnvilPlanFailure = ResultFailure<ReturnType<typeof planAnvilOperation>>
 type AnvilExperienceSpendFailure = ResultFailure<ReturnType<typeof spendExperienceLevels>>
+type EnchantmentOfferGenerationFailure = ResultFailure<ReturnType<typeof enchantmentOffers>>
+type FrameRollFailure = ResultFailure<ReturnType<typeof nextRoll>>
+type WeatherInputFailure = ResultFailure<ReturnType<typeof weatherExpires> | ReturnType<typeof advanceWeather>>
+type MobDropFailure = ResultFailure<ReturnType<typeof dropRollsNeeded> | ReturnType<typeof rollDropsOfKind>>
+type MobStateRepairFailure = ResultFailure<ReturnType<typeof repairEcosystemMobState>>
+type StatusEffectFailure = ResultFailure<ReturnType<typeof applyStatusEffect> | ReturnType<typeof tickStatusEffects>>
+type StatusEffectTick = ResultSuccess<ReturnType<typeof tickStatusEffects>>
+type BlockLootFailure = ResultFailure<ReturnType<typeof blockLoot>>
+type EnvironmentalContactDamageFailure = ResultFailure<ReturnType<typeof resolveEnvironmentalContactDamage>>
+type EnvironmentalContactDamageStep = ResultSuccess<ReturnType<typeof resolveEnvironmentalContactDamage>>
+type ExplosionDamageFailure = ResultFailure<ReturnType<typeof explosionDamageAt> | ReturnType<typeof explosionDamageAmount>>
+type DespawnVerdictFailure = ResultFailure<ReturnType<typeof despawnVerdict>>
 
 export type GeneratedBlockReadFailure =
   | Readonly<{ _tag: 'GeneratedNoiseSeedFailure'; failure: GeneratedNoiseSeedFailure }>
@@ -270,6 +283,16 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
   | Readonly<{ _tag: 'AnvilPlanFailure'; failure: AnvilPlanFailure }>
   | Readonly<{ _tag: 'AnvilExperienceSpendFailure'; failure: AnvilExperienceSpendFailure }>
+  | Readonly<{ _tag: 'EnchantmentOfferGenerationFailure'; failure: EnchantmentOfferGenerationFailure }>
+  | Readonly<{ _tag: 'FrameRollFailure'; operation: 'next'; failure: FrameRollFailure }>
+  | Readonly<{ _tag: 'WeatherInputFailure'; operation: 'expires' | 'advance'; failure: WeatherInputFailure }>
+  | Readonly<{ _tag: 'MobDropFailure'; operation: 'roll-count' | 'roll-drops'; failure: MobDropFailure }>
+  | Readonly<{ _tag: 'MobStateRepairFailure'; failure: MobStateRepairFailure }>
+  | Readonly<{ _tag: 'StatusEffectFailure'; operation: 'apply' | 'tick'; failure: StatusEffectFailure }>
+  | Readonly<{ _tag: 'BlockLootFailure'; failure: BlockLootFailure }>
+  | Readonly<{ _tag: 'EnvironmentalContactDamageFailure'; failure: EnvironmentalContactDamageFailure }>
+  | Readonly<{ _tag: 'ExplosionDamageFailure'; operation: 'at' | 'amount'; failure: ExplosionDamageFailure }>
+  | Readonly<{ _tag: 'DespawnVerdictFailure'; failure: DespawnVerdictFailure }>
   | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
   | Readonly<{ _tag: 'GeneratedBlockReadFailure'; failure: GeneratedBlockReadFailure }>
   | Readonly<{ _tag: 'InvalidServerTickDuration'; elapsedMs: number }>
@@ -448,13 +471,16 @@ const emptyContainerSlots = (kind: ContainerKind): Array<ItemStack | null> =>
 
 export const isWeatherClockState = (value: unknown): value is WeatherClockState => {
   const record = unknownRecord(value)
-  return record !== undefined
-    && typeof record['remainingSecs'] === 'number'
-    && Number.isFinite(record['remainingSecs'])
-    && record['remainingSecs'] > 0
-    && typeof record['seed'] === 'number'
-    && Number.isSafeInteger(record['seed'])
-    && normaliseSeed(record['seed']) === record['seed']
+  if (
+    record === undefined
+    || typeof record['remainingSecs'] !== 'number'
+    || !Number.isFinite(record['remainingSecs'])
+    || record['remainingSecs'] <= 0
+    || typeof record['seed'] !== 'number'
+    || !Number.isSafeInteger(record['seed'])
+  ) return false
+  const seed = normaliseSeed(record['seed'])
+  return Result.isSuccess(seed) && seed.success === record['seed']
 }
 
 const supportedMobKind = (entityType: string) => {
@@ -506,9 +532,11 @@ const mobWireState = (value: unknown): MobWireState => {
   }
 }
 
-const ecosystemMobStateForSimulation = (value: unknown): EcosystemMobState | undefined => {
+const ecosystemMobStateForSimulation = (value: unknown): Result.Result<EcosystemMobState | undefined, MobStateRepairFailure> => {
   const state = unknownRecord(value)
-  return state === undefined ? undefined : repairEcosystemMobState({ ...state, _tag: 'EcosystemMob' })
+  return state === undefined
+    ? Result.succeed(undefined)
+    : repairEcosystemMobState({ ...state, _tag: 'EcosystemMob' })
 }
 
 const creeperFuseForSimulation = (value: unknown): CreeperFuse => {
@@ -609,6 +637,8 @@ const VEHICLE_MOVE_DISTANCE = 1
 const PLAYER_MOVE_SPEED_BLOCKS_PER_SECOND = 8
 const MOVEMENT_COLLISION_SAMPLE_DISTANCE = 0.25
 const DEFAULT_INVENTORY_SLOTS = 36
+// Zero is the fixed no-Looting value; the brand constructor documents and enforces that invariant.
+const NO_LOOTING_LEVEL = Result.getOrThrow(EnchantmentLevel.result(0))
 const DEFAULT_VITALS: VitalsState = { health: 20, hunger: 20, experience: 0 }
 const DEFAULT_TIME_WEATHER: TimeWeatherState = { timeOfDay: 6_000, weather: 'clear' }
 const DEFAULT_WEATHER_CLOCK: WeatherClockState = {
@@ -2452,31 +2482,43 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           entities.set(entity.entityId, updated)
           return { accepted: true, deltas: (nextRevision) => [{ _tag: 'EntityUpdateDelta', world: worldId, revision: nextRevision, entity: updated }] }
         }
-        entities.delete(entity.entityId)
         const kind = supportedMobKind(entity.entityType)
         const experienceReward = kind === undefined
           ? 0
-          : mobXpReward({ _tag: 'Slain', lootingLevel: 0 }, mobExperienceReward(kind))
+          : mobXpReward({ _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL }, mobExperienceReward(kind))
+        const dropsResult: Result.Result<ReadonlyArray<AuthoritativeEntityState>, MultiplayerServerCoreFailure> = kind === undefined
+          ? Result.succeed([])
+          : (() => {
+              const rollCount = dropRollsNeeded(kind)
+              if (Result.isFailure(rollCount)) {
+                return Result.fail({ _tag: 'MobDropFailure', operation: 'roll-count', failure: rollCount.failure })
+              }
+              const loot = rollDropsOfKind(
+                kind,
+                { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
+                Array.from({ length: rollCount.success }, (_, index) => deterministicRoll(
+                  `${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:${String(entity.entityId)}:${String(index)}`,
+                )),
+              )
+              if (Result.isFailure(loot)) {
+                return Result.fail({ _tag: 'MobDropFailure', operation: 'roll-drops', failure: loot.failure })
+              }
+              return Result.succeed(loot.success.map((stack, index): AuthoritativeEntityState => ({
+                _tag: 'item-drop',
+                entityId: `${entity.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+                at: entity.at,
+                stack,
+              })))
+            })()
+        if (Result.isFailure(dropsResult)) return { accepted: false, reason: 'invalid-command', failure: dropsResult.failure }
         const playerVitals = vitals.get(message.player)
         const player = players.get(message.player)
+        entities.delete(entity.entityId)
         if (experienceReward > 0 && playerVitals !== undefined) playerVitals.experience += experienceReward
-        const loot = kind === undefined ? [] : rollDropsOfKind(
-          kind,
-          { _tag: 'Slain', lootingLevel: 0 },
-          Array.from({ length: dropRollsNeeded(kind) }, (_, index) => deterministicRoll(
-            `${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:${String(entity.entityId)}:${String(index)}`,
-          )),
-        )
-        const drops: ReadonlyArray<AuthoritativeEntityState> = loot.map((stack, index) => ({
-          _tag: 'item-drop',
-          entityId: `${entity.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-          at: entity.at,
-          stack,
-        }))
-        for (const drop of drops) entities.set(drop.entityId, drop)
+        for (const drop of dropsResult.success) entities.set(drop.entityId, drop)
         return { accepted: true, deltas: (nextRevision) => [
           { _tag: 'EntityDespawnDelta', world: worldId, revision: nextRevision, entityId: entity.entityId },
-          ...drops.map((entity) => ({ _tag: 'EntitySpawnDelta' as const, world: worldId, revision: nextRevision, entity })),
+          ...dropsResult.success.map((entity) => ({ _tag: 'EntitySpawnDelta' as const, world: worldId, revision: nextRevision, entity })),
           ...(experienceReward > 0 && player !== undefined && playerVitals !== undefined ? [{
             _tag: 'PlayerVitalsDelta' as const,
             world: player.world,
@@ -2689,7 +2731,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           const validMovement = isValidVehicleMovement(entity.at, at)
           if (Result.isFailure(validMovement)) return rejectBlockRead(validMovement.failure)
           if (!validMovement.success) return { accepted: false, reason: 'out-of-range' }
-          if (!tryConsumeMovementBudget(message.player, movementDistance(entity.at, at))) return { accepted: false, reason: 'out-of-range' }
+          const movementBudget = tryConsumeMovementBudget(message.player, movementDistance(entity.at, at))
+          if (Result.isFailure(movementBudget)) return { accepted: false, reason: 'invalid-command', failure: movementBudget.failure }
+          if (!movementBudget.success) return { accepted: false, reason: 'out-of-range' }
           updated = { ...entity, at }
           actor.at = at
           playerPositions.set(message.player, { at: { ...at }, facing: { ...actor.facing } })
@@ -3125,18 +3169,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return isMovementPathPassable(from, at, isVehiclePositionPassable)
   }
 
-  const tryConsumeMovementBudget = (player: PlayerId, distance: number): boolean => {
+  const tryConsumeMovementBudget = (player: PlayerId, distance: number): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const nowMs = options.now?.() ?? Date.now()
     const maximum = options.maxMoveDistance ?? DEFAULT_MAX_MOVE_DISTANCE
     const previous = movementBudgets.get(player) ?? { updatedAtMs: nowMs, availableDistance: maximum }
     const elapsedSeconds = Math.max(0, nowMs - previous.updatedAtMs) / 1_000
     const effects = statusEffects.get(player) ?? emptyStatusEffectState()
-    const speedMultiplier = tickStatusEffects(effects, DeltaTimeSecs(0)).movementSpeedMultiplier
+    const statusTick = tickStatusEffects(effects, DeltaTimeSecs(0))
+    if (Result.isFailure(statusTick)) {
+      return Result.fail({ _tag: 'StatusEffectFailure', operation: 'tick', failure: statusTick.failure })
+    }
+    const speedMultiplier = statusTick.success.movementSpeedMultiplier
     const availableDistance = Math.min(maximum, previous.availableDistance + elapsedSeconds * PLAYER_MOVE_SPEED_BLOCKS_PER_SECOND * speedMultiplier)
     movementBudgets.set(player, { updatedAtMs: nowMs, availableDistance })
-    if (distance > availableDistance + COLLISION_EPSILON) return false
+    if (distance > availableDistance + COLLISION_EPSILON) return Result.succeed(false)
     movementBudgets.set(player, { updatedAtMs: nowMs, availableDistance: availableDistance - distance })
-    return true
+    return Result.succeed(true)
   }
 
   const rejectMutation = (
@@ -3445,13 +3493,20 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         (total, candidate) => total + (candidate?.item === 'lapis_lazuli' ? candidate.count : 0),
         0,
       )
+      const offers = enchantmentOffers(current.seed, 15)
+      if (Result.isFailure(offers)) {
+        return rejectEnchanting('invalid-command', 'invalid-command', {
+          _tag: 'EnchantmentOfferGenerationFailure',
+          failure: offers.failure,
+        })
+      }
       const outcome = applyEnchantmentOffer({
         seed: current.seed,
         bookshelfCount: 15,
         playerLevel: levelForTotalExperience(totalExperienceResult.success),
         lapis,
         item: item.value,
-      }, enchantmentOffers(current.seed, 15)[command.offer])
+      }, offers.success[command.offer])
       if (!outcome.ok) {
         const reason: Extract<EnchantingCommandResult, { accepted: false }>['reason'] =
           outcome.reason === 'invalid_state' || outcome.reason === 'invalid_offer'
@@ -3581,7 +3636,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const outcome = drinkBrewingPotion(next)
         if (outcome[1]._tag !== 'Consumed') return rejectBrewing('invalid-command')
         next = outcome[0]
-        statusEffects.set(playerId, applyStatusEffect(statusEffects.get(playerId) ?? emptyStatusEffectState(), outcome[1].effect))
+        const applied = applyStatusEffect(statusEffects.get(playerId) ?? emptyStatusEffectState(), outcome[1].effect)
+        if (Result.isFailure(applied)) {
+          return rejectBrewing('invalid-command', 'invalid-command', {
+            _tag: 'StatusEffectFailure',
+            operation: 'apply',
+            failure: applied.failure,
+          })
+        }
+        statusEffects.set(playerId, applied.success)
         effectsChanged = true
       }
       brewingStands.set(positionKey(at), { at, state: next })
@@ -3995,7 +4058,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           })
           return { accepted: false, reason: 'invalid-movement' }
         }
-        if (!tryConsumeMovementBudget(message.player, movementDistance(player.at, message.at))) {
+        const movementBudget = tryConsumeMovementBudget(message.player, movementDistance(player.at, message.at))
+        if (Result.isFailure(movementBudget)) {
+          sendMessage(client, {
+            _tag: 'PlayerMove',
+            player: player.player,
+            world: worldId,
+            at: player.at,
+            facing: player.facing,
+          })
+          return { accepted: false, reason: 'invalid-movement', failure: movementBudget.failure }
+        }
+        if (!movementBudget.success) {
           sendMessage(client, {
             _tag: 'PlayerMove',
             player: player.player,
@@ -4097,6 +4171,23 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           }
           lootBlockId = blockId.value
         }
+        const inventory = inventories.get(message.player)
+        const heldItem = inventory?.slots[inventory.selectedSlot]?.item
+        const blockLootResult: ReturnType<typeof blockLoot> = lootBlockId === undefined
+          ? Result.succeed([])
+          : blockLoot(
+              lootBlockId,
+              miningLootContextForItem(typeof heldItem === 'string' && isItemType(heldItem) ? heldItem : null),
+              Array.from({ length: 4 }, (_, index) => deterministicRoll(
+                `block:${positionKey(message.at)}:${String(revision + 1)}:${String(index)}`,
+              )),
+            )
+        if (Result.isFailure(blockLootResult)) {
+          return rejectMutation(client, message, 'missing-block', 'invalid-mutation', {
+            _tag: 'BlockLootFailure',
+            failure: blockLootResult.failure,
+          })
+        }
         blocks.set(positionKey(message.at), { at: message.at, block: null })
         poweredRails.delete(positionKey(message.at))
         levers.delete(positionKey(message.at))
@@ -4131,22 +4222,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           brewingStands.delete(brewingKey)
         }
         revision += 1
-        const inventory = inventories.get(message.player)
-        const heldItem = inventory?.slots[inventory.selectedSlot]?.item
-        const blockDrops = lootBlockId !== undefined
-          ? blockLoot(
-              lootBlockId,
-              miningLootContextForItem(typeof heldItem === 'string' && isItemType(heldItem) ? heldItem : null),
-              Array.from({ length: 4 }, (_, index) => deterministicRoll(
-                `block:${positionKey(message.at)}:${String(revision)}:${String(index)}`,
-              )),
-            ).map((stack, index): AuthoritativeEntityState => ({
-              _tag: 'item-drop',
-              entityId: `block:${positionKey(message.at)}:drop:${String(revision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-              at: { x: message.at.x + 0.5, y: message.at.y + 0.5, z: message.at.z + 0.5 },
-              stack,
-            }))
-          : []
+        const blockDrops = blockLootResult.success.map((stack, index): AuthoritativeEntityState => ({
+          _tag: 'item-drop',
+          entityId: `block:${positionKey(message.at)}:drop:${String(revision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+          at: { x: message.at.x + 0.5, y: message.at.y + 0.5, z: message.at.z + 0.5 },
+          stack,
+        }))
         const contentsDrops = storedStacks.map((stack, index): AuthoritativeEntityState => ({
           _tag: 'item-drop',
           entityId: `contents:${positionKey(message.at)}:drop:${String(revision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
@@ -4386,24 +4467,39 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (timeChanged) {
       const elapsedGameSecs = (elapsedTicks * MINECRAFT_TICK_MS) / 1_000
       const weatherState = { weather: timeWeather.weather, remainingSecs: weatherClock.remainingSecs }
-      const transitionDraw = weatherExpires(weatherState, elapsedGameSecs)
-        ? nextRoll(weatherClock.seed)
-        : undefined
-      const durationDraw = transitionDraw === undefined ? undefined : nextRoll(transitionDraw.seed)
+      const expires = weatherExpires(weatherState, elapsedGameSecs)
+      if (Result.isFailure(expires)) {
+        return Result.fail({ _tag: 'WeatherInputFailure', operation: 'expires', failure: expires.failure })
+      }
+      let rolls = LOWEST_WEATHER_ROLLS
+      let nextWeatherSeed = weatherClock.seed
+      if (expires.success) {
+        const transitionDraw = nextRoll(weatherClock.seed)
+        if (Result.isFailure(transitionDraw)) {
+          return Result.fail({ _tag: 'FrameRollFailure', operation: 'next', failure: transitionDraw.failure })
+        }
+        const durationDraw = nextRoll(transitionDraw.success.seed)
+        if (Result.isFailure(durationDraw)) {
+          return Result.fail({ _tag: 'FrameRollFailure', operation: 'next', failure: durationDraw.failure })
+        }
+        rolls = { transition: transitionDraw.success.roll, duration: durationDraw.success.roll }
+        nextWeatherSeed = durationDraw.success.seed
+      }
       const nextWeather = advanceWeather(
         weatherState,
         elapsedGameSecs,
-        transitionDraw === undefined || durationDraw === undefined
-          ? LOWEST_WEATHER_ROLLS
-          : { transition: transitionDraw.roll, duration: durationDraw.roll },
+        rolls,
       )
+      if (Result.isFailure(nextWeather)) {
+        return Result.fail({ _tag: 'WeatherInputFailure', operation: 'advance', failure: nextWeather.failure })
+      }
       timeWeather = {
         timeOfDay: (timeWeather.timeOfDay + elapsedTicks) % MINECRAFT_DAY_TICKS,
-        weather: nextWeather.weather,
+        weather: nextWeather.success.weather,
       }
       weatherClock = {
-        remainingSecs: nextWeather.remainingSecs,
-        seed: durationDraw?.seed ?? weatherClock.seed,
+        remainingSecs: nextWeather.success.remainingSecs,
+        seed: nextWeatherSeed,
       }
       const nextThunderStrikeSequence = Math.floor(timeWeather.timeOfDay / THUNDER_STRIKE_INTERVAL_TICKS)
       if (
@@ -4416,6 +4512,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const at = target === undefined
           ? { x: 0, y: bounds.maxY, z: 0 }
           : { x: target.at.x, y: target.at.y, z: target.at.z }
+        const strikePosition = positionFromNumbers(at.x, at.y, at.z)
+        if (Result.isFailure(strikePosition)) {
+          return Result.fail({ _tag: 'PositionBrandFailure', failure: strikePosition.failure })
+        }
         postPersistenceDeltas.push({
           _tag: 'LightningStrikeDelta',
           world: worldId,
@@ -4427,8 +4527,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             entity._tag !== 'living'
             || entity.entityType !== CREEPER_KIND
             || entity.mobState?.charged === true
-            || !isWithinLightningStrikeRadius(entity.at, at)
           ) continue
+          const entityPosition = positionFromNumbers(entity.at.x, entity.at.y, entity.at.z)
+          if (Result.isFailure(entityPosition)) {
+            return Result.fail({ _tag: 'PositionBrandFailure', failure: entityPosition.failure })
+          }
+          if (!isWithinLightningStrikeRadius(entityPosition.success, strikePosition.success)) continue
           entities.set(entity.entityId, {
             ...entity,
             mobState: { ...mobWireState(entity.mobState), charged: true },
@@ -4466,6 +4570,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const changedBrewingStands: Array<Readonly<{ at: BlockPos; state: BrewingStandState }>> = []
       const changedEffects = new Set<PlayerId>()
       const changedVitals = new Set<PlayerId>()
+      const advancedEffects: Array<Readonly<{ player: PlayerId; effects: StatusEffectState; advanced: StatusEffectTick }>> = []
+
+      for (const [player, effects] of statusEffects) {
+        const advanced = tickStatusEffects(effects, DeltaTimeSecs(elapsedSecs))
+        if (Result.isFailure(advanced)) {
+          return Result.fail({ _tag: 'StatusEffectFailure', operation: 'tick', failure: advanced.failure })
+        }
+        advancedEffects.push({ player, effects, advanced: advanced.success })
+      }
 
       for (const [key, stand] of brewingStands) {
         const next = tickBrewingStand(stand.state, DeltaTimeSecs(elapsedSecs))
@@ -4474,8 +4587,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         changedBrewingStands.push({ at: stand.at, state: next })
       }
 
-      for (const [player, effects] of statusEffects) {
-        const advanced = tickStatusEffects(effects, DeltaTimeSecs(elapsedSecs))
+      for (const { player, effects, advanced } of advancedEffects) {
         if (JSON.stringify(advanced.state) !== JSON.stringify(effects)) {
           statusEffects.set(player, advanced.state)
           changedEffects.add(player)
@@ -4523,14 +4635,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
 
     if (elapsedSecs > 0) {
-      simulationElapsedSecs += elapsedSecs
+      const nextSimulationElapsedSecs = simulationElapsedSecs + elapsedSecs
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
+      const inactivePlayers: PlayerId[] = []
+      const contactSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; step: EnvironmentalContactDamageStep }>> = []
 
       for (const [player, presence] of players) {
         const playerVitals = vitals.get(player)
         if (playerVitals === undefined || playerVitals.health <= 0) {
-          environmentalContactDamageStates.delete(player)
+          inactivePlayers.push(player)
           continue
         }
         const contactsResult = environmentalContactsAt(presence.at)
@@ -4538,10 +4652,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const resolution = resolveEnvironmentalContactDamage(
           environmentalContactDamageStates.get(player) ?? INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
           contactsResult.success,
-          simulationElapsedSecs,
+          nextSimulationElapsedSecs,
         )
-        environmentalContactDamageStates.set(player, resolution.state)
-        const damage = resolution.damages.reduce((total, entry) => total + entry.amount, 0)
+        if (Result.isFailure(resolution)) {
+          return Result.fail({ _tag: 'EnvironmentalContactDamageFailure', failure: resolution.failure })
+        }
+        contactSteps.push({ player, playerVitals, step: resolution.success })
+      }
+
+      for (const player of inactivePlayers) environmentalContactDamageStates.delete(player)
+      for (const { player, playerVitals, step } of contactSteps) {
+        environmentalContactDamageStates.set(player, step.state)
+        const damage = step.damages.reduce((total, entry) => total + entry.amount, 0)
         if (damage <= 0) continue
 
         const wasAlive = playerVitals.health > 0
@@ -4555,6 +4677,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
       }
 
+      simulationElapsedSecs = nextSimulationElapsedSecs
       if (damagedPlayers.size > 0) {
         revision += 1
         stateChanged = true
@@ -4660,6 +4783,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
         }
         const plan = planResult.success
+        const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
+        for (const [player, presence] of players) {
+          if (presence.world !== worldId) continue
+          const playerVitals = vitals.get(player)
+          if (playerVitals === undefined) continue
+          const distance = Math.hypot(
+            presence.at.x - center.x,
+            presence.at.y + 0.9 - center.y,
+            presence.at.z - center.z,
+          )
+          const damage = explosionDamageAt(explosion, distance)
+          if (Result.isFailure(damage)) {
+            return Result.fail({ _tag: 'ExplosionDamageFailure', operation: 'at', failure: damage.failure })
+          }
+          if (damage.success.amount > 0) damageSteps.push({ player, playerVitals, amount: damage.success.amount })
+        }
         // Explosion resolution always needs a snapshot, including an empty crater.
         worldChanged = true
         for (const position of plan.destroyedBlocks) {
@@ -4667,19 +4806,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           disturbFallingBlocks([position])
           worldChanged = true
         }
-        for (const [player, presence] of players) {
-          if (presence.world !== worldId) continue
-          const distance = Math.hypot(
-            presence.at.x - center.x,
-            presence.at.y + 0.9 - center.y,
-            presence.at.z - center.z,
-          )
-          const damage = explosionDamageAt(explosion, distance)
-          if (damage.amount <= 0) continue
-          const playerVitals = vitals.get(player)
-          if (playerVitals === undefined) continue
+        for (const { player, playerVitals, amount } of damageSteps) {
           const wasAlive = playerVitals.health > 0
-          playerVitals.health = Math.max(0, playerVitals.health - damage.amount)
+          playerVitals.health = Math.max(0, playerVitals.health - amount)
           const hungerActor = hungerActors.get(player)
           if (hungerActor !== undefined) hungerActors.set(player, {
             ...hungerActor,
@@ -4731,31 +4860,69 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           const travelDistance = Math.hypot(travel.x, travel.y, travel.z)
           const blockProjection = Option.isNone(blockImpact) ? undefined : blockImpact.value.distance / travelDistance
           const blockWasHit = Option.isSome(blockImpact)
-          const livingHit = [...entities.values()]
-            .filter((candidate): candidate is Extract<AuthoritativeEntityState, { readonly _tag: 'living' }> => candidate._tag === 'living')
-            .map((candidate) => ({
-              candidate,
-              projection: arrowHitProjection(entity.at, at, { ...candidate.at, y: candidate.at.y + 0.9 }),
-            }))
-            .filter((candidate): candidate is { candidate: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>; projection: number } => candidate.projection !== undefined)
-            .sort((left, right) => left.projection - right.projection)[0]
-          const playerHit = [...players.entries()]
-            .filter(([player, presence]) =>
-              player !== entity.owner
-              && presence.world === worldId
-              && (vitals.get(player)?.health ?? 0) > 0,
-            )
-            .map(([player, presence]) => ({
-              player,
-              projection: arrowHitProjection(entity.at, at, { ...presence.at, y: presence.at.y + 0.9 }),
-            }))
-            .filter((candidate): candidate is { player: PlayerId; projection: number } => candidate.projection !== undefined)
-            .sort((left, right) => left.projection - right.projection)[0]
+          const livingHits: Array<Readonly<{
+            candidate: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
+            projection: number
+          }>> = []
+          for (const candidate of entities.values()) {
+            if (candidate._tag !== 'living') continue
+            const targetPosition = positionFromNumbers(candidate.at.x, candidate.at.y + 0.9, candidate.at.z)
+            if (Result.isFailure(targetPosition)) {
+              return Result.fail({ _tag: 'PositionBrandFailure', failure: targetPosition.failure })
+            }
+            const projection = arrowHitProjection(fromPosition.success, toPosition.success, targetPosition.success)
+            if (projection !== undefined) livingHits.push({ candidate, projection })
+          }
+          livingHits.sort((left, right) => left.projection - right.projection)
+          const livingHit = livingHits[0]
+          const playerHits: Array<Readonly<{ player: PlayerId; projection: number }>> = []
+          for (const [player, presence] of players) {
+            if (player === entity.owner || presence.world !== worldId || (vitals.get(player)?.health ?? 0) <= 0) continue
+            const targetPosition = positionFromNumbers(presence.at.x, presence.at.y + 0.9, presence.at.z)
+            if (Result.isFailure(targetPosition)) {
+              return Result.fail({ _tag: 'PositionBrandFailure', failure: targetPosition.failure })
+            }
+            const projection = arrowHitProjection(fromPosition.success, toPosition.success, targetPosition.success)
+            if (projection !== undefined) playerHits.push({ player, projection })
+          }
+          playerHits.sort((left, right) => left.projection - right.projection)
+          const playerHit = playerHits[0]
           const livingWasHit = livingHit !== undefined
             && (blockProjection === undefined || livingHit.projection < blockProjection)
           const playerWasHit = playerHit !== undefined
             && (blockProjection === undefined || playerHit.projection < blockProjection)
             && (livingHit === undefined || playerHit.projection < livingHit.projection)
+          let livingHitExperienceReward = 0
+          let livingHitDrops: ReadonlyArray<AuthoritativeEntityState> = []
+          if (!playerWasHit && livingWasHit && livingHit !== undefined && livingHit.candidate.health <= entity.damage) {
+            const kind = supportedMobKind(livingHit.candidate.entityType)
+            if (kind !== undefined) {
+              livingHitExperienceReward = mobXpReward(
+                { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
+                mobExperienceReward(kind),
+              )
+              const rollCount = dropRollsNeeded(kind)
+              if (Result.isFailure(rollCount)) {
+                return Result.fail({ _tag: 'MobDropFailure', operation: 'roll-count', failure: rollCount.failure })
+              }
+              const loot = rollDropsOfKind(
+                kind,
+                { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
+                Array.from({ length: rollCount.success }, (_, index) => deterministicRoll(
+                  `${String(options.seed)}:${String(entity.owner)}:${String(entity.entityId)}:${String(livingHit.candidate.entityId)}:${String(index)}`,
+                )),
+              )
+              if (Result.isFailure(loot)) {
+                return Result.fail({ _tag: 'MobDropFailure', operation: 'roll-drops', failure: loot.failure })
+              }
+              livingHitDrops = loot.success.map((stack, index): AuthoritativeEntityState => ({
+                _tag: 'item-drop',
+                entityId: `${livingHit.candidate.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+                at: livingHit.candidate.at,
+                stack,
+              }))
+            }
+          }
           if (ageTicks >= ARROW_LIFESPAN_TICKS || blockWasHit || livingWasHit || playerWasHit) {
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
@@ -4791,29 +4958,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               } else {
                 entities.delete(hit.entityId)
                 movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: hit.entityId })
-                const kind = supportedMobKind(hit.entityType)
-                const experienceReward = kind === undefined ? 0 : mobXpReward({ _tag: 'Slain', lootingLevel: 0 }, mobExperienceReward(kind))
                 if (entity.owner !== null) {
                   const ownerVitals = vitals.get(entity.owner)
                   const owner = players.get(entity.owner)
-                  if (experienceReward > 0 && ownerVitals !== undefined) {
-                    ownerVitals.experience += experienceReward
+                  if (livingHitExperienceReward > 0 && ownerVitals !== undefined) {
+                    ownerVitals.experience += livingHitExperienceReward
                     if (owner !== undefined) movedEntities.push({
                       _tag: 'PlayerVitalsDelta', world: owner.world, revision: 0, player: entity.owner, state: vitalsSnapshot(ownerVitals),
                     })
                   }
                 }
-                const loot = kind === undefined ? [] : rollDropsOfKind(kind, { _tag: 'Slain', lootingLevel: 0 }, Array.from(
-                  { length: dropRollsNeeded(kind) },
-                  (_, index) => deterministicRoll(`${String(options.seed)}:${String(entity.owner)}:${String(entity.entityId)}:${String(hit.entityId)}:${String(index)}`),
-                ))
-                for (const [index, stack] of loot.entries()) {
-                  const drop: AuthoritativeEntityState = {
-                    _tag: 'item-drop',
-                    entityId: `${hit.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-                    at: hit.at,
-                    stack,
-                  }
+                for (const drop of livingHitDrops) {
                   entities.set(drop.entityId, drop)
                   movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
                 }
@@ -4863,7 +5018,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             randomRoll: deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:despawn:${String(hostileMobState.ageTicks)}`),
             difficulty: options.difficulty ?? 'normal',
           })
-          if (verdict._tag === 'Despawn') {
+          if (Result.isFailure(verdict)) {
+            return Result.fail({ _tag: 'DespawnVerdictFailure', failure: verdict.failure })
+          }
+          if (verdict.success._tag === 'Despawn') {
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
             continue
@@ -4950,8 +5108,24 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const kind = passiveKind ?? hostileKind
         if (kind === undefined) continue
         const target = hostileKind === undefined ? undefined : targetEntry?.[1].at
-        const state = ecosystemMobStateForSimulation(entity.mobState) ?? initialEcosystemMobState()
-        const step = stepEcosystemMob(kind, state, entity.at, target, elapsedSecs)
+        const stateResult = ecosystemMobStateForSimulation(entity.mobState)
+        if (Result.isFailure(stateResult)) {
+          return Result.fail({ _tag: 'MobStateRepairFailure', failure: stateResult.failure })
+        }
+        const state = stateResult.success ?? initialEcosystemMobState()
+        const selfPosition = positionFromNumbers(entity.at.x, entity.at.y, entity.at.z)
+        if (Result.isFailure(selfPosition)) {
+          return Result.fail({ _tag: 'PositionBrandFailure', failure: selfPosition.failure })
+        }
+        let targetPosition: Position | undefined
+        if (target !== undefined) {
+          const brandedTarget = positionFromNumbers(target.x, target.y, target.z)
+          if (Result.isFailure(brandedTarget)) {
+            return Result.fail({ _tag: 'PositionBrandFailure', failure: brandedTarget.failure })
+          }
+          targetPosition = brandedTarget.success
+        }
+        const step = stepEcosystemMob(kind, state, selfPosition.success, targetPosition, elapsedSecs)
         const at = {
           ...step.feetPosition,
           x: Math.min(bounds.maxX, Math.max(bounds.minX, step.feetPosition.x)),
@@ -4959,7 +5133,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         }
         const mobState = {
           ...(hostileKind === undefined ? initialMobState : hostileMobState),
-          attackCooldownSecs: step.state.attackCooldownSecs,
+          attackCooldownSecs: step.state.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
           motionPhase: step.state.motionPhase,
           provoked: step.state.provoked,
         }
@@ -5097,24 +5271,30 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if (Result.isFailure(planResult)) {
             return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
           }
-          for (const position of planResult.success.destroyedBlocks) {
-            blocks.set(positionKey(position), { at: position, block: null })
-            disturbFallingBlocks([position])
-            worldChanged = true
-          }
+          const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
           for (const [player, presence] of players) {
             if (presence.world !== dimension) continue
+            const playerVitals = vitals.get(player)
+            if (playerVitals === undefined) continue
             const distance = Math.hypot(
               presence.at.x - explosion.position.x,
               presence.at.y + 0.9 - explosion.position.y,
               presence.at.z - explosion.position.z,
             )
             const damageAmount = explosionDamageAmount(explosion.power, distance)
-            if (damageAmount <= 0) continue
-            const playerVitals = vitals.get(player)
-            if (playerVitals === undefined) continue
+            if (Result.isFailure(damageAmount)) {
+              return Result.fail({ _tag: 'ExplosionDamageFailure', operation: 'amount', failure: damageAmount.failure })
+            }
+            if (damageAmount.success > 0) damageSteps.push({ player, playerVitals, amount: damageAmount.success })
+          }
+          for (const position of planResult.success.destroyedBlocks) {
+            blocks.set(positionKey(position), { at: position, block: null })
+            disturbFallingBlocks([position])
+            worldChanged = true
+          }
+          for (const { player, playerVitals, amount } of damageSteps) {
             const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - damageAmount)
+            playerVitals.health = Math.max(0, playerVitals.health - amount)
             const hungerActor = hungerActors.get(player)
             if (hungerActor !== undefined) hungerActors.set(player, {
               ...hungerActor,
