@@ -58,6 +58,7 @@ import {
   type MultiplayerServerState,
   type GeneratedBlockReadFailure,
 } from './core.js'
+import { makeMultiplayerServerCoreParts } from './entrypoints/core-parts.js'
 import { loadLegacyPlayerClaims } from './legacy-player-claims.js'
 import { createReconnectAuth } from './reconnect-auth.js'
 import { makeMultiplayerRedstoneRuntime } from './redstone-runtime.js'
@@ -598,6 +599,7 @@ export const startMultiplayerServer = async (
   if (Result.isFailure(noiseSeed)) return Result.fail({ _tag: 'GeneratedNoiseSeedFailure', failure: noiseSeed.failure })
   // Both realms have always generated from the overworld terrain generator; the End is only its static blocks.
   const terrainSource = generatedChunkSource(noiseSeed.success)
+  const coreParts = makeMultiplayerServerCoreParts()
   const overworldSpawnResult = findSpawnAt(generatedBlockAt)
   if (Result.isFailure(overworldSpawnResult)) return Result.fail(overworldSpawnResult.failure)
   const netherSpawnResult = findSpawnAt(generatedBlockAt)
@@ -678,6 +680,7 @@ export const startMultiplayerServer = async (
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
     chunkSource: terrainSource,
+    parts: coreParts,
     spawnAt: overworldSpawnAt,
     staticBlocks: [
       { at: overworldNetherPortalAt, block: 'nether_portal' },
@@ -695,6 +698,7 @@ export const startMultiplayerServer = async (
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
     chunkSource: terrainSource,
+    parts: coreParts,
     spawnAt: netherSpawnAt,
     staticBlocks: [{ at: netherPortalAt, block: 'nether_portal' }],
     ...(netherInitialState === undefined ? {} : { initialState: netherInitialState }),
@@ -709,6 +713,7 @@ export const startMultiplayerServer = async (
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
     chunkSource: chunkSourceFromBlocks('END', () => AIR_BLOCK_ID),
+    parts: coreParts,
     spawnAt: endSpawnAt,
     staticBlocks: endStaticBlocks,
     ...(endInitialState === undefined ? {} : { initialState: endInitialState }),

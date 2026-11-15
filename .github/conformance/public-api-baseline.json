@@ -15,12 +15,6 @@
     "count": 1,
     "file": "apps/multiplayer-server/redstone-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( stage.run(elapsedSecsResult.success).pipe(Effect.provide(ServerClockLayer)), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Scope.make())"
   },
   {

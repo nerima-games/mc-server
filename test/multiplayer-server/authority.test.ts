@@ -26,6 +26,7 @@ import {
 } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerRedstoneRuntime } from '../../apps/multiplayer-server/redstone-runtime'
 import { airTerrain, terrainFrom } from './terrain'
+import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
 import {
   decodePlayerDamageWireMessage,
   encodePlayerDamageCommand,
@@ -164,6 +165,7 @@ const makeFixture = (
     difficulty,
     spawnAt: joinAt,
     chunkSource: airTerrain,
+    parts: makeMultiplayerServerCoreParts(),
     ...serverOptions,
     onStateChanged: (state) => {
       timeline.push('persist')

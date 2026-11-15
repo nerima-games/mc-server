@@ -26,7 +26,7 @@ import {
 } from '@nerima-games/mx-multiplayer'
 import { AIR_BLOCK_ID, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, ChunkCapacity, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, getBlockAt, makeChunkStore, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
@@ -126,17 +126,13 @@ import {
   type EnchantedItem,
   DEFAULT_BLOCK_REACH,
   DEFAULT_SURVIVAL_DIFFICULTY,
-  SPAWN_PLAYER_VITALS,
-  SURVIVAL_HUNGER_STATE_VERSION,
   exhaustionForSurvivalActivity,
-  makeInMemoryVitals,
-  makeSurvivalHungerRuntime,
   resolveFoodUse,
   type InvalidFoodItemId,
   type SurvivalActivityInput,
   type SurvivalActivityInputFailure,
   type SurvivalHungerError,
-  type SurvivalHungerRuntimeApi,
+  type SurvivalDifficulty,
   type SurvivalHungerState,
   type StatusEffectApplication,
 } from '@nerima-games/mx-gameplay'
@@ -368,6 +364,34 @@ const anvilFingerprint = (command: AnvilCommand): string => JSON.stringify(comma
 export const enchantingResultKey = (player: PlayerId, commandId: string): string => JSON.stringify([player, commandId])
 const enchantingFingerprint = (command: EnchantingCommand): string => JSON.stringify(command)
 
+/** mx-gameplay survival-hunger operations, made synchronous by the server entrypoint. */
+export interface SurvivalHungerPart {
+  readonly create: (
+    vitals: Readonly<{ healthPoints: EntityHealthPoints; hungerPoints: HungerPoints }>,
+    difficulty: SurvivalDifficulty,
+  ) => SurvivalHungerState
+  readonly addExhaustion: (state: SurvivalHungerState, amount: number) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+  readonly eat: (state: SurvivalHungerState, foodPoints: number, saturationModifier: number) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+  readonly respawn: (state: SurvivalHungerState) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+  readonly tick: (
+    state: SurvivalHungerState,
+    elapsed: DeltaTimeSecs,
+  ) => Result.Result<Readonly<{ state: SurvivalHungerState; died: boolean }>, SurvivalHungerError>
+}
+
+/** The read operations of an mc-worldgen ChunkStore, made synchronous by the server entrypoint. */
+export interface ChunkStorePart {
+  readonly peek: (coord: ChunkCoord) => ReadonlyChunkWithBlockStates | undefined
+  readonly load: (coord: ChunkCoord) => Result.Result<ReadonlyChunkWithBlockStates, ChunkStoreError>
+  readonly unload: (coord: ChunkCoord) => Result.Result<boolean, ChunkPersistenceError>
+}
+
+/** Effect-backed services the core uses synchronously; `entrypoints/core-parts.ts` builds them. */
+export interface MultiplayerServerCoreParts {
+  readonly survivalHunger: SurvivalHungerPart
+  readonly openChunkStore: (source: ChunkSource) => ChunkStorePart
+}
+
 export interface MultiplayerServerOptions {
   readonly worldId: string
   readonly dimension?: Dimension
@@ -383,6 +407,7 @@ export interface MultiplayerServerOptions {
   }>
   /** Terrain under the server's block edits; the core's ChunkStore generates chunks from it. */
   readonly chunkSource: ChunkSource
+  readonly parts: MultiplayerServerCoreParts
   readonly staticBlocks?: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null }>>
   readonly spawnAt: BlockPos
   readonly initialState?: MultiplayerServerState
@@ -668,8 +693,6 @@ const NO_LOOTING_LEVEL = Result.getOrThrow(EnchantmentLevel.result(0))
 const DEFAULT_VITALS: VitalsState = { health: 20, hunger: 20, experience: 0 }
 // mx-gameplay treats a missing players-sleeping percentage as "every player"; parsing null cannot fail.
 const DEFAULT_SLEEP_RATIO = Result.getOrThrow(sleepRatio(null))
-// Bounds resident terrain. The store never holds a written chunk, so evicting one only costs regeneration.
-const CHUNK_STORE_CAPACITY = Result.getOrThrow(ChunkCapacity.result(256))
 
 /** A chunk source that reads each cell from `blockAt`, for terrain the worldgen generators do not produce. */
 export const chunkSourceFromBlocks = (
@@ -734,7 +757,7 @@ type HungerPlan =
   | Readonly<{ accepted: false; reason: CommandRejectionReason; failure?: MultiplayerServerCoreFailure }>
   | Readonly<{
       accepted: true
-      operation: (runtime: SurvivalHungerRuntimeApi) => Effect.Effect<unknown, SurvivalHungerError>
+      operation: (hunger: SurvivalHungerPart, state: SurvivalHungerState) => Result.Result<SurvivalHungerState, SurvivalHungerError>
       consumedSlot: number | undefined
       effects: ReadonlyArray<StatusEffectApplication>
     }>
@@ -950,7 +973,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return { coord: chunk.coord, blocks: chunkBlocks, biomes: chunk.biomes }
   })
   // The store is the read side of the world only; edits stay in `blocks` until block writes move to the commit path.
-  const chunkStore: ChunkStoreApi = Effect.runSync(makeChunkStore(overlaySource, CHUNK_STORE_CAPACITY))
+  const chunkStore = options.parts.openChunkStore(overlaySource)
   const poweredRails = new Map<string, Readonly<{ at: BlockPos; powered: boolean }>>(
     (options.initialState?.poweredRails ?? []).map(({ at, powered }) => [positionKey(at), {
       at: { ...at },
@@ -1404,16 +1427,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const loadChunk = (coord: ChunkCoord): Result.Result<ReadonlyChunkWithBlockStates, MultiplayerServerCoreFailure> => {
     const key = chunkKeyOf(coord.cx, coord.cz)
     const stale = blocks.takeChanged(key)
-    const resident = Effect.runSync(chunkStore.peek(coord))
+    const resident = chunkStore.peek(coord)
     if (resident !== undefined && !stale) return Result.succeed(resident)
     if (resident !== undefined) {
-      const unloaded = Effect.runSync(Effect.result(chunkStore.unload(coord)))
+      const unloaded = chunkStore.unload(coord)
       if (Result.isFailure(unloaded)) return Result.fail({ _tag: 'ChunkStoreUnloadFailure', failure: unloaded.failure })
     }
     const overlay = overlayFor(coord)
     if (Result.isFailure(overlay)) return Result.fail(overlay.failure)
     pendingOverlays.set(key, overlay.success)
-    const loaded = Effect.runSync(Effect.result(chunkStore.load(coord)))
+    const loaded = chunkStore.load(coord)
     pendingOverlays.delete(key)
     return Result.isFailure(loaded) ? Result.fail({ _tag: 'ChunkStoreLoadFailure', failure: loaded.failure }) : Result.succeed(loaded.success)
   }
@@ -1879,31 +1902,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   }
 
   // Every damage source writes health to the wire vitals, so each hunger step starts from that health.
-  const readHunger = (player: PlayerId, playerVitals: MutableVitalsState): Result.Result<SurvivalHungerState, MultiplayerServerCoreFailure> =>
-    Result.mapError(Effect.runSync(Effect.result(Effect.gen(function* () {
-      const healthPoints = yield* Effect.fromResult(EntityHealthPoints.result(playerVitals.health))
-      const stored = hungerStates.get(player)
-      if (stored !== undefined) return { ...stored, vitals: { ...stored.vitals, healthPoints } }
-      const hungerPoints = yield* Effect.fromResult(HungerPoints.result(playerVitals.hunger))
-      // The in-memory vitals normalise spawn saturation against the persisted hunger.
-      const initial = yield* makeInMemoryVitals({ ...SPAWN_PLAYER_VITALS, healthPoints, hungerPoints })
-      const state: SurvivalHungerState = {
-        version: SURVIVAL_HUNGER_STATE_VERSION,
-        difficulty: options.difficulty ?? DEFAULT_SURVIVAL_DIFFICULTY,
-        vitals: yield* initial.snapshot,
-      }
-      return state
-    }))), hungerFailure)
-
-  const runHunger = <A>(
-    before: SurvivalHungerState,
-    operation: (runtime: SurvivalHungerRuntimeApi) => Effect.Effect<A, SurvivalHungerError>,
-  ): Result.Result<Readonly<{ value: A; after: SurvivalHungerState }>, MultiplayerServerCoreFailure> =>
-    Result.mapError(Effect.runSync(Effect.result(Effect.gen(function* () {
-      const runtime = yield* makeSurvivalHungerRuntime(before)
-      const value = yield* operation(runtime)
-      return { value, after: yield* runtime.snapshot }
-    }))), hungerFailure)
+  const readHunger = (player: PlayerId, playerVitals: MutableVitalsState): Result.Result<SurvivalHungerState, MultiplayerServerCoreFailure> => {
+    const healthPoints = EntityHealthPoints.result(playerVitals.health)
+    if (Result.isFailure(healthPoints)) return Result.fail(hungerFailure(healthPoints.failure))
+    const stored = hungerStates.get(player)
+    if (stored !== undefined) return Result.succeed({ ...stored, vitals: { ...stored.vitals, healthPoints: healthPoints.success } })
+    const hungerPoints = HungerPoints.result(playerVitals.hunger)
+    if (Result.isFailure(hungerPoints)) return Result.fail(hungerFailure(hungerPoints.failure))
+    return Result.succeed(options.parts.survivalHunger.create(
+      { healthPoints: healthPoints.success, hungerPoints: hungerPoints.success },
+      options.difficulty ?? DEFAULT_SURVIVAL_DIFFICULTY,
+    ))
+  }
 
   const commitHunger = (player: PlayerId, playerVitals: MutableVitalsState, after: SurvivalHungerState): void => {
     hungerStates.set(player, after)
@@ -2008,7 +2018,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const { foodPoints, saturationModifier } = food.success
         return {
           accepted: true,
-          operation: (runtime) => runtime.eat(foodPoints, saturationModifier),
+          operation: (hunger, state) => hunger.eat(state, foodPoints, saturationModifier),
           consumedSlot: slot,
           effects: food.success.effects,
         }
@@ -2022,7 +2032,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (Result.isFailure(exhaustion)) {
       return { accepted: false, reason: 'invalid-command', failure: { _tag: 'SurvivalActivityFailure', failure: exhaustion.failure } }
     }
-    return { accepted: true, operation: (runtime) => runtime.addExhaustion(exhaustion.success), consumedSlot: undefined, effects: [] }
+    return { accepted: true, operation: (hunger, state) => hunger.addExhaustion(state, exhaustion.success), consumedSlot: undefined, effects: [] }
   }
 
   const executeHungerCommand = (message: Extract<AuthoritativeCommand, { readonly _tag: 'PlayerVitalsCommand' }>): CommandDecision => {
@@ -2033,13 +2043,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     const before = readHunger(message.player, playerVitals)
     if (Result.isFailure(before)) return { accepted: false, reason: 'invalid-command', failure: before.failure }
     const plan: HungerPlan = message.action === 'respawn'
-      ? { accepted: true, operation: (runtime) => runtime.respawn, consumedSlot: undefined, effects: [] }
+      ? { accepted: true, operation: (hunger, state) => hunger.respawn(state), consumedSlot: undefined, effects: [] }
       : message.action._tag === 'eat'
         ? planEat(message, message.action.item, inventory, before.success)
         : planActivity(message.action.activity, message.action.amount, before.success)
     if (!plan.accepted) return plan
-    const stepped = runHunger(before.success, plan.operation)
-    if (Result.isFailure(stepped)) return { accepted: false, reason: 'invalid-command', failure: stepped.failure }
+    const stepped = plan.operation(options.parts.survivalHunger, before.success)
+    if (Result.isFailure(stepped)) return { accepted: false, reason: 'invalid-command', failure: hungerFailure(stepped.failure) }
     let nextEffects = statusEffects.get(message.player) ?? emptyStatusEffectState()
     for (const effect of plan.effects) {
       const applied = applyStatusEffect(nextEffects, effect)
@@ -2048,7 +2058,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
       nextEffects = applied.success.state
     }
-    commitHunger(message.player, playerVitals, stepped.success.after)
+    commitHunger(message.player, playerVitals, stepped.success)
     if (plan.effects.length > 0) statusEffects.set(message.player, nextEffects)
     const respawnedPlayer = message.action === 'respawn' ? players.get(message.player) : undefined
     if (message.action === 'respawn') {
@@ -5395,9 +5405,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const playerVitals = Option.getOrThrow(Option.fromNullishOr(vitals.get(player)))
         const before = readHunger(player, playerVitals)
         if (Result.isFailure(before)) return Result.fail(before.failure)
-        const ticked = runHunger(before.success, (runtime) => runtime.tick(elapsed))
-        if (Result.isFailure(ticked)) return Result.fail(ticked.failure)
-        steps.push({ player, playerVitals, before: before.success, after: ticked.success.after, died: ticked.success.value.died })
+        const ticked = options.parts.survivalHunger.tick(before.success, elapsed)
+        if (Result.isFailure(ticked)) return Result.fail(hungerFailure(ticked.failure))
+        steps.push({ player, playerVitals, before: before.success, after: ticked.success.state, died: ticked.success.died })
       }
       for (const step of steps) commitHunger(step.player, step.playerVitals, step.after)
       const changed = steps.filter((step) => hungerChanged(step.before, step.after))

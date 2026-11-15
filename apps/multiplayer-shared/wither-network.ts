@@ -1,18 +1,16 @@
 import { Result } from 'effect'
 import { PositionAxis, position, type Position } from '@nerima-games/mc-kernel'
 import type { WireText } from '@nerima-games/mx-multiplayer'
-import type {
-  WitherDamageKind,
-  WitherPhase,
-  WitherSkullProjectileDescriptor,
-  WitherSkullVariant,
-  WitherSnapshot,
-} from '@nerima-games/mc-sim'
 import {
   WitherChargeRemainingSecs as makeWitherChargeRemainingSecs,
   WitherExplosionPower as makeWitherExplosionPower,
   WitherHealthPoints as makeWitherHealthPoints,
   WitherProjectileSpeed as makeWitherProjectileSpeed,
+  type WitherDamageKind,
+  type WitherPhase,
+  type WitherSkullProjectileDescriptor,
+  type WitherSkullVariant,
+  type WitherSnapshot,
 } from '@nerima-games/mc-sim'
 
 import type { RuntimeWitherSkull, WitherRuntimeSnapshot } from './wither-runtime.js'

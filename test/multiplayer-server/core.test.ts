@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest'
 import { makeMultiplayerServerCore, type MultiplayerServerOptions, type MultiplayerServerState, type ReceiveResult } from '../../apps/multiplayer-server/core'
 import { decodeAnvilWireMessage } from '../../apps/multiplayer-shared/anvil-network'
 import { airTerrain, terrainFrom } from './terrain'
+import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
 import { decodeBrewingWireMessage } from '../../apps/multiplayer-shared/brewing-network'
 import { decodeEnderDragonWireMessage, type EnderDragonWireMessage } from '../../apps/multiplayer-shared/ender-dragon-network'
 import { decodeEnchantingWireMessage } from '../../apps/multiplayer-shared/enchanting-network'
@@ -115,6 +116,7 @@ const makeFixture = (
     allowedBlocks: new Set(['stone', 'dirt']),
     bounds: { minX: -10, maxX: 10, minY: 0, maxY: 100, minZ: -10, maxZ: 10 },
     chunkSource: terrainFrom(blockAt),
+    parts: makeMultiplayerServerCoreParts(),
     spawnAt,
     ...serverOptions,
     now: () => nowMs,
@@ -920,6 +922,7 @@ describe('authoritative multiplayer server core', () => {
       bounds: { minX: -10, maxX: 10, minY: 0, maxY: 100, minZ: -10, maxZ: 10 },
       spawnAt: { x: 0, y: 64, z: 0 },
       chunkSource: airTerrain,
+      parts: makeMultiplayerServerCoreParts(),
       staticBlocks: [{ at: { x: 0, y: 64, z: 0 }, block: 'end_portal' }],
     })
     expect(destination.connect('socket-a', (wire) => destinationFrames.push(wire))).toBe(true)

@@ -227,9 +227,7 @@ export const makeMultiplayerRedstoneRuntime = async (
         tickRemainderMs = pendingMs - gameTicks * gameTickMs
         for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
           for (const stage of stages) {
-            Effect.runSync(
-              stage.run(gameTickSecs).pipe(Effect.provide(ServerClockLayer)),
-            )
+            yield* stage.run(gameTickSecs).pipe(Effect.provide(ServerClockLayer))
           }
         }
         for (const event of Effect.runSync(runtime.drainHopperTransferEvents)) {
