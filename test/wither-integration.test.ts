@@ -1,4 +1,4 @@
-import { Result } from 'effect'
+import { Option, Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { blockIdOf, blockTypeOfId } from '@nerima-games/mc-kernel'
 import { isPlaceableItem } from '@nerima-games/mx-gameplay'
@@ -20,8 +20,8 @@ const valueOf = <A, E>(result: Result.Result<A, E>): A => {
 describe('wither gameplay integration', () => {
   it('exposes wither structure blocks through the host placement vocabulary', () => {
     expect(isPlaceableItem('wither_skeleton_skull')).toBe(true)
-    expect(blockTypeOfId(blockIdOf('wither_skeleton_skull'))).toBe('wither_skeleton_skull')
-    expect(blockTypeOfId(blockIdOf('soul_soil'))).toBe('soul_soil')
+    expect(valueOf(blockTypeOfId(Option.getOrThrow(blockIdOf('wither_skeleton_skull'))))).toBe('wither_skeleton_skull')
+    expect(valueOf(blockTypeOfId(Option.getOrThrow(blockIdOf('soul_soil'))))).toBe('soul_soil')
   })
 
   it('consumes a completed structure, activates the wither, and produces its death drop', () => {

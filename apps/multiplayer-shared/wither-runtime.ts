@@ -271,7 +271,8 @@ export const matchRuntimeWitherSummon = (
     let materialFailure: Brand.BrandError | undefined
     const match = matchWitherSummon(positionedBase.success, (cell) => {
       const value = blockAt(cell)
-      if (value !== 'soul_sand' && value !== 'soul_soil') return undefined
+      // mc-sim matches both the body materials and the skulls through this reader.
+      if (value === undefined) return undefined
       const material = WitherSummonMaterial.result(value)
       if (Result.isFailure(material)) {
         materialFailure = material.failure

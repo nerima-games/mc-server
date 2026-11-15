@@ -1,5 +1,5 @@
 import {
-  createHungerAuthority,
+  HungerAuthority,
   decodeFrame,
   encodeFrame,
   type AuthoritativeCommand,
@@ -22,14 +22,12 @@ import {
   type WorldId,
   type WorldSnapshot,
   type ContainerKind,
-  type HungerActor,
-  type HungerCommand,
-  type HungerEvent,
+  type HungerActivity,
 } from '@nerima-games/mx-multiplayer'
-import { blockIdOf, blockTypeOfId, BlockAxis, BlockId, DeltaTimeSecs, EnchantmentLevel, isBlockType, isItemType, maxStackCountOfItem, PositionAxis, propertyOfBlockId, StackCount, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type Dimension } from '@nerima-games/mc-worldgen'
-import { advanceFurnace, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
+import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, ChunkCapacity, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, generateChunkAt, getBlockAt, makeChunkStore, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -126,11 +124,29 @@ import {
   initialEnderDragonEncounter,
   type EnderDragonEncounterSnapshot,
   type EnchantedItem,
+  DEFAULT_BLOCK_REACH,
+  DEFAULT_SURVIVAL_DIFFICULTY,
+  SPAWN_PLAYER_VITALS,
+  SURVIVAL_HUNGER_STATE_VERSION,
+  exhaustionForSurvivalActivity,
+  makeInMemoryVitals,
+  makeSurvivalHungerRuntime,
+  resolveFoodUse,
+  type InvalidFoodItemId,
+  type SurvivalActivityInput,
+  type SurvivalActivityInputFailure,
+  type SurvivalHungerError,
+  type SurvivalHungerRuntimeApi,
+  type SurvivalHungerState,
+  type StatusEffectApplication,
 } from '@nerima-games/mx-gameplay'
-import { Option, Result, Schema } from 'effect'
+import { Brand, Effect, Option, Result, Schema } from 'effect'
 import {
   SleepAuthority,
   decodeSleepWireMessage,
+  sleepRatio,
+  type SleepIntentContext,
+  type SleepRatio,
   type SleepWireMessage,
 } from '../multiplayer-shared/sleep-network.js'
 import {
@@ -296,6 +312,14 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
   | Readonly<{ _tag: 'GeneratedBlockReadFailure'; failure: GeneratedBlockReadFailure }>
   | Readonly<{ _tag: 'InvalidServerTickDuration'; elapsedMs: number }>
+  | Readonly<{ _tag: 'SurvivalHungerFailure'; failure: SurvivalHungerError }>
+  | Readonly<{ _tag: 'SurvivalActivityFailure'; failure: SurvivalActivityInputFailure }>
+  | Readonly<{ _tag: 'FoodUseFailure'; failure: InvalidFoodItemId }>
+  | Readonly<{ _tag: 'ChunkCoordinateFailure'; failure: Brand.BrandError }>
+  | Readonly<{ _tag: 'ChunkStoreLoadFailure'; failure: ChunkStoreError }>
+  | Readonly<{ _tag: 'ChunkStoreUnloadFailure'; failure: ChunkPersistenceError }>
+  | Readonly<{ _tag: 'BlockOverrideNotInRegistry'; at: BlockPos; block: string }>
+  | Readonly<{ _tag: 'IntentContextFailure'; field: 'targetTick' | 'expectedDimensionRevision'; failure: Brand.BrandError | Schema.SchemaError }>
 
 const positionFromNumbers = (x: number, y: number, z: number): Result.Result<Position, PositionFailure> => {
   const brandedX = PositionAxis.result(x)
@@ -357,14 +381,15 @@ export interface MultiplayerServerOptions {
     minZ: number
     maxZ: number
   }>
-  readonly generatedBlockAt?: (position: BlockPos) => Result.Result<string | null, GeneratedBlockReadFailure>
+  /** Terrain under the server's block edits; the core's ChunkStore generates chunks from it. */
+  readonly chunkSource: ChunkSource
   readonly staticBlocks?: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null }>>
   readonly spawnAt: BlockPos
   readonly initialState?: MultiplayerServerState
   readonly onStateChanged?: (state: MultiplayerServerState) => void
   readonly maxMoveDistance?: number
   readonly passableBlocks?: ReadonlySet<string>
-  readonly sleepPercentage?: number
+  readonly sleepRatio?: SleepRatio
   readonly now?: () => number
   readonly difficulty?: 'peaceful' | 'easy' | 'normal' | 'hard'
   readonly onEndPortalUse?: (clientId: ClientId, command: EndPortalUseCommand) => void
@@ -617,6 +642,7 @@ type CommandDecision =
       accepted: true
       deltas: (revision: number) => ReadonlyArray<AuthoritativeDelta>
       messages?: (revision: number) => ReadonlyArray<NetworkMessage>
+      statusEffectDeltas?: (revision: number) => ReadonlyArray<BrewingWireMessage>
       worldSnapshotRequired?: boolean
       snapshotBroadcastRequired?: boolean
     }>
@@ -640,13 +666,87 @@ const DEFAULT_INVENTORY_SLOTS = 36
 // Zero is the fixed no-Looting value; the brand constructor documents and enforces that invariant.
 const NO_LOOTING_LEVEL = Result.getOrThrow(EnchantmentLevel.result(0))
 const DEFAULT_VITALS: VitalsState = { health: 20, hunger: 20, experience: 0 }
+// mx-gameplay treats a missing players-sleeping percentage as "every player"; parsing null cannot fail.
+const DEFAULT_SLEEP_RATIO = Result.getOrThrow(sleepRatio(null))
+// Bounds resident terrain. The store never holds a written chunk, so evicting one only costs regeneration.
+const CHUNK_STORE_CAPACITY = Result.getOrThrow(ChunkCapacity.result(256))
+
+/** A chunk source that reads each cell from `blockAt`, for terrain the worldgen generators do not produce. */
+export const chunkSourceFromBlocks = (
+  biome: ChunkBiomeType,
+  blockAt: (position: BlockPos) => BlockId,
+): ChunkSource => (coord) => Effect.sync(() => {
+  const chunkBlocks = new Uint16Array(CHUNK_VOLUME)
+  for (let lx = 0; lx < CHUNK_SIZE_XZ; lx += 1) {
+    for (let lz = 0; lz < CHUNK_SIZE_XZ; lz += 1) {
+      for (let y = 0; y < CHUNK_HEIGHT; y += 1) {
+        chunkBlocks[blockIndex(lx, y, lz)] = blockAt({ x: coord.cx * CHUNK_SIZE_XZ + lx, y, z: coord.cz * CHUNK_SIZE_XZ + lz })
+      }
+    }
+  }
+  return { coord, blocks: chunkBlocks, biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => biome) }
+})
+
+const chunkKeyOf = (cx: number, cz: number): string => `${String(cx)},${String(cz)}`
+
+type BlockOverride = Readonly<{ at: BlockPos; block: string | null }>
+
+/** The server's block edits, recording which chunks each write makes stale in the ChunkStore view. */
+class BlockOverrides extends Map<string, BlockOverride> {
+  readonly #changedChunks = new Set<string>()
+
+  override set(key: string, value: BlockOverride): this {
+    this.#changedChunks.add(chunkKeyOf(Math.floor(value.at.x / CHUNK_SIZE_XZ), Math.floor(value.at.z / CHUNK_SIZE_XZ)))
+    return super.set(key, value)
+  }
+
+  takeChanged(key: string): boolean {
+    return this.#changedChunks.delete(key)
+  }
+}
+
+const survivalActivityInput = (activity: HungerActivity, amount: number): SurvivalActivityInput => {
+  switch (activity) {
+    case 'walk':
+      return { _tag: 'walk', distance: amount }
+    case 'swim':
+      return { _tag: 'swim', distance: amount }
+    case 'jump':
+      return { _tag: 'jump', count: amount }
+    case 'attack':
+      return { _tag: 'attack', count: amount }
+    case 'mine':
+      return { _tag: 'mine', blocks: amount }
+  }
+}
+
+const usedItem = (intent: Intent): Result.Result<ItemId, Intent> =>
+  intent.payload._tag === 'UseItem' ? Result.succeed(intent.payload.item) : Result.fail(intent)
+
+// The fields a hunger change reports to clients; the food timer advances on every tick and is not one of them.
+const hungerChanged = (before: SurvivalHungerState, after: SurvivalHungerState): boolean =>
+  before.vitals.hungerPoints !== after.vitals.hungerPoints
+  || before.vitals.saturation !== after.vitals.saturation
+  || before.vitals.exhaustion !== after.vitals.exhaustion
+  || before.vitals.healthPoints !== after.vitals.healthPoints
+
+type HungerPlan =
+  | Readonly<{ accepted: false; reason: CommandRejectionReason; failure?: MultiplayerServerCoreFailure }>
+  | Readonly<{
+      accepted: true
+      operation: (runtime: SurvivalHungerRuntimeApi) => Effect.Effect<unknown, SurvivalHungerError>
+      consumedSlot: number | undefined
+      effects: ReadonlyArray<StatusEffectApplication>
+    }>
 const DEFAULT_TIME_WEATHER: TimeWeatherState = { timeOfDay: 6_000, weather: 'clear' }
 const DEFAULT_WEATHER_CLOCK: WeatherClockState = {
   remainingSecs: INITIAL_WEATHER.remainingSecs,
   seed: DEFAULT_ROLL_SEED,
 }
 const MINECRAFT_DAY_TICKS = 24_000
-const MINECRAFT_TICK_MS = 50
+const MINECRAFT_TICK_MS = Number(DEFAULT_TICK_DURATION) * 1_000
+// DEFAULT_TICK_DURATION is a finite positive duration, so it is a valid delta time.
+const GAME_TICK_SECS = Result.getOrThrow(DeltaTimeSecs.result(Number(DEFAULT_TICK_DURATION)))
 const THUNDER_STRIKE_INTERVAL_TICKS = 160
 const ITEM_DROP_LIFESPAN_TICKS = 6_000
 const ARROW_LIFESPAN_TICKS = 1_200
@@ -835,10 +935,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   )
   const playerClients = new Map<PlayerId, ClientId>()
   const movementBudgets = new Map<PlayerId, MovementBudget>()
-  const blocks = new Map<string, Readonly<{ at: BlockPos; block: string | null }>>(
-    [...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])]
-      .map((mutation) => [positionKey(mutation.at), mutation]),
-  )
+  const blocks = new BlockOverrides()
+  for (const mutation of [...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])]) {
+    blocks.set(positionKey(mutation.at), mutation)
+  }
+  // Block ids of the edits inside the chunk being loaded; loadChunk validates them before generation.
+  const pendingOverlays = new Map<string, ReadonlyArray<Readonly<{ index: number; block: BlockId }>>>()
+  const overlaySource: ChunkSource = (coord) => Effect.map(options.chunkSource(coord), (chunk) => {
+    // loadChunk records this chunk's validated overlay before it asks the store to generate the chunk.
+    const overlay = Option.getOrThrow(Option.fromNullishOr(pendingOverlays.get(chunkKeyOf(coord.cx, coord.cz))))
+    if (overlay.length === 0) return chunk
+    const chunkBlocks = Uint16Array.from(chunk.blocks)
+    for (const { index, block } of overlay) chunkBlocks[index] = block
+    return { coord: chunk.coord, blocks: chunkBlocks, biomes: chunk.biomes }
+  })
+  // The store is the read side of the world only; edits stay in `blocks` until block writes move to the commit path.
+  const chunkStore: ChunkStoreApi = Effect.runSync(makeChunkStore(overlaySource, CHUNK_STORE_CAPACITY))
   const poweredRails = new Map<string, Readonly<{ at: BlockPos; powered: boolean }>>(
     (options.initialState?.poweredRails ?? []).map(({ at, powered }) => [positionKey(at), {
       at: { ...at },
@@ -960,6 +1072,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   }
   let revision = options.initialState?.revision ?? 0
   let timeTickRemainderMs = 0
+  // Game ticks this core has simulated since it started; intents target the tick they are applied on.
+  let simulationTick = 0
   let simulationElapsedSecs = 0
   const environmentalContactDamageStates = new Map<PlayerId, EnvironmentalContactDamageState>()
   let witherRevision = options.initialState?.witherRevision ?? 0
@@ -1012,22 +1126,25 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   }
   const lastWitherAttackMs = new Map<PlayerId, number>()
   const lastEnderDragonAttackMs = new Map<PlayerId, number>()
-  const hungerActors = new Map<PlayerId, HungerActor>()
-  let hungerTickRemainderMs = 0
+  const hungerAuthority = new HungerAuthority()
+  const hungerPlayers = new Set<PlayerId>()
+  const hungerStates = new Map<PlayerId, SurvivalHungerState>()
   let sleepBlockReadFailure: MultiplayerServerCoreFailure | undefined
-  const sleepAuthority = new SleepAuthority({
+  // An empty roster has no bed position to convert, so construction cannot fail.
+  const sleepAuthority = Result.getOrThrow(SleepAuthority.make({
     world: worldId,
     revision: 0,
     actors: [],
     blocks: {},
     drops: [],
   }, {
-    reach: Number.MAX_SAFE_INTEGER,
-    sleepPercentage: options.sleepPercentage ?? 100,
+    sleepRatio: options.sleepRatio ?? DEFAULT_SLEEP_RATIO,
+    // Sleep snapshot positions are join positions, so validateSleep checks reach against the live player position instead.
+    reach: Number.POSITIVE_INFINITY,
     validateSleep: ({ actor, bed }) => {
       const at = players.get(actor.player)?.at
       const withinReach = at !== undefined
-        && (at.x - bed.x) ** 2 + (at.y - bed.y) ** 2 + (at.z - bed.z) ** 2 <= 5 ** 2
+        && (at.x - bed.x) ** 2 + (at.y - bed.y) ** 2 + (at.z - bed.z) ** 2 <= DEFAULT_BLOCK_REACH ** 2
       const hostileNearby = [...entities.values()].some((entity) => entity._tag === 'living'
         && entity.health > 0
         && (supportedMobKind(entity.entityType) !== undefined
@@ -1050,7 +1167,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         safe: !hostileNearby,
       }
     },
-  })
+  }))
 
   const sendMessage = (client: ConnectedClient, message: NetworkMessage): void => {
     const encoded = encodeFrame(message)
@@ -1270,14 +1387,58 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return Number.isFinite(distance) && distance <= BLOCK_INTERACTION_RANGE
   }
 
+  const overlayFor = (coord: ChunkCoord): Result.Result<ReadonlyArray<Readonly<{ index: number; block: BlockId }>>, MultiplayerServerCoreFailure> => {
+    const overlay: Array<Readonly<{ index: number; block: BlockId }>> = []
+    for (const { at, block } of blocks.values()) {
+      if (Math.floor(at.x / CHUNK_SIZE_XZ) !== coord.cx || Math.floor(at.z / CHUNK_SIZE_XZ) !== coord.cz) continue
+      if (at.y < 0 || at.y >= CHUNK_HEIGHT) continue
+      const id = block === null ? Option.some(AIR_BLOCK_ID) : isBlockType(block) ? blockIdOf(block) : Option.none()
+      if (Option.isNone(id)) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at, block: String(block) })
+      const local = { x: at.x - coord.cx * CHUNK_SIZE_XZ, z: at.z - coord.cz * CHUNK_SIZE_XZ }
+      overlay.push({ index: blockIndex(local.x, at.y, local.z), block: id.value })
+    }
+    return Result.succeed(overlay)
+  }
+
+  /** The resident chunk, regenerated with the current edits when a write has made it stale. */
+  const loadChunk = (coord: ChunkCoord): Result.Result<ReadonlyChunkWithBlockStates, MultiplayerServerCoreFailure> => {
+    const key = chunkKeyOf(coord.cx, coord.cz)
+    const stale = blocks.takeChanged(key)
+    const resident = Effect.runSync(chunkStore.peek(coord))
+    if (resident !== undefined && !stale) return Result.succeed(resident)
+    if (resident !== undefined) {
+      const unloaded = Effect.runSync(Effect.result(chunkStore.unload(coord)))
+      if (Result.isFailure(unloaded)) return Result.fail({ _tag: 'ChunkStoreUnloadFailure', failure: unloaded.failure })
+    }
+    const overlay = overlayFor(coord)
+    if (Result.isFailure(overlay)) return Result.fail(overlay.failure)
+    pendingOverlays.set(key, overlay.success)
+    const loaded = Effect.runSync(Effect.result(chunkStore.load(coord)))
+    pendingOverlays.delete(key)
+    return Result.isFailure(loaded) ? Result.fail({ _tag: 'ChunkStoreLoadFailure', failure: loaded.failure }) : Result.succeed(loaded.success)
+  }
+
   const blockAt = (at: BlockPos): Result.Result<string | null, MultiplayerServerCoreFailure> => {
     const override = blocks.get(positionKey(at))
     if (override !== undefined) return Result.succeed(override.block)
-    const generated = options.generatedBlockAt?.(at) ?? Result.succeed(null)
-    return Result.isFailure(generated)
-      ? Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: generated.failure })
-      : Result.succeed(generated.success)
+    const x = BlockAxis.result(at.x)
+    if (Result.isFailure(x)) return Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: { _tag: 'GeneratedBlockAxisFailure', axis: 'x', failure: x.failure } })
+    const y = BlockAxis.result(at.y)
+    if (Result.isFailure(y)) return Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: { _tag: 'GeneratedBlockAxisFailure', axis: 'y', failure: y.failure } })
+    const z = BlockAxis.result(at.z)
+    if (Result.isFailure(z)) return Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: { _tag: 'GeneratedBlockAxisFailure', axis: 'z', failure: z.failure } })
+    if (y.success < 0 || y.success >= CHUNK_HEIGHT) return Result.succeed(null)
+    const position = blockPosition(x.success, y.success, z.success)
+    const chunk = loadChunk(chunkCoordOfBlock(position))
+    if (Result.isFailure(chunk)) return Result.fail(chunk.failure)
+    const local = localCoordOfBlock(position)
+    const blockId = BlockId.result(getBlockAt(chunk.success, local.lx, local.ly, local.lz))
+    if (Result.isFailure(blockId)) return Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: { _tag: 'GeneratedBlockIdFailure', failure: blockId.failure } })
+    const block = blockTypeOfId(blockId.success)
+    if (Result.isFailure(block)) return Result.fail({ _tag: 'GeneratedBlockReadFailure', failure: { _tag: 'GeneratedBlockRegistryFailure', failure: block.failure } })
+    return Result.succeed(block.success === undefined || block.success === 'air' ? null : block.success)
   }
+
 
   const environmentalContactsAt = (at: PlayerSnapshot['at']): Result.Result<ReadonlyArray<EnvironmentalContact>, MultiplayerServerCoreFailure> => {
     const minX = at.x - PLAYER_HALF_WIDTH
@@ -1701,40 +1862,53 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (!enchantments.has(player)) enchantments.set(player, { seed: options.seed >>> 0, items: new Map() })
     if (!vitals.has(player)) vitals.set(player, { ...DEFAULT_VITALS })
     if (!statusEffects.has(player)) statusEffects.set(player, emptyStatusEffectState())
-    const playerVitals = vitals.get(player) as MutableVitalsState
-    const inventory = inventories.get(player) as MutableInventoryState
-    const food: Record<string, number> = {}
-    for (const stack of inventory.slots) {
-      if (stack !== null) food[stack.item] = (food[stack.item] ?? 0) + stack.count
-    }
-    const previous = hungerActors.get(player)
-    hungerActors.set(player, {
-      player,
-      session: String(player),
-      state: previous?.state ?? { food: playerVitals.hunger, saturation: 5, exhaustion: 0, health: playerVitals.health },
-      food,
-    })
+    hungerPlayers.add(player)
   }
 
-  const applyHungerEvents = (events: ReadonlyArray<HungerEvent>): Readonly<{
-    changed: ReadonlyArray<PlayerId>
-    deaths: ReadonlyArray<PlayerId>
-  }> => {
-    const changed = new Set<PlayerId>()
-    const deaths = new Set<PlayerId>()
-    for (const event of events) {
-      if (event._tag !== 'HungerChanged') continue
-      const playerVitals = vitals.get(event.player)
-      const actor = hungerActors.get(event.player)
-      if (playerVitals === undefined || actor === undefined) continue
-      const wasAlive = playerVitals.health > 0
-      playerVitals.health = event.state.health
-      playerVitals.hunger = event.state.food
-      hungerActors.set(event.player, { ...actor, state: event.state })
-      changed.add(event.player)
-      if (wasAlive && playerVitals.health <= 0) deaths.add(event.player)
+  const hungerFailure = (failure: SurvivalHungerError): MultiplayerServerCoreFailure => ({ _tag: 'SurvivalHungerFailure', failure })
+
+  // Each core simulates one dimension, so its revision is the dimension revision an intent expects.
+  const intentContext = (expectedRevision: number): Result.Result<SleepIntentContext, MultiplayerServerCoreFailure> => {
+    const targetTick = SimulationTick.result(simulationTick)
+    if (Result.isFailure(targetTick)) return Result.fail({ _tag: 'IntentContextFailure', field: 'targetTick', failure: targetTick.failure })
+    const expectedDimensionRevision = Schema.decodeUnknownResult(DimensionRevisionSchema)(expectedRevision)
+    if (Result.isFailure(expectedDimensionRevision)) {
+      return Result.fail({ _tag: 'IntentContextFailure', field: 'expectedDimensionRevision', failure: expectedDimensionRevision.failure })
     }
-    return { changed: [...changed], deaths: [...deaths] }
+    return Result.succeed({ targetTick: targetTick.success, expectedDimensionRevision: expectedDimensionRevision.success })
+  }
+
+  // Every damage source writes health to the wire vitals, so each hunger step starts from that health.
+  const readHunger = (player: PlayerId, playerVitals: MutableVitalsState): Result.Result<SurvivalHungerState, MultiplayerServerCoreFailure> =>
+    Result.mapError(Effect.runSync(Effect.result(Effect.gen(function* () {
+      const healthPoints = yield* Effect.fromResult(EntityHealthPoints.result(playerVitals.health))
+      const stored = hungerStates.get(player)
+      if (stored !== undefined) return { ...stored, vitals: { ...stored.vitals, healthPoints } }
+      const hungerPoints = yield* Effect.fromResult(HungerPoints.result(playerVitals.hunger))
+      // The in-memory vitals normalise spawn saturation against the persisted hunger.
+      const initial = yield* makeInMemoryVitals({ ...SPAWN_PLAYER_VITALS, healthPoints, hungerPoints })
+      const state: SurvivalHungerState = {
+        version: SURVIVAL_HUNGER_STATE_VERSION,
+        difficulty: options.difficulty ?? DEFAULT_SURVIVAL_DIFFICULTY,
+        vitals: yield* initial.snapshot,
+      }
+      return state
+    }))), hungerFailure)
+
+  const runHunger = <A>(
+    before: SurvivalHungerState,
+    operation: (runtime: SurvivalHungerRuntimeApi) => Effect.Effect<A, SurvivalHungerError>,
+  ): Result.Result<Readonly<{ value: A; after: SurvivalHungerState }>, MultiplayerServerCoreFailure> =>
+    Result.mapError(Effect.runSync(Effect.result(Effect.gen(function* () {
+      const runtime = yield* makeSurvivalHungerRuntime(before)
+      const value = yield* operation(runtime)
+      return { value, after: yield* runtime.snapshot }
+    }))), hungerFailure)
+
+  const commitHunger = (player: PlayerId, playerVitals: MutableVitalsState, after: SurvivalHungerState): void => {
+    hungerStates.set(player, after)
+    playerVitals.health = after.vitals.healthPoints
+    playerVitals.hunger = after.vitals.hungerPoints
   }
 
   const applyPlayerDeaths = (
@@ -1794,36 +1968,91 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return deltas
   }
 
+  const planEat = (
+    message: Extract<AuthoritativeCommand, { readonly _tag: 'PlayerVitalsCommand' }>,
+    item: string,
+    inventory: MutableInventoryState,
+    before: SurvivalHungerState,
+  ): HungerPlan => {
+    if (!isItemType(item)) return { accepted: false, reason: 'insufficient-items' }
+    // handleCommand already rejected a stale expectedRevision, and the intent is consumed in this same step.
+    const context = intentContext(message.expectedRevision)
+    if (Result.isFailure(context)) return { accepted: false, reason: 'invalid-command', failure: context.failure }
+    const result = hungerAuthority.execute({
+      _tag: 'Eat',
+      player: message.player,
+      session: String(message.player),
+      commandId: message.commandId,
+      expectedRevision: message.expectedRevision,
+      expectedDimensionRevision: context.success.expectedDimensionRevision,
+      item: itemIdOf(item),
+    }, context.success.targetTick)
+    if (!result.accepted) return { accepted: false, reason: 'invalid-command' }
+    // HungerAuthority maps an Eat command only to a UseItem intent.
+    const held = itemTypeOfId(Result.getOrThrow(usedItem(result.intent)))
+    const food = resolveFoodUse({
+      held,
+      vitals: before.vitals,
+      effectRoll: deterministicRoll(`${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:food-effects`),
+    })
+    if (Result.isFailure(food)) return { accepted: false, reason: 'invalid-command', failure: { _tag: 'FoodUseFailure', failure: food.failure } }
+    switch (food.success._tag) {
+      case 'notFood':
+        return { accepted: false, reason: 'insufficient-items' }
+      case 'full':
+      case 'dead':
+        return { accepted: false, reason: 'invalid-command' }
+      case 'consume': {
+        const slot = inventory.slots.findIndex((stack) => stack?.item === held)
+        if (slot < 0) return { accepted: false, reason: 'insufficient-items' }
+        const { foodPoints, saturationModifier } = food.success
+        return {
+          accepted: true,
+          operation: (runtime) => runtime.eat(foodPoints, saturationModifier),
+          consumedSlot: slot,
+          effects: food.success.effects,
+        }
+      }
+    }
+  }
+
+  const planActivity = (activity: HungerActivity, amount: number, before: SurvivalHungerState): HungerPlan => {
+    if (before.vitals.healthPoints <= 0) return { accepted: false, reason: 'invalid-command' }
+    const exhaustion = exhaustionForSurvivalActivity(survivalActivityInput(activity, amount))
+    if (Result.isFailure(exhaustion)) {
+      return { accepted: false, reason: 'invalid-command', failure: { _tag: 'SurvivalActivityFailure', failure: exhaustion.failure } }
+    }
+    return { accepted: true, operation: (runtime) => runtime.addExhaustion(exhaustion.success), consumedSlot: undefined, effects: [] }
+  }
+
   const executeHungerCommand = (message: Extract<AuthoritativeCommand, { readonly _tag: 'PlayerVitalsCommand' }>): CommandDecision => {
     ensurePlayerState(message.player)
-    const authority = createHungerAuthority({
-      world: worldId,
-      revision,
-      difficulty: options.difficulty ?? 'normal',
-      actors: [...hungerActors.values()],
-      tickRemainderMs: hungerTickRemainderMs,
-    })
-    const action: HungerCommand = message.action === 'respawn'
-      ? { _tag: 'Respawn', player: message.player, session: String(message.player), commandId: message.commandId, expectedRevision: revision }
+    // ensurePlayerState created the vitals and inventory entries for this player.
+    const playerVitals = Option.getOrThrow(Option.fromNullishOr(vitals.get(message.player)))
+    const inventory = Option.getOrThrow(Option.fromNullishOr(inventories.get(message.player)))
+    const before = readHunger(message.player, playerVitals)
+    if (Result.isFailure(before)) return { accepted: false, reason: 'invalid-command', failure: before.failure }
+    const plan: HungerPlan = message.action === 'respawn'
+      ? { accepted: true, operation: (runtime) => runtime.respawn, consumedSlot: undefined, effects: [] }
       : message.action._tag === 'eat'
-        ? { _tag: 'Eat', player: message.player, session: String(message.player), commandId: message.commandId, expectedRevision: revision, item: message.action.item }
-        : { _tag: 'Activity', player: message.player, session: String(message.player), commandId: message.commandId, expectedRevision: revision, activity: message.action.activity, amount: message.action.amount }
-    const result = authority.execute(action)
-    if (!result.accepted) {
-      const reason: CommandRejectionReason = result.reason === 'insufficient-items' || result.reason === 'stale-revision'
-        ? result.reason
-        : result.reason === 'unauthorized-player' ? 'unauthorized-player' : 'invalid-command'
-      return { accepted: false, reason }
+        ? planEat(message, message.action.item, inventory, before.success)
+        : planActivity(message.action.activity, message.action.amount, before.success)
+    if (!plan.accepted) return plan
+    const stepped = runHunger(before.success, plan.operation)
+    if (Result.isFailure(stepped)) return { accepted: false, reason: 'invalid-command', failure: stepped.failure }
+    let nextEffects = statusEffects.get(message.player) ?? emptyStatusEffectState()
+    for (const effect of plan.effects) {
+      const applied = applyStatusEffect(nextEffects, effect)
+      if (Result.isFailure(applied)) {
+        return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StatusEffectFailure', operation: 'apply', failure: applied.failure } }
+      }
+      nextEffects = applied.success.state
     }
-    hungerActors.clear()
-    const nextSnapshot = authority.snapshot()
-    hungerTickRemainderMs = nextSnapshot.tickRemainderMs
-    for (const actor of nextSnapshot.actors) hungerActors.set(actor.player, actor)
-    const { changed, deaths } = applyHungerEvents(result.events)
+    commitHunger(message.player, playerVitals, stepped.success.after)
+    if (plan.effects.length > 0) statusEffects.set(message.player, nextEffects)
     const respawnedPlayer = message.action === 'respawn' ? players.get(message.player) : undefined
     if (message.action === 'respawn') {
-      const playerVitals = vitals.get(message.player)
-      if (playerVitals !== undefined) playerVitals.experience = 0
+      playerVitals.experience = 0
       if (respawnedPlayer !== undefined) {
         respawnedPlayer.at = { ...options.spawnAt }
         playerPositions.set(message.player, {
@@ -1832,21 +2061,26 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         })
       }
     }
-    const consumed = result.events.find((event) => event._tag === 'FoodConsumed')
-    if (consumed !== undefined) {
-      const inventory = inventories.get(consumed.player)
-      const slot = inventory?.slots.findIndex((stack) => stack?.item === consumed.item) ?? -1
-      const stack = slot >= 0 ? inventory?.slots[slot] : undefined
-      if (inventory !== undefined && stack != null) inventory.slots[slot] = stack.count === 1 ? null : { ...stack, count: stack.count - 1 }
+    const consumedSlot = plan.consumedSlot
+    if (consumedSlot !== undefined) {
+      // planEat located a stack in this slot before the step ran.
+      const stack = Option.getOrThrow(Option.fromNullishOr(inventory.slots[consumedSlot]))
+      inventory.slots[consumedSlot] = stack.count === 1 ? null : { ...stack, count: stack.count - 1 }
     }
-    return { accepted: true, deltas: (nextRevision) => [
-      ...applyPlayerDeaths(deaths, nextRevision),
-      ...changed.flatMap((player) => {
-        const presence = players.get(player)
-        return presence === undefined ? [] : [{ _tag: 'PlayerVitalsDelta' as const, world: presence.world, revision: nextRevision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) }]
-      }),
-      ...(consumed === undefined || players.get(consumed.player) === undefined ? [] : [{ _tag: 'PlayerInventoryDelta' as const, world: (players.get(consumed.player) as MutablePlayer).world, revision: nextRevision, player: consumed.player, state: inventorySnapshot(inventories.get(consumed.player) as MutableInventoryState) }]),
+    const presence = players.get(message.player)
+    return { accepted: true, deltas: (nextRevision) => presence === undefined ? [] : [
+      { _tag: 'PlayerVitalsDelta' as const, world: presence.world, revision: nextRevision, player: message.player, state: vitalsSnapshot(playerVitals) },
+      ...(consumedSlot === undefined ? [] : [{ _tag: 'PlayerInventoryDelta' as const, world: presence.world, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) }]),
     ],
+    ...(plan.effects.length === 0 ? {} : {
+      statusEffectDeltas: (nextRevision: number) => [{
+        _tag: 'PlayerStatusEffectsDelta' as const,
+        world: worldId,
+        revision: nextRevision,
+        player: message.player,
+        state: copyStatusEffectState(nextEffects),
+      }],
+    }),
     ...(respawnedPlayer === undefined ? {} : {
       messages: () => [{
         _tag: 'PlayerMove' as const,
@@ -2222,10 +2456,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         playerPositions.set(message.player, { at: { ...actor.at }, facing: { ...actor.facing } })
         const wasAlive = playerVitals.health > 0
         playerVitals.health = Math.max(0, playerVitals.health - ENDER_PEARL_DAMAGE)
-        const hungerActor = hungerActors.get(message.player)
-        if (hungerActor !== undefined) {
-          hungerActors.set(message.player, { ...hungerActor, state: { ...hungerActor.state, health: playerVitals.health } })
-        }
         const died = wasAlive && playerVitals.health <= 0
 
         return {
@@ -3096,6 +3326,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       sendEnchanting(client, enchantmentsDelta(message.player))
     }
     for (const outboundMessage of outboundMessages) broadcast(outboundMessage)
+    for (const statusEffectDelta of decision.statusEffectDeltas?.(revision) ?? []) broadcastBrewing(statusEffectDelta)
     if (decision.worldSnapshotRequired === true) broadcast(authoritativeSnapshot())
     if (decision.snapshotBroadcastRequired === true) broadcast(snapshot())
     return { accepted: true, message }
@@ -3702,13 +3933,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         playerVitals.health - command.amount,
         command.minimumHealthPoints ?? 0,
       )
-      const hungerActor = hungerActors.get(client.playerId)
-      if (hungerActor !== undefined) {
-        hungerActors.set(client.playerId, {
-          ...hungerActor,
-          state: { ...hungerActor.state, health: playerVitals.health },
-        })
-      }
       revision += 1
       const result: PlayerDamageCommandResult = {
         _tag: 'PlayerDamageCommandResult',
@@ -3918,7 +4142,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       if (client.playerId === null) return { accepted: false, reason: 'join-required' }
       if (sleepMessage.command.actor !== client.playerId) return { accepted: false, reason: 'identity-spoof' }
       sleepBlockReadFailure = undefined
-      const result = sleepAuthority.execute(sleepMessage.command)
+      const context = intentContext(revision)
+      if (Result.isFailure(context)) return { accepted: false, reason: 'invalid-command', failure: context.failure }
+      const result = sleepAuthority.execute(sleepMessage.command, context.success)
       sendSleep(client, { _tag: 'SleepCommandResult', result })
       if (sleepBlockReadFailure !== undefined) {
         const failure = sleepBlockReadFailure
@@ -4355,7 +4581,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     statusEffects.delete(playerId)
     anvilNames.delete(playerId)
     enchantments.delete(playerId)
-    hungerActors.delete(playerId)
+    hungerPlayers.delete(playerId)
+    hungerStates.delete(playerId)
     playerPositions.delete(playerId)
     notifyStateChanged()
     return transfer
@@ -4433,6 +4660,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     const validElapsedMs = elapsedMs
     const elapsedTicks = Math.floor((timeTickRemainderMs + validElapsedMs) / MINECRAFT_TICK_MS)
     timeTickRemainderMs = timeTickRemainderMs + validElapsedMs - elapsedTicks * MINECRAFT_TICK_MS
+    simulationTick += elapsedTicks
     const timeChanged = elapsedTicks > 0
     if (elapsedSecs > 0) {
       const fishingDeltas: Array<Omit<Extract<AuthoritativeDelta, { readonly _tag: 'PlayerFishingDelta' }>, 'revision'>> = []
@@ -4604,11 +4832,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         )
         if (nextHealth === playerVitals.health) continue
         playerVitals.health = nextHealth
-        const hungerActor = hungerActors.get(player)
-        if (hungerActor !== undefined) hungerActors.set(player, {
-          ...hungerActor,
-          state: { ...hungerActor.state, health: playerVitals.health },
-        })
         changedVitals.add(player)
       }
 
@@ -4668,11 +4891,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
         const wasAlive = playerVitals.health > 0
         playerVitals.health = Math.max(0, playerVitals.health - damage)
-        const hungerActor = hungerActors.get(player)
-        if (hungerActor !== undefined) hungerActors.set(player, {
-          ...hungerActor,
-          state: { ...hungerActor.state, health: playerVitals.health },
-        })
         damagedPlayers.add(player)
         if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
       }
@@ -4809,11 +5027,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         for (const { player, playerVitals, amount } of damageSteps) {
           const wasAlive = playerVitals.health > 0
           playerVitals.health = Math.max(0, playerVitals.health - amount)
-          const hungerActor = hungerActors.get(player)
-          if (hungerActor !== undefined) hungerActors.set(player, {
-            ...hungerActor,
-            state: { ...hungerActor.state, health: playerVitals.health },
-          })
           damagedPlayers.add(player)
           if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
         }
@@ -4941,10 +5154,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               if (playerVitals !== undefined) {
                 const wasAlive = playerVitals.health > 0
                 playerVitals.health = Math.max(0, playerVitals.health - entity.damage)
-                const hungerActor = hungerActors.get(playerHit.player)
-                if (hungerActor !== undefined) {
-                  hungerActors.set(playerHit.player, { ...hungerActor, state: { ...hungerActor.state, health: playerVitals.health } })
-                }
                 damagedPlayers.add(playerHit.player)
                 if (wasAlive && playerVitals.health <= 0) deadPlayers.add(playerHit.player)
               }
@@ -5125,31 +5334,35 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           }
           targetPosition = brandedTarget.success
         }
-        const step = stepEcosystemMob(kind, state, selfPosition.success, targetPosition, elapsedSecs)
+        // stepEcosystemMob advances exactly one game tick per call.
+        let ecosystem = state
+        let feetPosition = selfPosition.success
+        const attackDamages: number[] = []
+        for (let gameTick = 0; gameTick < elapsedTicks; gameTick += 1) {
+          const step = stepEcosystemMob(kind, ecosystem, feetPosition, targetPosition, GAME_TICK_SECS)
+          ecosystem = step.state
+          feetPosition = step.feetPosition
+          if (step.attack !== undefined) attackDamages.push(step.attack.damage)
+        }
         const at = {
-          ...step.feetPosition,
-          x: Math.min(bounds.maxX, Math.max(bounds.minX, step.feetPosition.x)),
-          z: Math.min(bounds.maxZ, Math.max(bounds.minZ, step.feetPosition.z)),
+          ...feetPosition,
+          x: Math.min(bounds.maxX, Math.max(bounds.minX, feetPosition.x)),
+          z: Math.min(bounds.maxZ, Math.max(bounds.minZ, feetPosition.z)),
         }
         const mobState = {
           ...(hostileKind === undefined ? initialMobState : hostileMobState),
-          attackCooldownSecs: step.state.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
-          motionPhase: step.state.motionPhase,
-          provoked: step.state.provoked,
+          attackCooldownSecs: ecosystem.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
+          motionPhase: ecosystem.motionPhase,
+          provoked: ecosystem.provoked,
         }
         const updated = { ...entity, at, mobState }
         entities.set(entity.entityId, updated)
         movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-        if (step.attack !== undefined && targetEntry !== undefined) {
-          const playerVitals = vitals.get(targetEntry[0])
-          if (playerVitals !== undefined) {
+        const playerVitals = targetEntry === undefined ? undefined : vitals.get(targetEntry[0])
+        if (targetEntry !== undefined && playerVitals !== undefined) {
+          for (const damage of attackDamages) {
             const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - step.attack.damage)
-            const hungerActor = hungerActors.get(targetEntry[0])
-            if (hungerActor !== undefined) hungerActors.set(targetEntry[0], {
-              ...hungerActor,
-              state: { ...hungerActor.state, health: playerVitals.health },
-            })
+            playerVitals.health = Math.max(0, playerVitals.health - damage)
             damagedPlayers.add(targetEntry[0])
             if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
           }
@@ -5174,20 +5387,27 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
     }
 
-    if (hungerActors.size > 0) {
-      const authority = createHungerAuthority({ world: worldId, revision, difficulty: options.difficulty ?? 'normal', actors: [...hungerActors.values()], tickRemainderMs: hungerTickRemainderMs })
-      const events = authority.tick(elapsedMs)
-      hungerTickRemainderMs = authority.snapshot().tickRemainderMs
-      hungerActors.clear()
-      for (const actor of authority.snapshot().actors) hungerActors.set(actor.player, actor)
-      const { changed, deaths } = applyHungerEvents(events)
+    if (hungerPlayers.size > 0) {
+      const elapsed = DeltaTimeSecs(elapsedSecs)
+      const steps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; before: SurvivalHungerState; after: SurvivalHungerState; died: boolean }>> = []
+      for (const player of hungerPlayers) {
+        // hungerPlayers only holds players whose vitals ensurePlayerState created; detachPlayer removes both.
+        const playerVitals = Option.getOrThrow(Option.fromNullishOr(vitals.get(player)))
+        const before = readHunger(player, playerVitals)
+        if (Result.isFailure(before)) return Result.fail(before.failure)
+        const ticked = runHunger(before.success, (runtime) => runtime.tick(elapsed))
+        if (Result.isFailure(ticked)) return Result.fail(ticked.failure)
+        steps.push({ player, playerVitals, before: before.success, after: ticked.success.after, died: ticked.success.value.died })
+      }
+      for (const step of steps) commitHunger(step.player, step.playerVitals, step.after)
+      const changed = steps.filter((step) => hungerChanged(step.before, step.after))
       if (changed.length > 0) {
         revision += 1
         stateChanged = true
-        postPersistenceDeltas.push(...applyPlayerDeaths(deaths, revision))
-        for (const player of changed) {
-          const presence = players.get(player)
-          if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) })
+        postPersistenceDeltas.push(...applyPlayerDeaths(steps.filter((step) => step.died).map((step) => step.player), revision))
+        for (const step of changed) {
+          const presence = players.get(step.player)
+          if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player: step.player, state: vitalsSnapshot(step.playerVitals) })
         }
       }
     }
@@ -5243,11 +5463,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if (playerVitals !== undefined) {
             const wasAlive = playerVitals.health > 0
             playerVitals.health = Math.max(0, playerVitals.health - advanceResult.success.meleeDamage)
-            const hungerActor = hungerActors.get(targetEntry[0])
-            if (hungerActor !== undefined) hungerActors.set(targetEntry[0], {
-              ...hungerActor,
-              state: { ...hungerActor.state, health: playerVitals.health },
-            })
             damagedPlayers.add(targetEntry[0])
             if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
           }
@@ -5295,11 +5510,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           for (const { player, playerVitals, amount } of damageSteps) {
             const wasAlive = playerVitals.health > 0
             playerVitals.health = Math.max(0, playerVitals.health - amount)
-            const hungerActor = hungerActors.get(player)
-            if (hungerActor !== undefined) hungerActors.set(player, {
-              ...hungerActor,
-              state: { ...hungerActor.state, health: playerVitals.health },
-            })
             damagedPlayers.add(player)
             if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
           }
@@ -5347,11 +5557,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if (playerVitals === undefined || playerVitals.health <= 0) return []
           const wasAlive = playerVitals.health > 0
           playerVitals.health = Math.max(0, playerVitals.health - event.amount)
-          const hungerActor = hungerActors.get(player)
-          if (hungerActor !== undefined) hungerActors.set(player, {
-            ...hungerActor,
-            state: { ...hungerActor.state, health: playerVitals.health },
-          })
           return [{ player, died: wasAlive && playerVitals.health <= 0 }] as const
         })
         if (damagedPlayers.length === 0) continue

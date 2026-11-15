@@ -1,4 +1,5 @@
 import {
+  GAME_TICKS_PER_REDSTONE_TICK,
   makeRuntimeRedstoneStages,
   PistonBlockOffsetSchema,
   pistonPositionAt,
@@ -11,6 +12,7 @@ import {
   type RedstoneWorldRuntimeService,
 } from '@nerima-games/mx-redstone'
 import { blockIdOf, BlockPositionSchema, capabilityOfBlockId, DeltaTimeSecs, DimensionIdSchema, isBlockType } from '@nerima-games/mc-kernel'
+import { DEFAULT_TICK_DURATION, HOPPER_TRANSFER_COOLDOWN_TICKS } from '@nerima-games/mc-sim'
 import { Context, Effect, Layer, Option, Result, Schema, Scope } from 'effect'
 
 import { ServerClockLayer } from './clock.js'
@@ -80,11 +82,8 @@ export interface MultiplayerRedstoneRuntime {
   readonly tick: (elapsedMs: number) => Effect.Effect<Result.Result<void, MultiplayerRedstoneTickFailure>>
 }
 
-type RedstoneTickFailure = ReturnType<typeof DeltaTimeSecs.result> extends Result.Result<unknown, infer Failure> ? Failure : never
-
 export type MultiplayerRedstoneTickFailure =
   | Readonly<{ _tag: 'InvalidRedstoneTickDuration'; elapsedMs: number }>
-  | Readonly<{ _tag: 'RedstoneDeltaTimeFailure'; failure: RedstoneTickFailure }>
   | Readonly<{ _tag: 'RedstoneSchemaFailure'; operation: 'containerSlots' | 'dimension' | 'position'; failure: Schema.SchemaError }>
   | Readonly<{ _tag: 'RedstoneSnapshotSyncFailure'; failure: RedstoneSnapshotSyncFailure }>
   | Readonly<{ _tag: 'CoreBlockReadFailure'; failure: MultiplayerServerCoreFailure }>
@@ -188,15 +187,21 @@ export const makeMultiplayerRedstoneRuntime = async (
   const runtime = Context.get(context, RedstoneWorldRuntime)
   const stages = await Effect.runPromise(Effect.provide(makeRuntimeRedstoneStages, context))
   const realmsByDimension = new Map(realms.map((realm) => [realm.dimension, realm]))
+  // mx-redstone stages advance one game tick per run, so wall-clock time is split into whole game ticks.
+  const gameTickMs = Number(DEFAULT_TICK_DURATION) * 1_000
+  // DEFAULT_TICK_DURATION is a finite positive duration, so it is a valid delta time.
+  const gameTickSecs = Result.getOrThrow(DeltaTimeSecs.result(Number(DEFAULT_TICK_DURATION)))
+  let tickRemainderMs = 0
+  // mc-sim's HopperService owns hopper cooldowns, but it commits through WorldCommitCoordinator and
+  // ContainerStorageService, which this server does not run. Until those are wired, the host keeps the
+  // remaining cooldown per hopper and follows HopperService's planTransferTick rules: elapsed ticks
+  // drain it, a powered hopper is locked, a transfer restarts it, and a rejected transfer clears it.
+  const hopperCooldowns = new Map<string, number>()
 
   return {
     tick: (elapsedMs) => {
       if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
         return Effect.succeed(Result.fail({ _tag: 'InvalidRedstoneTickDuration', elapsedMs }))
-      }
-      const elapsedSecsResult = DeltaTimeSecs.result(elapsedMs / 1_000)
-      if (Result.isFailure(elapsedSecsResult)) {
-        return Effect.succeed(Result.fail({ _tag: 'RedstoneDeltaTimeFailure', failure: elapsedSecsResult.failure }))
       }
       return Effect.gen(function* () {
         for (const realm of realms) {
@@ -217,14 +222,29 @@ export const makeMultiplayerRedstoneRuntime = async (
           const sync = yield* Effect.result(runtime.syncSnapshot({ dimension: dimension.success, components }))
           if (Result.isFailure(sync)) return Result.fail({ _tag: 'RedstoneSnapshotSyncFailure', failure: sync.failure })
         }
-        for (const stage of stages) {
-          Effect.runSync(
-            stage.run(elapsedSecsResult.success).pipe(Effect.provide(ServerClockLayer)),
-          )
+        const pendingMs = tickRemainderMs + elapsedMs
+        const gameTicks = Math.floor(pendingMs / gameTickMs)
+        tickRemainderMs = pendingMs - gameTicks * gameTickMs
+        for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
+          for (const stage of stages) {
+            Effect.runSync(
+              stage.run(gameTickSecs).pipe(Effect.provide(ServerClockLayer)),
+            )
+          }
         }
         for (const event of Effect.runSync(runtime.drainHopperTransferEvents)) {
-          const result = realmsByDimension.get(event.dimension)?.core.applyHopperTransfer(event.position)
-          if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          const core = realmsByDimension.get(event.dimension)?.core
+          if (core === undefined) continue
+          const key = `${event.dimension}:${String(event.position.x)},${String(event.position.y)},${String(event.position.z)}`
+          // Events count redstone ticks; HOPPER_TRANSFER_COOLDOWN_TICKS counts game ticks.
+          const remaining = Math.max(0, (hopperCooldowns.get(key) ?? 0) - event.elapsedRedstoneTicks * GAME_TICKS_PER_REDSTONE_TICK)
+          if (event.powered || remaining > 0) {
+            hopperCooldowns.set(key, remaining)
+            continue
+          }
+          const result = core.applyHopperTransfer(event.position)
+          if (Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          hopperCooldowns.set(key, result.success ? HOPPER_TRANSFER_COOLDOWN_TICKS : 0)
         }
         for (const event of Effect.runSync(runtime.drainTriggerEvents)) {
           const core = realmsByDimension.get(event.dimension)?.core

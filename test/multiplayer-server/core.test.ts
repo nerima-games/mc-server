@@ -1,4 +1,6 @@
 import {
+  PROTOCOL_VERSION,
+  TransferIdSchema,
   decodeFrame,
   encodeFrame,
   type CommandId,
@@ -10,16 +12,21 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import type { Dimension } from '@nerima-games/mc-worldgen'
-import { Result } from 'effect'
+import { EncodedBlockStateSchema } from '@nerima-games/mc-kernel'
+import { Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import { makeMultiplayerServerCore, type MultiplayerServerOptions, type MultiplayerServerState, type ReceiveResult } from '../../apps/multiplayer-server/core'
 import { decodeAnvilWireMessage } from '../../apps/multiplayer-shared/anvil-network'
+import { airTerrain, terrainFrom } from './terrain'
 import { decodeBrewingWireMessage } from '../../apps/multiplayer-shared/brewing-network'
 import { decodeEnderDragonWireMessage, type EnderDragonWireMessage } from '../../apps/multiplayer-shared/ender-dragon-network'
 import { decodeEnchantingWireMessage } from '../../apps/multiplayer-shared/enchanting-network'
 import { decodeSleepWireMessage, type SleepWireMessage } from '../../apps/multiplayer-shared/sleep-network'
 import { decodeWitherWireMessage, type WitherWireMessage } from '../../apps/multiplayer-shared/wither-network'
+
+// Zero is the default block state; the kernel codec validates it.
+const DEFAULT_BLOCK_STATE = Result.getOrThrow(Schema.decodeUnknownResult(EncodedBlockStateSchema)(0))
 
 const playerId = (value: string): PlayerId => value as PlayerId
 const playerName = (value: string): PlayerName => value as PlayerName
@@ -75,7 +82,7 @@ const join = (player: string, name = player): Extract<NetworkMessage, { readonly
   at: { x: 0, y: 64, z: 0 },
 })
 
-const witherStructureAt: NonNullable<MultiplayerServerOptions['generatedBlockAt']> = ({ x, y, z }) => {
+const witherStructureAt = ({ x, y, z }: Readonly<{ x: number; y: number; z: number }>): string | null => {
   const blocks = new Map([
     ['0,64,0', 'soul_sand'],
     ['-1,65,0', 'soul_sand'],
@@ -85,11 +92,11 @@ const witherStructureAt: NonNullable<MultiplayerServerOptions['generatedBlockAt'
     ['0,66,0', 'wither_skeleton_skull'],
     ['1,66,0', 'wither_skeleton_skull'],
   ])
-  return Result.succeed(blocks.get(`${String(x)},${String(y)},${String(z)}`) ?? null)
+  return blocks.get(`${String(x)},${String(y)},${String(z)}`) ?? null
 }
 
 const makeFixture = (
-  generatedBlockAt: NonNullable<MultiplayerServerOptions['generatedBlockAt']> = () => Result.succeed(null),
+  blockAt: (position: Readonly<{ x: number; y: number; z: number }>) => string | null = () => null,
   timeOfDay = 6_000,
   spawnAt: { x: number; y: number; z: number } = { x: 0, y: 64, z: 0 },
   initialWeather: 'clear' | 'rain' | 'thunder' = 'clear',
@@ -107,7 +114,7 @@ const makeFixture = (
     seed: 42,
     allowedBlocks: new Set(['stone', 'dirt']),
     bounds: { minX: -10, maxX: 10, minY: 0, maxY: 100, minZ: -10, maxZ: 10 },
-    generatedBlockAt,
+    chunkSource: terrainFrom(blockAt),
     spawnAt,
     ...serverOptions,
     now: () => nowMs,
@@ -141,7 +148,7 @@ const makeFixture = (
   const receiveEnderDragon = (clientId: string, message: EnderDragonWireMessage): ReceiveResult =>
     server.receive(clientId, JSON.stringify(message) as WireText)
   const advanceTime = (elapsedMs: number): void => { nowMs += elapsedMs }
-  const tick = (elapsedMs: number): void => server.tick(elapsedMs)
+  const tick = (elapsedMs: number): void => { expect(Result.isSuccess(server.tick(elapsedMs))).toBe(true) }
   return { server, sent, connect, receive, receiveSleep, receiveWither, receiveEnderDragon, advanceTime, tick }
 }
 
@@ -221,14 +228,38 @@ describe('authoritative multiplayer server core', () => {
     const fixture = makeFixture()
     fixture.connect('socket-a')
     fixture.receive('socket-a', join('alice'))
+    const before = fixture.server.snapshot()
 
+    // mx-multiplayer 0.17 decodes a ReplicatedWorldSnapshot only against a ReplicatedOwnerRegistry.
+    // The server decodes client frames without one, so a well-formed enveloped snapshot from a
+    // client fails decoding as a malformed frame before it can reach the server-only message check.
     expect(fixture.server.receive('socket-a', JSON.stringify({
-      _tag: 'ReplicatedWorldSnapshot',
-      world: 'world-1',
-      revision: 0,
-      blocks: [],
-      owners: [],
-    }) as WireText)).toEqual({ accepted: false, reason: 'identity-spoof' })
+      protocolVersion: PROTOCOL_VERSION,
+      message: {
+        _tag: 'ReplicatedWorldSnapshot',
+        world: 'world-1',
+        revision: 0,
+        blocks: [],
+        owners: [],
+      },
+    }) as WireText)).toEqual({ accepted: false, reason: 'malformed-frame' })
+    expect(fixture.server.snapshot()).toEqual(before)
+  })
+
+  it('rejects decodable server-only snapshot transfer frames from clients without changing state', () => {
+    const fixture = makeFixture()
+    const frames = fixture.connect('socket-a')
+    fixture.receive('socket-a', join('alice'))
+    const before = fixture.server.snapshot()
+    frames.length = 0
+
+    // Snapshot transfer frames carry no owner state, so they decode without a registry and reach
+    // the server-only message check.
+    const transferId = Result.getOrThrow(Schema.decodeUnknownResult(TransferIdSchema)('transfer-1'))
+    expect(fixture.receive('socket-a', { _tag: 'ReplicatedWorldSnapshotEnd', transferId }))
+      .toEqual({ accepted: false, reason: 'identity-spoof' })
+    expect(fixture.server.snapshot()).toEqual(before)
+    expect(frames).toEqual([])
   })
 
   it('updates movement and broadcasts movement and chat as authoritative events', () => {
@@ -319,7 +350,7 @@ describe('authoritative multiplayer server core', () => {
       player: playerId('alice'),
       at: { x: 2, y: 65, z: 2 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     })).toEqual({ accepted: false, reason: 'identity-spoof' })
     expect(messages(bobFrames)).toEqual([
       expect.objectContaining({ _tag: 'BlockMutationRejected', reason: 'unauthorized-player', revision: 0 }),
@@ -337,7 +368,7 @@ describe('authoritative multiplayer server core', () => {
 
     const at = { x: 2, y: 65, z: 3 }
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block: 'stone', state: 0,
+      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block: 'stone', state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(messages(bobFrames)).toContainEqual(expect.objectContaining({ _tag: 'BlockPlace', at, block: 'stone' }))
     expect(fixture.server.snapshot()).toMatchObject({ revision: 1, blocks: [{ at, block: 'stone' }] })
@@ -358,13 +389,13 @@ describe('authoritative multiplayer server core', () => {
     aliceFrames.length = 0
 
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: near, block: 'stone', state: 0,
+      _tag: 'BlockPlace', player: playerId('alice'), at: near, block: 'stone', state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), at: near,
     }).accepted).toBe(true)
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: far, block: 'dirt', state: 0,
+      _tag: 'BlockPlace', player: playerId('alice'), at: far, block: 'dirt', state: DEFAULT_BLOCK_STATE,
     })).toEqual({ accepted: false, reason: 'invalid-mutation' })
     expect(fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), at: far,
@@ -388,7 +419,7 @@ describe('authoritative multiplayer server core', () => {
     aliceFrames.length = 0
 
     expect(fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block, state: 0,
+      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block, state: DEFAULT_BLOCK_STATE,
     })).toEqual({ accepted: false, reason: 'invalid-mutation' })
     expect(messages(aliceFrames)).toEqual([
       expect.objectContaining({ _tag: 'BlockMutationRejected', operation: 'place', reason, revision: 0 }),
@@ -403,7 +434,7 @@ describe('authoritative multiplayer server core', () => {
     aliceFrames.length = 0
 
     fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 1, y: 63, z: 1 }, block: 'dirt', state: 0,
+      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 1, y: 63, z: 1 }, block: 'dirt', state: DEFAULT_BLOCK_STATE,
     })
     fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), at: { x: 3, y: 63, z: 0 },
@@ -419,7 +450,7 @@ describe('authoritative multiplayer server core', () => {
     fixture.receive('socket-a', join('alice'))
     fixture.receive('socket-b', join('bob'))
     fixture.receive('socket-a', {
-      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 3, y: 64, z: 0 }, block: 'stone', state: 0,
+      _tag: 'BlockPlace', player: playerId('alice'), at: { x: 3, y: 64, z: 0 }, block: 'stone', state: DEFAULT_BLOCK_STATE,
     })
     aliceFrames.length = 0
 
@@ -780,7 +811,7 @@ describe('authoritative multiplayer server core', () => {
       },
     })).toEqual(expect.objectContaining({ accepted: true }))
   })
-  it('authoritatively drops Blaze loot when a Blaze dies', () => {
+  it('authoritatively resolves a Blaze death through mx-gameplay drop and experience rules', () => {
     const fixture = makeFixture()
     const frames = fixture.connect('socket-a')
     fixture.receive('socket-a', join('alice'))
@@ -796,6 +827,7 @@ describe('authoritative multiplayer server core', () => {
 
     expect(fixture.receive('socket-a', {
       _tag: 'EntityAttackCommand',
+      heldSlot: 0,
       commandId: 'blaze-kill' as CommandId,
       player: playerId('alice'),
       world: worldId('world-1'),
@@ -803,16 +835,13 @@ describe('authoritative multiplayer server core', () => {
       entityId: 'blaze-1' as EntityId,
     })).toEqual(expect.objectContaining({ accepted: true }))
 
-    expect(messages(frames)).toEqual(expect.arrayContaining([
+    // mx-gameplay's BLAZE_DROPS is empty (blaze rods are absent from the kernel), so the kill
+    // despawns the Blaze and awards BLAZE_XP_REWARD (10) without an item drop.
+    expect(messages(frames)).toEqual([
+      expect.objectContaining({ _tag: 'AuthoritativeCommandAccepted', commandId: 'blaze-kill' }),
       expect.objectContaining({ _tag: 'EntityDespawnDelta', entityId: 'blaze-1' }),
-      expect.objectContaining({
-        _tag: 'EntitySpawnDelta',
-        entity: expect.objectContaining({
-          _tag: 'item-drop',
-          stack: { item: 'blaze_powder', count: 1 },
-        }),
-      }),
-    ]))
+      expect.objectContaining({ _tag: 'PlayerVitalsDelta', player: 'alice', state: expect.objectContaining({ experience: 10 }) }),
+    ])
   })
 
   it('accepts End portal travel only for a server-owned portal block', () => {
@@ -890,6 +919,7 @@ describe('authoritative multiplayer server core', () => {
       allowedBlocks: new Set(['end_stone', 'end_portal']),
       bounds: { minX: -10, maxX: 10, minY: 0, maxY: 100, minZ: -10, maxZ: 10 },
       spawnAt: { x: 0, y: 64, z: 0 },
+      chunkSource: airTerrain,
       staticBlocks: [{ at: { x: 0, y: 64, z: 0 }, block: 'end_portal' }],
     })
     expect(destination.connect('socket-a', (wire) => destinationFrames.push(wire))).toBe(true)
@@ -1000,7 +1030,7 @@ describe('authoritative multiplayer server core', () => {
       const at = { x: 1, y: 64, z: 1 }
       const containerId = `world-1:${String(at.x)},${String(at.y)},${String(at.z)}`
       const fixture = makeFixture(
-        ({ x, y, z }) => (x === at.x && y === at.y && z === at.z ? 'chest' : null),
+        ({ x, y, z }) => x === at.x && y === at.y && z === at.z ? 'chest' : null,
         6_000,
         { x: 0, y: 64, z: 0 },
         'clear',
@@ -1023,7 +1053,7 @@ describe('authoritative multiplayer server core', () => {
       const at = { x: 2, y: 64, z: 1 }
       const furnaceId = JSON.stringify(['world-1', at.x, at.y, at.z])
       const fixture = makeFixture(
-        ({ x, y, z }) => (x === at.x && y === at.y && z === at.z ? 'furnace' : null),
+        ({ x, y, z }) => x === at.x && y === at.y && z === at.z ? 'furnace' : null,
         6_000,
         { x: 0, y: 64, z: 0 },
         'clear',
@@ -1060,7 +1090,7 @@ describe('authoritative multiplayer server core', () => {
     it('drops a brewing stand\'s bottle and ingredient, discarding only fuel charge progress', () => {
       const at = { x: 1, y: 64, z: 2 }
       const fixture = makeFixture(
-        ({ x, y, z }) => (x === at.x && y === at.y && z === at.z ? 'brewing_stand' : null),
+        ({ x, y, z }) => x === at.x && y === at.y && z === at.z ? 'brewing_stand' : null,
         6_000,
         { x: 0, y: 64, z: 0 },
         'clear',
@@ -1092,7 +1122,7 @@ describe('authoritative multiplayer server core', () => {
     it('converts a finished potion into its item form when the brewing stand holding it is broken', () => {
       const at = { x: 1, y: 64, z: 3 }
       const fixture = makeFixture(
-        ({ x, y, z }) => (x === at.x && y === at.y && z === at.z ? 'brewing_stand' : null),
+        ({ x, y, z }) => x === at.x && y === at.y && z === at.z ? 'brewing_stand' : null,
         6_000,
         { x: 0, y: 64, z: 0 },
         'clear',

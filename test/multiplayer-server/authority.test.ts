@@ -10,7 +10,10 @@ import {
   type WireText,
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
-import { Effect, Result } from 'effect'
+import { EncodedBlockStateSchema, PositionAxis } from '@nerima-games/mc-kernel'
+import { DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
+import { SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS } from '@nerima-games/mx-gameplay'
+import { Effect, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -22,6 +25,7 @@ import {
   type ReceiveResult,
 } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerRedstoneRuntime } from '../../apps/multiplayer-server/redstone-runtime'
+import { airTerrain, terrainFrom } from './terrain'
 import {
   decodePlayerDamageWireMessage,
   encodePlayerDamageCommand,
@@ -56,6 +60,11 @@ const playerName = (value: string): PlayerName => value as PlayerName
 const worldId = (value: string): WorldId => value as WorldId
 const commandId = (value: string): CommandId => value as CommandId
 const entityId = (value: string): EntityId => value as EntityId
+
+// Zero is the default block state; the kernel codec validates it.
+const DEFAULT_BLOCK_STATE = Result.getOrThrow(Schema.decodeUnknownResult(EncodedBlockStateSchema)(0))
+const origin = { x: PositionAxis(0), y: PositionAxis(64), z: PositionAxis(0) }
+const stillVelocity = { x: PositionAxis(0), y: PositionAxis(0), z: PositionAxis(0) }
 
 const sleepResult = (frames: ReadonlyArray<WireText>) =>
   frames.map(decodeSleepWireMessage).find((message) => message?._tag === 'SleepCommandResult')
@@ -104,7 +113,7 @@ const initialState = (): MultiplayerServerState => ({
     furnaceId: '["world-1",2,64,0]',
     input: null,
     fuel: null,
-    output: { item: 'iron-ingot', count: 2 },
+    output: { item: 'iron_ingot', count: 2 },
     burnTicksRemaining: 0,
     cookTicks: 0,
   }],
@@ -125,10 +134,10 @@ const witherState = (
       version: 1,
       state: {
         phase,
-        healthPoints: 300,
-        chargeRemainingSecs: phase === 'charging' ? 0.1 : 0,
-        feetPosition: { x: 0, y: 64, z: 0 },
-        velocity: { x: 0, y: 0, z: 0 },
+        healthPoints: WitherHealthPoints(300),
+        chargeRemainingSecs: WitherChargeRemainingSecs(phase === 'charging' ? 0.1 : 0),
+        feetPosition: origin,
+        velocity: stillVelocity,
       },
     },
     rangedCooldownSecs: 100,
@@ -142,7 +151,7 @@ const makeFixture = (
   state: MultiplayerServerState = initialState(),
   joinAt: Readonly<{ x: number; y: number; z: number }> = { x: 0, y: 64, z: 0 },
   difficulty: 'peaceful' | 'easy' | 'normal' | 'hard' = 'normal',
-  serverOptions: Partial<Pick<MultiplayerServerOptions, 'allowedBlocks' | 'generatedBlockAt' | 'now' | 'passableBlocks' | 'spawnAt'>> = {},
+  serverOptions: Partial<Pick<MultiplayerServerOptions, 'allowedBlocks' | 'chunkSource' | 'now' | 'passableBlocks' | 'spawnAt'>> = {},
 ) => {
   const sent: Array<WireText> = []
   const persisted: Array<MultiplayerServerState> = []
@@ -154,6 +163,7 @@ const makeFixture = (
     initialState: state,
     difficulty,
     spawnAt: joinAt,
+    chunkSource: airTerrain,
     ...serverOptions,
     onStateChanged: (state) => {
       timeline.push('persist')
@@ -212,7 +222,7 @@ describe('multiplayer server authoritative state', () => {
       }],
     }, undefined, 'normal', {
       now: () => now,
-      generatedBlockAt: (position) => Result.succeed(position.y === 63 ? 'stone' : null),
+      chunkSource: terrainFrom((position) => position.y === 63 ? 'stone' : null),
     })
     fixture.sent.length = 0
 
@@ -317,7 +327,7 @@ describe('multiplayer server authoritative state', () => {
       }],
     }, undefined, 'normal', {
       now: () => now,
-      generatedBlockAt: (position) => Result.succeed(position.y === 63 || (position.x === 0 && position.y === 65 && position.z === -3) ? 'stone' : null),
+      chunkSource: terrainFrom((position) => position.y === 63 || (position.x === 0 && position.y === 65 && position.z === -3) ? 'stone' : null),
     })
     fixture.sent.length = 0
 
@@ -378,7 +388,7 @@ describe('multiplayer server authoritative state', () => {
       ],
     }, undefined, 'normal', {
       now: () => now,
-      generatedBlockAt: (position) => Result.succeed(position.y === 63 || (position.x === 0 && position.y === 65 && position.z === -1) ? 'stone' : null),
+      chunkSource: terrainFrom((position) => position.y === 63 || (position.x === 0 && position.y === 65 && position.z === -1) ? 'stone' : null),
     })
     expect(fixture.server.connect('socket-b', () => undefined)).toBe(true)
     expect(fixture.server.receive('socket-b', frame({
@@ -425,7 +435,7 @@ describe('multiplayer server authoritative state', () => {
       ],
     }, undefined, 'normal', {
       now: () => now,
-      generatedBlockAt: (position) => Result.succeed(position.y === 63 ? 'stone' : null),
+      chunkSource: terrainFrom((position) => position.y === 63 ? 'stone' : null),
     })
     const bobSent: WireText[] = []
     expect(fixture.server.connect('socket-b', (wire) => bobSent.push(wire))).toBe(true)
@@ -489,7 +499,7 @@ describe('multiplayer server authoritative state', () => {
       ],
     }, undefined, 'normal', {
       now: () => now,
-      generatedBlockAt: (position) => Result.succeed(position.y === 63 ? 'stone' : null),
+      chunkSource: terrainFrom((position) => position.y === 63 ? 'stone' : null),
     })
     expect(fixture.server.connect('socket-b', () => undefined)).toBe(true)
     expect(fixture.server.receive('socket-b', frame({
@@ -849,7 +859,7 @@ describe('multiplayer server authoritative state', () => {
         },
       }],
     }, undefined, 'normal', {
-      generatedBlockAt: (at) => Result.succeed(at.x === 0 && at.y === 65 && at.z < 0 && at.z >= -5 ? 'water' : null),
+      chunkSource: terrainFrom((at) => at.x === 0 && at.y === 65 && at.z < 0 && at.z >= -5 ? 'water' : null),
     })
     fixture.sent.length = 0
 
@@ -1738,19 +1748,21 @@ describe('multiplayer server authoritative state', () => {
       }),
     ])
     fixture.server.tick(2_000)
-    expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
+    // mx-gameplay applies the activity's exhaustion when the command is accepted
+    // (exhaustionForSurvivalActivity: 100 x SURVIVAL_EXHAUSTION.jump 0.05 = 5), so the 4-second food
+    // tick has nothing to report: hunger 2 is below mc-sim's REGEN_HUNGER_THRESHOLD 18 and above zero.
+    expect(messages(fixture.sent)).toEqual([
+      expect.objectContaining({
+        _tag: 'WorldTimeWeatherDelta',
+        revision: 5,
+        state: { timeOfDay: 6_040, weather: 'clear' },
+      }),
       expect.objectContaining({
         _tag: 'WorldTimeWeatherDelta',
         revision: 5,
         state: { timeOfDay: 6_080, weather: 'clear' },
       }),
-      expect.objectContaining({
-        _tag: 'PlayerVitalsDelta',
-        revision: 6,
-        player: 'alice',
-        state: { health: 3, hunger: 2, experience: 7 },
-      }),
-    ]))
+    ])
 
     fixture.server.disconnect('socket-a')
     fixture.sent.length = 0
@@ -1761,9 +1773,10 @@ describe('multiplayer server authoritative state', () => {
       name: playerName('Alice'),
       at: { x: 0, y: 64, z: 0 },
     })).accepted).toBe(true)
+    // Only the activity command advanced the revision; the food tick changed no reported hunger field.
     expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
       _tag: 'AuthoritativeSnapshot',
-      revision: 6,
+      revision: 5,
       vitals: [{ player: 'alice', state: { health: 3, hunger: 2, experience: 7 } }],
     }))
   })
@@ -1808,6 +1821,33 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
     fixture.server.tick(40_000)
     expect(messages(fixture.sent).some((message) => message._tag === 'EntitySpawnDelta')).toBe(false)
+  })
+
+  it('runs hunger regeneration and starvation from health already reduced by damage', () => {
+    const damage = (amount: number): PlayerDamageCommand => ({
+      _tag: 'PlayerDamageCommand', commandId: 'damage-before-hunger', player: 'alice', world: 'world-1', expectedRevision: 4, amount,
+    })
+    const vitalsDeltas = (sent: ReadonlyArray<WireText>) => messages(sent).filter((message) => message._tag === 'PlayerVitalsDelta')
+
+    // Full hunger with saturation regenerates one point per SATURATED_REGEN_TICK_SECS (0.5 s).
+    const regen = makeFixture({ ...initialState(), vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }] })
+    regen.server.tick(100)
+    expect(regen.receiveDamage(damage(5)).accepted).toBe(true)
+    regen.sent.length = 0
+    regen.server.tick(500)
+    expect(vitalsDeltas(regen.sent)).toEqual([
+      expect.objectContaining({ player: 'alice', state: { health: 16, hunger: 20, experience: 7 } }),
+    ])
+
+    // Empty hunger on hard difficulty starves one point per FOOD_TICK_SECS (4 s), down to starvationHealthFloor('hard') = 0.
+    const starving = makeFixture({ ...initialState(), vitals: [{ player: playerId('alice'), state: { health: 3, hunger: 0, experience: 7 } }] }, undefined, 'hard')
+    starving.server.tick(100)
+    expect(starving.receiveDamage(damage(1)).accepted).toBe(true)
+    starving.sent.length = 0
+    starving.server.tick(3_900)
+    expect(vitalsDeltas(starving.sent)).toEqual([
+      expect.objectContaining({ player: 'alice', state: { health: 1, hunger: 0, experience: 7 } }),
+    ])
   })
 
   it('applies self damage and reuses atomic player death handling exactly once', () => {
@@ -2065,6 +2105,8 @@ describe('multiplayer server authoritative state', () => {
         },
       }],
       vitals: [{ player: playerId('alice'), state: { health: 3, hunger: 2, experience: 1_000 } }],
+      // mx-gameplay's enchantmentOffers(75, 15) puts Protection II in slot 0; the fixture's default seed 42 now offers Wind Burst there.
+      enchantments: [{ player: playerId('alice'), seed: 75, items: [] }],
     })
     fixture.sent.length = 0
     const command: EnchantingCommand = {
@@ -2318,6 +2360,58 @@ describe('multiplayer server authoritative state', () => {
     }))
   })
 
+  it('applies the status effects mx-gameplay grants for an eaten food', () => {
+    const state = initialState()
+    const fixture = makeFixture({
+      ...state,
+      inventories: [{
+        player: playerId('alice'),
+        state: { slots: [...state.inventories[0]!.state.slots, { item: 'golden_apple', count: 1 }], selectedSlot: 0 },
+      }],
+    })
+    fixture.sent.length = 0
+    expect(fixture.receive({
+      _tag: 'PlayerVitalsCommand',
+      commandId: commandId('eat-golden-apple'),
+      player: playerId('alice'),
+      world: worldId('world-1'),
+      expectedRevision: 4,
+      action: { _tag: 'eat', item: 'golden_apple' },
+    }).accepted).toBe(true)
+    // resolveFoodUse grants the golden apple's regeneration (kernel food data, chance 1); absorption
+    // has no mx-gameplay status-effect type, so it is not part of the consume outcome.
+    const effects = fixture.sent.map(decodeBrewingWireMessage).find((message) => message?._tag === 'PlayerStatusEffectsDelta')
+    const regeneration = { type: 'regeneration', remainingSecs: 5, pulseClockSecs: 0, amplifier: 1 }
+    expect(effects).toEqual({
+      _tag: 'PlayerStatusEffectsDelta', world: 'world-1', revision: 5, player: 'alice', state: { effects: [regeneration] },
+    })
+    expect(fixture.persisted.at(-1)?.statusEffects).toEqual([{ player: 'alice', state: { effects: [regeneration] } }])
+  })
+
+  it('rejects an eat command with a stale expected revision before resolving food', () => {
+    const state = initialState()
+    const fixture = makeFixture({
+      ...state,
+      inventories: [{
+        player: playerId('alice'),
+        state: { slots: [...state.inventories[0]!.state.slots, { item: 'potato', count: 1 }], selectedSlot: 0 },
+      }],
+    })
+    fixture.sent.length = 0
+    expect(fixture.receive({
+      _tag: 'PlayerVitalsCommand',
+      commandId: commandId('eat-stale'),
+      player: playerId('alice'),
+      world: worldId('world-1'),
+      expectedRevision: 3,
+      action: { _tag: 'eat', item: 'potato' },
+    })).toEqual({ accepted: false, reason: 'invalid-command' })
+    expect(messages(fixture.sent)).toEqual([
+      expect.objectContaining({ _tag: 'AuthoritativeCommandRejected', commandId: 'eat-stale', revision: 4, reason: 'stale-revision' }),
+    ])
+    expect(fixture.persisted).toEqual([])
+  })
+
   it('consumes food and broadcasts inventory and vitals deltas atomically', () => {
     const state = initialState()
     const fixture = makeFixture({
@@ -2423,17 +2517,17 @@ describe('multiplayer server authoritative state', () => {
     expect(output).toContainEqual(expect.objectContaining({
       _tag: 'FurnaceDelta',
       revision: 7,
-      state: expect.objectContaining({ fuel: { item: 'coal', count: 1 }, output: { item: 'iron-ingot', count: 1 } }),
+      state: expect.objectContaining({ fuel: { item: 'coal', count: 1 }, output: { item: 'iron_ingot', count: 1 } }),
     }))
     expect(fixture.persisted.at(-1)).toMatchObject({
       revision: 7,
       timeWeather: { timeOfDay: 6_000, weather: 'clear' },
       inventories: [{
         player: 'alice',
-        state: { slots: [{ item: 'stone', count: 3 }, { item: 'coal', count: 2 }, { item: 'iron-ingot', count: 1 }] },
+        state: { slots: [{ item: 'stone', count: 3 }, { item: 'coal', count: 2 }, { item: 'iron_ingot', count: 1 }] },
       }],
       containers: [{ containerId: 'world-1:1,64,0', kind: 'chest', slots: [{ item: 'stone', count: 2 }, { item: 'apple', count: 2 }] }],
-      furnaces: [{ furnaceId: '["world-1",2,64,0]', fuel: { item: 'coal', count: 1 }, output: { item: 'iron-ingot', count: 1 } }],
+      furnaces: [{ furnaceId: '["world-1",2,64,0]', fuel: { item: 'coal', count: 1 }, output: { item: 'iron_ingot', count: 1 } }],
     })
   })
 
@@ -2677,7 +2771,9 @@ describe('multiplayer server authoritative state', () => {
   it('applies hostile mob attacks to the nearest player and preserves cooldown state', () => {
     const fixture = makeFixture({
       ...initialState(),
-      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
+      // Hunger 17 is below REGEN_HUNGER_THRESHOLD (18) and above zero, so mx-gameplay's hunger tick
+      // neither regenerates nor starves and every vitals delta here comes from the skeleton.
+      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 17, experience: 7 } }],
       entities: [{
         _tag: 'living', entityId: entityId('skeleton-1'), entityType: 'skeleton',
         at: { x: 10, y: 64, z: 0 }, health: 20, maxHealth: 20,
@@ -2685,6 +2781,11 @@ describe('multiplayer server authoritative state', () => {
     })
     fixture.sent.length = 0
     fixture.persisted.length = 0
+    // stepEcosystemMob advances one game tick per call: the skeleton (10 blocks away, inside its
+    // ranged band) shoots on the first tick and restarts SKELETON_ATTACK_INTERVAL_TICKS.
+    const gameTickMs = Number(DEFAULT_TICK_DURATION) * 1_000
+    const ticksPerSecond = 1_000 / gameTickMs
+    const cooldownSecs = (ticks: number) => ticks * gameTickMs / 1_000
 
     fixture.server.tick(1_000)
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
@@ -2692,24 +2793,29 @@ describe('multiplayer server authoritative state', () => {
         _tag: 'EntityUpdateDelta',
         entity: expect.objectContaining({
           entityId: 'skeleton-1',
-          mobState: expect.objectContaining({ motionPhase: 1, attackCooldownSecs: 2, provoked: false }),
+          mobState: expect.objectContaining({
+            motionPhase: ticksPerSecond,
+            attackCooldownSecs: cooldownSecs(SKELETON_ATTACK_INTERVAL_TICKS - (ticksPerSecond - 1)),
+            provoked: false,
+          }),
         }),
       }),
-      expect.objectContaining({ _tag: 'PlayerVitalsDelta', player: 'alice', state: expect.objectContaining({ health: 16 }) }),
+      expect.objectContaining({ _tag: 'PlayerVitalsDelta', player: 'alice', state: expect.objectContaining({ health: 20 - SKELETON_ATTACK_DAMAGE }) }),
     ]))
 
     fixture.sent.length = 0
     fixture.server.tick(1_000)
+    const remainingTicks = SKELETON_ATTACK_INTERVAL_TICKS - (2 * ticksPerSecond - 1)
     expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
       _tag: 'EntityUpdateDelta',
-      entity: expect.objectContaining({ mobState: expect.objectContaining({ attackCooldownSecs: 1 }) }),
+      entity: expect.objectContaining({ mobState: expect.objectContaining({ attackCooldownSecs: cooldownSecs(remainingTicks) }) }),
     }))
     expect(messages(fixture.sent).some((message) => message._tag === 'PlayerVitalsDelta')).toBe(false)
 
     fixture.sent.length = 0
-    fixture.server.tick(1_000)
+    fixture.server.tick(remainingTicks * gameTickMs)
     expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
-      _tag: 'PlayerVitalsDelta', player: 'alice', state: expect.objectContaining({ health: 12 }),
+      _tag: 'PlayerVitalsDelta', player: 'alice', state: expect.objectContaining({ health: 20 - 2 * SKELETON_ATTACK_DAMAGE }),
     }))
   })
 
@@ -2876,7 +2982,7 @@ describe('multiplayer server authoritative state', () => {
         maxHealth: 20,
       }],
     }, undefined, 'normal', {
-      generatedBlockAt: (position) => Result.succeed(position.y === 63 ? 'stone' : null),
+      chunkSource: terrainFrom((position) => position.y === 63 ? 'stone' : null),
     })
     fixture.sent.length = 0
 
@@ -2887,6 +2993,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       expectedRevision: 4,
       entityId: entityId('enderman-2'),
+      heldSlot: 0,
     }).accepted).toBe(true)
     expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
       _tag: 'EntityUpdateDelta',
@@ -2925,8 +3032,8 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.server.connect('socket-b', (wire) => observer.push(wire))).toBe(true)
     expect(fixture.server.receive('socket-b', frame({ _tag: 'PlayerJoin', player: playerId('bob'), name: playerName('Bob'), at: { x: 0, y: 64, z: 0 } })).accepted).toBe(true)
     const send = (message: NetworkMessage): void => { expect(fixture.receive(message).accepted).toBe(true) }
-    send({ _tag: 'EntityAttackCommand', commandId: commandId('attack-1'), player: playerId('alice'), world: worldId('world-1'), expectedRevision: 4, entityId: entityId('zombie-1') })
-    send({ _tag: 'EntityAttackCommand', commandId: commandId('attack-2'), player: playerId('alice'), world: worldId('world-1'), expectedRevision: 5, entityId: entityId('zombie-1') })
+    send({ _tag: 'EntityAttackCommand', commandId: commandId('attack-1'), player: playerId('alice'), world: worldId('world-1'), expectedRevision: 4, entityId: entityId('zombie-1'), heldSlot: 0 })
+    send({ _tag: 'EntityAttackCommand', commandId: commandId('attack-2'), player: playerId('alice'), world: worldId('world-1'), expectedRevision: 5, entityId: entityId('zombie-1'), heldSlot: 0 })
     const drop = messages(observer).find((message) => message._tag === 'EntitySpawnDelta')
     expect(drop).toMatchObject({ _tag: 'EntitySpawnDelta', entity: { _tag: 'item-drop', stack: { item: 'rotten_flesh', count: 1 } } })
     expect(messages(observer)).toEqual(expect.arrayContaining([
@@ -2963,6 +3070,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       expectedRevision: 4,
       entityId: entityId('unknown-1'),
+      heldSlot: 0,
     }).accepted).toBe(true)
 
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
@@ -2986,6 +3094,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       expectedRevision: 4,
       entityId: entityId('far-zombie'),
+      heldSlot: 0,
     })).toEqual({ accepted: false, reason: 'invalid-command' })
     expect(fixture.receive({
       _tag: 'VehicleCommand',
@@ -3202,7 +3311,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 1, y: 64, z: 0 },
       block: 'chest',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'PlayerInventoryCommand',
@@ -3218,7 +3327,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 2, y: 64, z: 0 },
       block: 'furnace',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
 
     expect(fixture.persisted.at(-1)).toMatchObject({
@@ -3650,7 +3759,7 @@ describe('multiplayer server authoritative state', () => {
         world: worldId('world-1'),
         at: { x: 1, y: 64, z: 0 },
         block: kind,
-        state: 0,
+        state: DEFAULT_BLOCK_STATE,
       }).accepted).toBe(true)
       expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
         _tag: 'AuthoritativeSnapshot',
@@ -3673,7 +3782,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 1, y: 64, z: 0 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     })).toEqual({
       accepted: true,
       message: expect.objectContaining({ _tag: 'BlockPlace', block: 'stone' }),
@@ -3693,7 +3802,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 2, y: 64, z: 0 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3701,7 +3810,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 0, y: 64, z: 1 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3709,7 +3818,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 3, y: 64, z: 0 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3717,7 +3826,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 4, y: 64, z: 0 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
     expect(fixture.receive({
       _tag: 'BlockPlace',
@@ -3725,7 +3834,7 @@ describe('multiplayer server authoritative state', () => {
       world: worldId('world-1'),
       at: { x: 0, y: 64, z: 2 },
       block: 'stone',
-      state: 0,
+      state: DEFAULT_BLOCK_STATE,
     })).toEqual({ accepted: false, reason: 'invalid-mutation' })
     expect(fixture.persisted.at(-1)).toMatchObject({ revision: 9 })
   })

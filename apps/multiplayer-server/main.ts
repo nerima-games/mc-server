@@ -8,6 +8,7 @@ import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 
 import {
+  AIR_BLOCK_ID,
   BlockAxis,
   BlockId,
   blockPosition,
@@ -19,6 +20,7 @@ import { CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
 import {
   CHUNK_HEIGHT,
   generateChunkAt,
+  generatedChunkSource,
   getBlockAt,
   NoiseSeed as WorldgenNoiseSeed,
   type Chunk,
@@ -50,6 +52,7 @@ import { isValidWitherRuntimeSnapshot } from '../multiplayer-shared/wither-runti
 import { WITHER_MAX_WIRE_LENGTH } from '../multiplayer-shared/wither-network.js'
 import {
   isWeatherClockState,
+  chunkSourceFromBlocks,
   makeMultiplayerServerCore,
   type MultiplayerServerCore,
   type MultiplayerServerState,
@@ -591,6 +594,10 @@ export const startMultiplayerServer = async (
   options: MultiplayerRuntimeOptions,
 ): Promise<Result.Result<MultiplayerRuntime, GeneratedBlockReadFailure>> => {
   const generatedBlockAt = makeGeneratedBlockAt(options.seed)
+  const noiseSeed = WorldgenNoiseSeed.result(options.seed)
+  if (Result.isFailure(noiseSeed)) return Result.fail({ _tag: 'GeneratedNoiseSeedFailure', failure: noiseSeed.failure })
+  // Both realms have always generated from the overworld terrain generator; the End is only its static blocks.
+  const terrainSource = generatedChunkSource(noiseSeed.success)
   const overworldSpawnResult = findSpawnAt(generatedBlockAt)
   if (Result.isFailure(overworldSpawnResult)) return Result.fail(overworldSpawnResult.failure)
   const netherSpawnResult = findSpawnAt(generatedBlockAt)
@@ -670,7 +677,7 @@ export const startMultiplayerServer = async (
     dimension: dimensionForWorld(options.worldId),
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
-    generatedBlockAt,
+    chunkSource: terrainSource,
     spawnAt: overworldSpawnAt,
     staticBlocks: [
       { at: overworldNetherPortalAt, block: 'nether_portal' },
@@ -687,7 +694,7 @@ export const startMultiplayerServer = async (
     dimension: 'nether',
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
-    generatedBlockAt,
+    chunkSource: terrainSource,
     spawnAt: netherSpawnAt,
     staticBlocks: [{ at: netherPortalAt, block: 'nether_portal' }],
     ...(netherInitialState === undefined ? {} : { initialState: netherInitialState }),
@@ -701,7 +708,7 @@ export const startMultiplayerServer = async (
     dimension: 'end',
     seed: options.seed,
     allowedBlocks: options.allowedBlocks ?? new Set(DEFAULT_BLOCKS),
-    generatedBlockAt: () => Result.succeed(null),
+    chunkSource: chunkSourceFromBlocks('END', () => AIR_BLOCK_ID),
     spawnAt: endSpawnAt,
     staticBlocks: endStaticBlocks,
     ...(endInitialState === undefined ? {} : { initialState: endInitialState }),
