@@ -6,10 +6,16 @@ export type SavedServerStateFailure = {
   readonly _tag: 'SavedServerStateFailure'
   readonly path: string
   readonly reason: string
+  readonly code?: string
+  readonly filePath?: string
 }
 
-export const savedServerStateFailure = (path: string, reason: string): SavedServerStateFailure => ({
-  _tag: 'SavedServerStateFailure', path, reason,
+export const savedServerStateFailure = (
+  path: string,
+  reason: string,
+  context?: { readonly code?: string; readonly filePath?: string },
+): SavedServerStateFailure => ({
+  _tag: 'SavedServerStateFailure', path, reason, ...context,
 })
 
 const potion = Schema.Literals(['awkward', 'speed', 'poison', 'regeneration'])
@@ -55,8 +61,7 @@ export const migrateLegacyBrewingState = (value: unknown): Result.Result<Brewing
     if (!compatible) return Result.fail(savedServerStateFailure('brewingStands', 'invalid legacy brewing recipe'))
   }
   const charges = Math.min(state.fuelUnits, 20)
-  // Only complete groups of 20 charges become powder; discard the remainder instead of creating fuel.
-  const powder = Math.floor((state.fuelUnits - charges) / 20)
+  const powder = Math.ceil((state.fuelUnits - charges) / 20)
   if (powder > 64) return Result.fail(savedServerStateFailure('brewingStands', 'legacy brewing fuel exceeds one stack'))
   // Legacy starts already consumed the ingredient and one charge. Honor the paid output once on load;
   // the remaining brewing time is deliberately forgiven rather than charging those inputs again.

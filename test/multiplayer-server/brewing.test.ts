@@ -5,7 +5,7 @@ import { EncodedBlockStateSchema, type BrewingState } from '@nerima-games/mc-ker
 import { BrewingStandState, CommandId, PlayerId, PlayerName, WorldId, brewingStateFromWire, decodeFrame, encodeFrame, type BrewingAction, type NetworkMessage, type WireText } from '@nerima-games/mx-multiplayer'
 import { makeMultiplayerServerCore, type MultiplayerServerState } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
-import { terrainFrom } from './terrain'
+import { floorTerrain } from './terrain'
 import { replicatedOwners } from './codec'
 
 const at = { x: 1, y: 64, z: 0 }
@@ -31,7 +31,7 @@ const fixture = (state = stand(), metadata: Partial<MultiplayerServerState> = {}
   const server = Result.getOrThrow(makeMultiplayerServerCore({
     worldId: 'world-1', dimension: 'overworld', seed: 42,
     allowedBlocks: new Set(['brewing_stand', 'furnace']), bounds: { minX: -10, maxX: 10, minY: 0, maxY: 100, minZ: -10, maxZ: 10 },
-    spawnAt: { x: 0, y: 64, z: 0 }, chunkSource: terrainFrom((pos) => pos.x === at.x && pos.y === at.y && pos.z === at.z && block !== 'air' ? block : null),
+    spawnAt: { x: 0, y: 64, z: 0 }, chunkSource: floorTerrain(0, 'air', block === 'air' ? [] : [{ at, block }]),
     parts: makeMultiplayerServerCoreParts(), initialState: initial, onStateChanged: (saved) => saves.push(saved),
   }))
   const send = (message: NetworkMessage) => server.receive('a', Result.getOrThrow(encodeFrame(message, replicatedOwners)))
@@ -134,7 +134,11 @@ describe('protocol 12 brewing commands', () => {
   it('rejects a full fuel stack without consuming inventory', () => {
     const f = fixture(stand({ fuel: stack('blaze_powder', 64) }))
     const before = f.saved()
-    expect(f.command({ _tag: 'insert-fuel', slot: 3 }).accepted).toBe(false)
+    const result = f.command({ _tag: 'insert-fuel', slot: 3 })
+    expect(result.accepted).toBe(false)
+    if (result.accepted) throw new Error('full fuel stack accepted')
+    expect(result.failure).toBeUndefined()
+    expect(f.network()).toContainEqual(expect.objectContaining({ _tag: 'BrewingCommandRejected', reason: 'invalid-command' }))
     expect(f.saved()).toEqual(before)
   })
 

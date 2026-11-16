@@ -3,6 +3,8 @@ import { statusEffectsToWire } from '../../apps/multiplayer-server/brewing-stand
 import { emptyBrewingState } from '@nerima-games/mc-sim'
 import {
   BrewingCommand,
+  CommandId,
+  WorldId,
   decodeFrame,
   encodeFrame,
   PlayerId,
@@ -17,7 +19,9 @@ import { describe, expect, it } from 'vitest'
 import { makeMultiplayerServerCore, type MultiplayerServerState } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
 import { replicatedOwners } from './codec'
-import { airTerrain } from './terrain'
+import { floorTerrain } from './terrain'
+
+const airTerrain = floorTerrain(0, 'air')
 
 const frame = (message: NetworkMessage): WireText => Result.getOrThrow(encodeFrame(message))
 const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage> =>
@@ -38,6 +42,49 @@ describe('visible status-effect wire state', () => {
     expect(statusEffectsToWire(state)).toEqual(Result.fail({ _tag: 'UnsupportedVisibleStatusEffect', type: 'night_vision' }))
     expect(state.effects[0]?.type).toBe('night_vision')
   })
+  it('rejects an unsupported initial effect before creating a server', () => {
+    const player = PlayerId.make('alice')
+    const state = Result.getOrThrow(applyStatusEffect(emptyStatusEffectState(), { type: 'night_vision', durationSecs: 12 })).state
+    const result = makeMultiplayerServerCore({
+      worldId: 'world-1', seed: 42, allowedBlocks: new Set(), spawnAt: { x: 0, y: 64, z: 0 },
+      chunkSource: airTerrain, parts: makeMultiplayerServerCoreParts(),
+      initialState: {
+        revision: 0, blocks: [], inventories: [], vitals: [], timeWeather: { timeOfDay: 6000, weather: 'clear' },
+        containers: [], furnaces: [], villagerTrades: [], statusEffects: [{ player, state }],
+      },
+    })
+    expect(result).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', path: 'statusEffects', reason: 'unsupported visible status effect type: night_vision' }))
+  })
+
+  it('rejects an unsupported realm-transfer effect before mutating destination state', () => {
+    const makeServer = () => Result.getOrThrow(makeMultiplayerServerCore({
+      worldId: 'world-1', seed: 42, allowedBlocks: new Set(), spawnAt: { x: 0, y: 64, z: 0 },
+      chunkSource: airTerrain, parts: makeMultiplayerServerCoreParts(),
+    }))
+    const source = makeServer()
+    const player = PlayerId.make('alice')
+    expect(source.connect('source', () => {})).toBe(true)
+    expect(source.receive('source', frame(Result.getOrThrow(Schema.decodeUnknownResult(PlayerJoin)({
+      _tag: 'PlayerJoin', player, name: 'Alice', at: { x: 0, y: 64, z: 0 },
+    })))).accepted).toBe(true)
+    const transfer = Result.getOrThrow(source.detachPlayer('source'))
+    if (transfer === undefined) throw new Error('missing detached player')
+    const destination = makeServer()
+    const sent: Array<WireText> = []
+    expect(destination.connect('destination', (wire) => { sent.push(wire) })).toBe(true)
+    const before = destination.snapshot()
+    const frameCount = sent.length
+    const state = Result.getOrThrow(applyStatusEffect(emptyStatusEffectState(), { type: 'night_vision', durationSecs: 12 })).state
+    expect(destination.acceptRealmTransfer('destination', { ...transfer, statusEffects: state }, {
+      commandId: CommandId.make('transfer'), fromWorld: WorldId.make('world-1'),
+      at: { x: 0, y: 64, z: 0 }, facing: { yawRadians: 0, pitchRadians: 0 },
+    }, Result.getOrThrow(destination.prepareRealmTransfer()))).toEqual(Result.fail({
+      _tag: 'SavedServerStateFailure', path: 'statusEffects', reason: 'unsupported visible status effect type: night_vision',
+    }))
+    expect(destination.snapshot()).toEqual(before)
+    expect(sent).toHaveLength(frameCount)
+  })
+
   it('announces regeneration I in the tick regeneration II expires while retaining hidden effects on the server', () => {
     const player = Result.getOrThrow(Schema.decodeUnknownResult(PlayerId)('alice'))
     const at = { x: 1, y: 64, z: 0 }

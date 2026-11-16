@@ -33,7 +33,6 @@ import {
 import {
   decodeEnchantedItem,
   decodeEnderDragonEncounterSnapshot,
-  isValidStatusEffectState,
 } from '@nerima-games/mx-gameplay'
 import { Effect, Option, Result, Schema } from 'effect'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -53,6 +52,7 @@ import {
   type MultiplayerServerState,
   type GeneratedBlockReadFailure,
 } from './core.js'
+import { validateServerStatusEffects } from './brewing-stands.js'
 import { makeMultiplayerServerCoreParts } from './entrypoints/core-parts.js'
 import { loadLegacyPlayerClaims } from './legacy-player-claims.js'
 import { migrateLegacyBrewingState, migrateLegacyFurnaces, savedServerStateFailure, type SavedServerStateFailure } from './legacy-state.js'
@@ -483,15 +483,16 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2 | 3): 
   }
 
   const statusEffectsValue = state['statusEffects']
-  if (statusEffectsValue !== undefined && !Array.isArray(statusEffectsValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
-  const statusEffects = statusEffectsValue === undefined
-    ? []
-    : statusEffectsValue.flatMap((entry: unknown) => {
-        if (!isRecord(entry) || !isValidStatusEffectState(entry['state'])) return []
-        const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
-        return Result.isFailure(player) ? [] : [{ player: player.success, state: entry['state'] }]
-      })
-  if (statusEffectsValue !== undefined && statusEffects.length !== statusEffectsValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
+  if (statusEffectsValue !== undefined && !Array.isArray(statusEffectsValue)) return Result.fail(savedServerStateFailure('statusEffects', 'invalid status effect state'))
+  const statusEffects: Array<NonNullable<MultiplayerServerState['statusEffects']>[number]> = []
+  for (const entry of statusEffectsValue === undefined ? [] : statusEffectsValue) {
+    if (!isRecord(entry)) return Result.fail(savedServerStateFailure('statusEffects', 'invalid status effect state'))
+    const effects = validateServerStatusEffects(entry['state'])
+    if (Result.isFailure(effects)) return Result.fail(effects.failure)
+    const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
+    if (Result.isFailure(player)) return Result.fail(savedServerStateFailure('statusEffects', 'invalid status effect player'))
+    statusEffects.push({ player: player.success, state: effects.success })
+  }
 
   const anvilNamesValue = state['anvilNames']
   if (anvilNamesValue !== undefined && !Array.isArray(anvilNamesValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
@@ -627,21 +628,27 @@ export const loadServerState = async (
     source = await readFile(path, 'utf8')
   } catch (error) {
     if (isRecord(error) && error['code'] === 'ENOENT') return Result.succeed(undefined)
-    return Result.fail(savedServerStateFailure('file', 'failed to read multiplayer state'))
+    const code = isRecord(error) && typeof error['code'] === 'string' ? error['code'] : undefined
+    return Result.fail(savedServerStateFailure(path, 'failed to read multiplayer state', {
+      filePath: path, ...(code === undefined ? {} : { code }),
+    }))
   }
   let value: unknown
   try {
     value = JSON.parse(source)
   } catch {
-    return Result.fail(savedServerStateFailure('file', 'invalid multiplayer state JSON'))
+    return Result.fail(savedServerStateFailure(path, 'invalid multiplayer state JSON', { filePath: path }))
   }
-  if (!isRecord(value)) return Result.fail(savedServerStateFailure('file', 'invalid multiplayer state envelope'))
+  if (!isRecord(value)) return Result.fail(savedServerStateFailure(path, 'invalid multiplayer state envelope', { filePath: path }))
   const format = value['format']
   if ((format !== 1 && format !== 2 && format !== 3) || value['worldId'] !== worldId || value['seed'] !== seed) {
-    return Result.fail(savedServerStateFailure('file', 'multiplayer state file does not match world and seed or supported format'))
+    return Result.fail(savedServerStateFailure(path, 'multiplayer state file does not match world and seed or supported format', { filePath: path }))
   }
   const decodedState = decodeServerState(value['state'], worldId, format)
-  if (Result.isFailure(decodedState)) return Result.fail(decodedState.failure)
+  if (Result.isFailure(decodedState)) {
+    const failure = decodedState.failure
+    return Result.fail(failure._tag === 'SavedServerStateFailure' ? { ...failure, filePath: path } : failure)
+  }
   // An unaddressable position or a mob state mx-gameplay cannot repair would otherwise stop every tick of this dimension.
   return Result.map(validateLoadedServerState(decodedState.success), () => decodedState.success)
 }
