@@ -307,7 +307,6 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'SavedFurnaceInvalid'; furnaceId: string; failure: FurnaceAdvanceFailure }>
   | Readonly<{ _tag: 'WitherSkullOutsideProjectileRules'; id: string }>
   | Readonly<{ _tag: 'MobMovementFailure'; fault: MobMovementRosterFault }>
-  | Readonly<{ _tag: 'ChunkWindowOpenFailure'; failure: ChunkWindowOpenFailure }>
   | Readonly<{ _tag: 'InvalidServerBounds'; bounds: ServerBounds }>
   | Readonly<{ _tag: 'RevisionExhausted'; counter: RevisionCounter; revision: number }>
   | Readonly<{ _tag: 'SimulationTickExhausted'; simulationTick: number; elapsedTicks: number }>
@@ -384,14 +383,8 @@ export interface ChunkStorePart {
    * A ChunkWindow over exactly `chunks`, by value: it reads no store, so a later load that evicts these chunks from
    * the store does not change it.
    */
-  readonly openWindow: (chunks: ReadonlyArray<ReadonlyChunkWithBlockStates>) => Result.Result<ChunkWindow, ChunkWindowOpenFailure>
+  readonly openWindow: (chunks: ReadonlyArray<ReadonlyChunkWithBlockStates>) => ChunkWindow
 }
-
-/** Why `ChunkStorePart.openWindow` could not open a window over the chunks it was given. */
-export type ChunkWindowOpenFailure =
-  | Readonly<{ _tag: 'ChunkWindowEmpty'; failure: Brand.BrandError }>
-  | Readonly<{ _tag: 'ChunkWindowChunkNotGiven'; cx: number; cz: number }>
-  | Readonly<{ _tag: 'ChunkWindowStoreFailure'; failure: ChunkStoreError }>
 
 /** Effect-backed services the core uses synchronously; `entrypoints/core-parts.ts` builds them. */
 export interface MultiplayerServerCoreParts {
@@ -1241,8 +1234,7 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
       if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
       chunks.push(loaded.success)
     }
-    const window = chunkStore.openWindow(chunks)
-    return Result.isFailure(window) ? Result.fail({ _tag: 'ChunkWindowOpenFailure', failure: window.failure }) : Result.succeed(window.success)
+    return Result.succeed(chunkStore.openWindow(chunks))
   }
 
   return { blockAt, openWindow }

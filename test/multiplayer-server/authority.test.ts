@@ -15,7 +15,7 @@ import {
   PositionAxis, SimulationTick, position, type Position,
 } from '@nerima-games/mc-kernel'
 import { DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
-import { ChunkCapacity, makeChunkStore, type ChunkSource } from '@nerima-games/mc-worldgen'
+import { CHUNK_VOLUME, type ChunkSource, type ChunkStoreApi, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import {
   chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, openChunkWindow, planMobMovementRoster,
   SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS, stepEcosystemMob,
@@ -3372,8 +3372,35 @@ describe('multiplayer server authoritative state', () => {
   type SavedEntity = NonNullable<MultiplayerServerState['entities']>[number]
 
   /**
+   * A ChunkStoreApi that answers peek from fixed chunks and supports nothing else. openChunkWindow reads its store only
+   * through peek (mx-gameplay chunk-window.js:149-156), so the expected plan can read terrain chunks directly instead of
+   * paying a real store's per-chunk state materialization.
+   */
+  const peekOnlyStore = (chunks: ReadonlyMap<string, ReadonlyChunkWithBlockStates>): ChunkStoreApi => {
+    const unsupported = Effect.die(new Error('the expected-plan store only answers peek'))
+    return {
+      prepare: () => unsupported,
+      publish: () => unsupported,
+      load: () => unsupported,
+      peek: (coord) => Effect.succeed(chunks.get(`${String(coord.cx)},${String(coord.cz)}`)),
+      snapshot: () => unsupported,
+      isLoaded: () => unsupported,
+      loadedCoords: unsupported,
+      neighbours: () => unsupported,
+      unload: () => unsupported,
+      getBlock: () => unsupported,
+      getBlockWithState: () => unsupported,
+      setBlock: () => unsupported,
+      getLight: () => unsupported,
+      subscribeDirty: unsupported,
+      subscribeDirtyScoped: unsupported,
+      reset: unsupported,
+    }
+  }
+
+  /**
    * mx-gameplay's own plan for a roster, computed without the core. Each server tick opens one ChunkWindow over every
-   * chunk around the mobs' feet at that tick's start, from a dedicated ChunkStore large enough to hold them all. Each
+   * chunk around the mobs' feet at that tick's start, generated straight from the terrain source. Each
    * game tick then steps every mob's AI with stepEcosystemMob (toward its target, if it has one) and plans the whole
    * roster once with planMobMovementRoster, at simulation ticks 1, 2, … in the overworld.
    */
@@ -3385,11 +3412,12 @@ describe('multiplayer server authoritative state', () => {
       for (const { feet } of current) {
         for (const coord of chunkCoordsAround(feet, CHUNK_SIZE_XZ)) coords.set(`${String(coord.cx)},${String(coord.cz)}`, coord)
       }
-      const window = Effect.runSync(Effect.gen(function* () {
-        const store = yield* makeChunkStore(terrain, ChunkCapacity(coords.size))
-        for (const coord of coords.values()) yield* store.load(coord)
-        return yield* openChunkWindow(store, [...coords.values()])
+      // The window and the movement world read block ids only, so the generated chunks need no real block states.
+      const chunks = new Map([...coords].map(([key, coord]) => {
+        const chunk = Effect.runSync(terrain(coord))
+        return [key, { coord: chunk.coord, blocks: chunk.blocks, blockStates: new Uint32Array(CHUNK_VOLUME), biomes: chunk.biomes }]
       }))
+      const window = Effect.runSync(openChunkWindow(peekOnlyStore(chunks), [...coords.values()]))
       const world = mobMovementWorldFromChunkWindow(window)
       for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
         simulationTick += 1
@@ -3496,9 +3524,10 @@ describe('multiplayer server authoritative state', () => {
     const cows = cowsAt(Array.from({ length: 29 }, (_, index) => ({ x: 64 * index, y: 64, z: 8 })))
     const fixture = makeFixture({ ...initialState(), entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
 
-    expect(fixture.server.tick(250)).toEqual(Result.succeed({ refusals: [] }))
+    // One game tick is enough: the plan already spends one roster's search budget and order across all 29 cows.
+    expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
 
-    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [5]))
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [1]))
   })
 
   it('plans a chained herd as one roster when its windows exceed the chunk store', () => {
@@ -3510,9 +3539,9 @@ describe('multiplayer server authoritative state', () => {
     ])
     const fixture = makeFixture({ ...initialState(), entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
 
-    expect(fixture.server.tick(100)).toEqual(Result.succeed({ refusals: [] }))
+    expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
 
-    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [2]))
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [1]))
   })
 
   it('shares one roster\'s search budget and order among cows whose windows share no chunk', () => {
@@ -3536,17 +3565,19 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('plans with a saved edit inside a herd whose windows exceed the chunk store', () => {
-    // A saved stone in cow-0's path, in a layout whose 261 chunks overflow the LRU store while they load.
-    const wall = { at: { x: 1, y: 64, z: 8 }, block: 'stone' }
+    // Saved edits that remove the floor under cow-1, in a layout whose 261 chunks overflow the LRU store while they
+    // load. At simulation tick 1 the planner starts at cow-1, so it moves cow-1 in the first game tick.
+    const hole = [63, 64].flatMap((x) => [7, 8].map((z) => ({ at: { x, y: 63, z }, block: null })))
     const cows = cowsAt(Array.from({ length: 29 }, (_, index) => ({ x: 64 * index, y: 64, z: 8 })))
-    const blocks = [...initialState().blocks, wall]
+    const blocks = [...initialState().blocks, ...hole]
     const fixture = makeFixture({ ...initialState(), blocks, entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
 
-    expect(fixture.server.tick(1_000)).toEqual(Result.succeed({ refusals: [] }))
+    expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
 
-    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(floorTerrain(63, 'stone', blocks), cows.planned, [20]))
-    // The edit reaches cow-0's plan: on the bare floor it stays at y = 64, and here it climbs the stone.
-    expect(fixture.persisted.at(-1)?.entities?.[0]?.at.y).toBeGreaterThan(64)
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(floorTerrain(63, 'stone', blocks), cows.planned, [1]))
+    // The edits reach cow-1's plan: on the bare floor it stays at y = 64, and here it starts to fall.
+    expect(plannedRoster(pastureWithEdits, cows.planned, [1]).get('cow-1')?.y).toBe(64)
+    expect(fixture.persisted.at(-1)?.entities?.[1]?.at.y).toBeLessThan(64)
   })
 
   it('moves a zombie toward its nearest player as one roster plan computes', () => {
