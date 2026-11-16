@@ -709,6 +709,106 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted).toEqual([])
   })
 
+  it('rejects an ender pearl landing outside addressable cells without moving the player or consuming the pearl', () => {
+    // Looking straight down, the pearl lands the eye height below the stone it hits, which here is below the
+    // lowest addressable cell.
+    const at = { x: 0.5, y: Number.MIN_SAFE_INTEGER + 3, z: 0.5 }
+    const pearls = { item: 'ender_pearl', count: 2 } as const
+    const fixture = makeFixture({
+      ...initialState(),
+      blocks: [{ at: { x: 0, y: Number.MIN_SAFE_INTEGER, z: 0 }, block: 'stone' }],
+      inventories: [{ player: playerId('alice'), state: { selectedSlot: 0, slots: [pearls, null, null] } }],
+      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
+      playerPositions: [{ player: playerId('alice'), at, facing: { yawRadians: 0, pitchRadians: -1.57 } }],
+    }, at)
+    fixture.sent.length = 0
+
+    expect(fixture.receive({
+      _tag: 'EnderPearlCommand', commandId: commandId('throw-ender-pearl-off-the-world'), player: playerId('alice'),
+      world: worldId('world-1'), expectedRevision: 4,
+    })).toEqual({
+      accepted: false,
+      reason: 'invalid-command',
+      failure: {
+        _tag: 'PositionOutsideAddressableCells',
+        subject: 'player',
+        id: 'alice',
+        at: expect.objectContaining({ y: -(2 ** 53) }),
+      },
+    })
+
+    expect(messages(fixture.sent)).toEqual([
+      expect.objectContaining({ _tag: 'AuthoritativeCommandRejected', commandId: 'throw-ender-pearl-off-the-world', revision: 4 }),
+    ])
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot().players).toEqual([expect.objectContaining({ player: playerId('alice'), at })])
+    fixture.sent.length = 0
+    fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: worldId('world-1'), lastKnownRevision: 4 })
+    expect(messages(fixture.sent)).toEqual([expect.objectContaining({
+      _tag: 'AuthoritativeSnapshot',
+      revision: 4,
+      inventories: [{ player: 'alice', state: expect.objectContaining({ slots: [pearls, null, null] }) }],
+      vitals: [{ player: 'alice', state: { health: 20, hunger: 20, experience: 7 } }],
+    })])
+  })
+
+  it('rejects commands without throwing once the revision reaches the largest safe integer', () => {
+    const slots = [{ item: 'stone', count: 5 }, { item: 'coal', count: 3 }, null] as const
+    const fixture = makeFixture({ ...initialState(), revision: Number.MAX_SAFE_INTEGER })
+    fixture.sent.length = 0
+    const exhausted = { _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER }
+
+    expect(fixture.receive({
+      _tag: 'PlayerInventoryCommand', commandId: commandId('select-at-revision-limit'), player: playerId('alice'),
+      world: worldId('world-1'), expectedRevision: Number.MAX_SAFE_INTEGER, action: { _tag: 'select-slot', slot: 1 },
+    })).toEqual({ accepted: false, reason: 'invalid-command', failure: exhausted })
+    // Block placement builds a C2 intent from the current revision, which threw once the revision passed this limit.
+    expect(fixture.receive({
+      _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at: { x: 1, y: 64, z: 1 }, block: 'stone', state: DEFAULT_BLOCK_STATE,
+    })).toEqual({ accepted: false, reason: 'invalid-mutation', failure: exhausted })
+    expect(messages(fixture.sent)).toEqual([
+      expect.objectContaining({
+        _tag: 'AuthoritativeCommandRejected',
+        commandId: 'select-at-revision-limit',
+        reason: 'invalid-command',
+        revision: Number.MAX_SAFE_INTEGER,
+      }),
+      expect.objectContaining({ _tag: 'BlockMutationRejected', at: { x: 1, y: 64, z: 1 }, revision: Number.MAX_SAFE_INTEGER }),
+    ])
+
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(expect.objectContaining({
+      revision: Number.MAX_SAFE_INTEGER,
+      blocks: initialState().blocks.map((block) => ({ ...block, world: 'world-1' })),
+    }))
+    fixture.sent.length = 0
+    fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: worldId('world-1'), lastKnownRevision: 4 })
+    expect(messages(fixture.sent)).toEqual([expect.objectContaining({
+      _tag: 'AuthoritativeSnapshot',
+      revision: Number.MAX_SAFE_INTEGER,
+      inventories: [{ player: 'alice', state: expect.objectContaining({ selectedSlot: 0, slots }) }],
+    })])
+  })
+
+  it('fails a tick with a typed failure when it cannot advance the revision or the simulation tick', () => {
+    const fixture = makeFixture({
+      ...initialState(),
+      revision: Number.MAX_SAFE_INTEGER,
+      entities: [{
+        _tag: 'item-drop', entityId: entityId('last-tick-drop'), at: { x: 2, y: 65, z: 3 },
+        stack: { item: 'stone', count: 1 }, ageTicks: 5_999,
+      }],
+    })
+
+    expect(fixture.server.tick(Number.MAX_VALUE)).toEqual(Result.fail({
+      _tag: 'SimulationTickExhausted',
+      simulationTick: 0,
+      elapsedTicks: Math.floor(Number.MAX_VALUE / 50),
+    }))
+    expect(fixture.server.tick(100)).toEqual(Result.fail({ _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER }))
+    expect(fixture.server.snapshot().revision).toBe(Number.MAX_SAFE_INTEGER)
+  })
+
   it('resolves bucket collection and placement from the authoritative player pose', () => {
     const state = initialState()
     const fixture = makeFixture({
@@ -2736,7 +2836,7 @@ describe('multiplayer server authoritative state', () => {
       entityId: entityId('expiring-drop'),
       at: { x: 2, y: 65, z: 3 },
       stack: { item: 'stone', count: 1 },
-    })).toBe(true)
+    })).toEqual(Result.succeed(true))
     fixture.sent.length = 0
     fixture.persisted.length = 0
 

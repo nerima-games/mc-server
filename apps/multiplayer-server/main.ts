@@ -624,7 +624,12 @@ export const startMultiplayerServer = async (
     destinationAt: BlockPos,
     command: Readonly<{ commandId: CommandId; world: WorldId }>,
   ): void => {
-    const transfer = source.detachPlayer(clientId)
+    const detached = source.detachPlayer(clientId)
+    if (Result.isFailure(detached)) {
+      console.error('Multiplayer realm transfer failed', { clientId, failure: detached.failure })
+      return
+    }
+    const transfer = detached.success
     if (transfer === undefined) return
     if (!destination.acceptRealmTransfer(clientId, transfer, {
       commandId: command.commandId,
@@ -739,9 +744,14 @@ export const startMultiplayerServer = async (
         activePlayers.delete(activePlayer)
       }
       activeRealms.delete(clientId)
-      overworldCore.disconnect(clientId)
-      netherCore.disconnect(clientId)
-      endCore.disconnect(clientId)
+      for (const [worldId, core] of [
+        [options.worldId, overworldCore],
+        ['nether', netherCore],
+        ['end', endCore],
+      ] as const) {
+        const result = core.disconnect(clientId)
+        if (Result.isFailure(result)) console.error('Multiplayer disconnect failed', { clientId, worldId, failure: result.failure })
+      }
     }
     const rejectHandshake = (reason: string = 'reconnect authentication failed'): void => {
       if (socket.readyState === WebSocket.OPEN) socket.close(1008, reason)

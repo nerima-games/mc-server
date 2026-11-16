@@ -224,6 +224,16 @@ describe('multiplayer state file round trip', () => {
         _tag: 'PositionOutsideAddressableCells', subject: 'wither', id: 'wither-1', at: { x: far, y: 64, z: 0 },
       }))
     })
+
+    it('for an eye of ender recovery', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        eyeOfEnderRecoveries: [{ entityId: EntityId.make('eye-1'), at: { x: 0, y: 64, z: far }, remainingSecs: 1 }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'eye-of-ender-recovery', id: 'eye-1', at: { x: 0, y: 64, z: far },
+      }))
+    })
   })
 
   it('still loads a state file predating these fields, leaving the new categories empty', async () => {

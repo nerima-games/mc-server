@@ -103,7 +103,7 @@ const makeFixture = (
   initialWeather: 'clear' | 'rain' | 'thunder' = 'clear',
   dimension: Dimension = 'overworld',
   options: Pick<MultiplayerServerOptions, 'staticBlocks' | 'onEndPortalUse' | 'onNetherPortalUse'> & Readonly<{
-    metadata?: Partial<Pick<MultiplayerServerState, 'anvilNames' | 'enchantments' | 'containers' | 'furnaces' | 'brewingStands'>>
+    metadata?: Partial<Pick<MultiplayerServerState, 'anvilNames' | 'enchantments' | 'containers' | 'furnaces' | 'brewingStands' | 'witherRevision'>>
   }> = {},
 ) => {
   const { metadata, ...serverOptions } = options
@@ -598,7 +598,7 @@ describe('authoritative multiplayer server core', () => {
   it.each([
     ['disconnects', (fixture: ReturnType<typeof makeFixture>) => { fixture.server.disconnect('socket-b') }],
     ['sends PlayerLeave', (fixture: ReturnType<typeof makeFixture>) => { fixture.receive('socket-b', { _tag: 'PlayerLeave', player: playerId('bob') }) }],
-    ['transfers to another realm', (fixture: ReturnType<typeof makeFixture>) => { expect(fixture.server.detachPlayer('socket-b')).toBeDefined() }],
+    ['transfers to another realm', (fixture: ReturnType<typeof makeFixture>) => { expect(Result.getOrThrow(fixture.server.detachPlayer('socket-b'))).toBeDefined() }],
   ] as const)('skips the night when the only awake player %s', (_case, removeBob) => {
     const fixture = makeFixture(({ x, y, z }) => x === 0 && y === 64 && z === 1 ? 'bed' : null, 13_000)
     const aliceFrames = fixture.connect('socket-a')
@@ -678,6 +678,37 @@ describe('authoritative multiplayer server core', () => {
       state: { timeOfDay: 6_000, weather: 'clear' },
     })
     expect(fixture.server.snapshot().revision).toBe(1)
+  })
+
+  it('rejects a Wither command without throwing once the Wither revision reaches the largest safe integer', () => {
+    const fixture = makeFixture(witherStructureAt, undefined, undefined, undefined, undefined, {
+      metadata: { witherRevision: Number.MAX_SAFE_INTEGER },
+    })
+    const frames = fixture.connect('socket-a')
+    fixture.receive('socket-a', join('alice'))
+    frames.length = 0
+
+    expect(fixture.receiveWither('socket-a', {
+      _tag: 'WitherCommand',
+      command: {
+        _tag: 'SummonWither', actor: 'alice', requestId: 'summon-at-limit', expectedRevision: Number.MAX_SAFE_INTEGER,
+        dimension: 'world-1', position: { x: 1, y: 66, z: 0 },
+      },
+    })).toEqual({
+      accepted: false,
+      reason: 'invalid-command',
+      failure: { _tag: 'RevisionExhausted', counter: 'wither', revision: Number.MAX_SAFE_INTEGER },
+    })
+    expect(witherMessages(frames)).toEqual([expect.objectContaining({
+      _tag: 'WitherCommandResult', requestId: 'summon-at-limit', accepted: false, revision: Number.MAX_SAFE_INTEGER,
+    })])
+    expect(fixture.server.snapshot().revision).toBe(0)
+    fixture.receive('socket-a', { _tag: 'PlayerLeave', player: playerId('alice') })
+    const rejoined = fixture.connect('socket-b')
+    fixture.receive('socket-b', join('alice'))
+    expect(witherMessages(rejoined)).toContainEqual(expect.objectContaining({
+      _tag: 'WitherSnapshot', revision: Number.MAX_SAFE_INTEGER, snapshot: expect.objectContaining({ withers: [] }),
+    }))
   })
 
   it('synchronizes authoritative Wither state to two clients and a rejoining session', () => {
@@ -897,7 +928,7 @@ describe('authoritative multiplayer server core', () => {
       at: { x: 1, y: 64, z: 0 },
       health: 4,
       maxHealth: 20,
-    })).toBe(true)
+    })).toEqual(Result.succeed(true))
     frames.length = 0
 
     expect(fixture.receive('socket-a', {
@@ -982,12 +1013,14 @@ describe('authoritative multiplayer server core', () => {
     source.receive('socket-a', join('alice'))
     expect(source.server.spawnEntity({
       _tag: 'living', entityId: EntityId.make('creeper-far'), entityType: 'creeper', at: { x: far, y: 64, z: far }, health: 20, maxHealth: 20,
-    })).toBe(false)
+    })).toEqual(Result.fail({
+      _tag: 'PositionOutsideAddressableCells', subject: 'entity', id: 'creeper-far', at: { x: far, y: 64, z: far },
+    }))
     expect(source.server.snapshot().revision).toBe(0)
 
     const destination = makeFixture()
     destination.connect('socket-b')
-    const transfer = source.server.detachPlayer('socket-a')
+    const transfer = Result.getOrThrow(source.server.detachPlayer('socket-a'))
     expect(transfer).toBeDefined()
     if (transfer === undefined) throw new Error('alice was not detached')
     expect(destination.server.acceptRealmTransfer('socket-b', transfer, {
@@ -1024,10 +1057,10 @@ describe('authoritative multiplayer server core', () => {
     })
     expect(destination.connect('socket-a', (wire) => destinationFrames.push(wire))).toBe(true)
 
-    const transfer = source.server.detachPlayer('socket-a')
-    expect(transfer).toBeDefined()
+    const transfer = Result.getOrThrow(source.server.detachPlayer('socket-a'))
+    if (transfer === undefined) throw new Error('alice was not detached')
     expect(source.server.snapshot().players).toEqual([])
-    expect(destination.acceptRealmTransfer('socket-a', transfer!, {
+    expect(destination.acceptRealmTransfer('socket-a', transfer, {
       commandId: 'end-transfer' as CommandId,
       fromWorld: worldId('world-1'),
       at: { x: 0, y: 65, z: 0 },
