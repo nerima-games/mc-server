@@ -3,13 +3,13 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { AIR_BLOCK_ID, BlockAxis, blockIdOf, blockPosition, ChunkAxis, chunkCoord, encodeBlockState, EncodedBlockStateSchema, PositionAxis, position } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, BlockAxis, blockIdOf, blockPosition, ChunkAxis, chunkCoord, encodeBlockState, EncodedBlockStateSchema, PositionAxis, position, WorldWriteInvalidBatch, WorldWriteChunkUnavailableSchema } from '@nerima-games/mc-kernel'
 import { makeReplicatedOwnerId, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, type ChunkBiomeType, type ChunkSource, type ChunkStoreApi } from '@nerima-games/mc-worldgen'
 import { AuthoritativeClientState, decodeFrame, encodeFrame, EntityId, PlayerId, PlayerName, WorldId, type NetworkMessage, type WireText } from '@nerima-games/mx-multiplayer'
 import { Effect, Option, Result, Schema } from 'effect'
 import fc from 'fast-check'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { makeMultiplayerServerCore, type MultiplayerServerCoreParts, type MultiplayerServerState } from '../../apps/multiplayer-server/core'
 import type { ServerWorldWrite } from '../../apps/multiplayer-server/world-write-port'
@@ -53,6 +53,7 @@ const networkMessages = (frames: ReadonlyArray<WireText>): ReadonlyArray<Network
 type FixtureOptions = Readonly<{
   state?: Partial<MultiplayerServerState>
   source?: ChunkSource
+  dimension?: 'overworld' | 'end'
 }>
 const makeFixture = (options: FixtureOptions = {}) => {
   const states: Array<MultiplayerServerState> = []
@@ -77,7 +78,7 @@ const makeFixture = (options: FixtureOptions = {}) => {
   }
   const core = Result.getOrThrow(makeMultiplayerServerCore({
     worldId: WORLD,
-    dimension: 'overworld',
+    dimension: options.dimension ?? 'overworld',
     seed: 42,
     allowedBlocks: new Set(['stone', 'sand', 'gravel', 'redstone_lamp', 'oak_log', 'tnt']),
     chunkSource: options.source === undefined ? airTerrain : options.source,
@@ -121,12 +122,18 @@ const makeFixture = (options: FixtureOptions = {}) => {
   })
   const breakBlock = (position = P) => receive({ _tag: 'BlockBreak', player: ALICE, world: WORLD, at: position })
   const lastState = () => Option.getOrThrow(Option.fromUndefinedOr(states.at(-1)))
+  const freshSnapshot = () => {
+    const start = alice.length
+    expect(receive({ _tag: 'AuthoritativeResyncRequest', world: WORLD }).accepted).toBe(true)
+    return Option.getOrThrow(Option.fromUndefinedOr(networkMessages(alice.slice(start))
+      .find((message) => message._tag === 'AuthoritativeSnapshot')))
+  }
   const deltas = (output: ReadonlyArray<WireText>) =>
     networkMessages(output).filter((message) => message._tag === 'ReplicatedWorldDelta')
-  return { core, worldWrite, store, states, alice, bob, initialAlice, receive, place, breakBlock, lastState, deltas }
+  return { core, parts, worldWrite, store, states, alice, bob, initialAlice, receive, place, breakBlock, lastState, freshSnapshot, deltas }
 }
 
-const makeBoundaryExplosion = () => {
+const makeBoundaryExplosion = (dimension: 'overworld' | 'end' = 'overworld', chargeRemainingSecs = 0.05) => {
   const loaded: Array<string> = []
   const terrain = terrainFrom(({ x, y, z }) =>
     y === 63 || ((x === 15 || x === 16) && y === 64 && z === 0) ? 'stone' : null)
@@ -136,7 +143,7 @@ const makeBoundaryExplosion = () => {
   }
   const center = { x: 15, y: 64, z: 0 }
   const untouched = { x: 16, y: 64, z: 0 }
-  const fixture = makeFixture({ source, state: { wither: {
+  const fixture = makeFixture({ source, dimension, state: { wither: {
     nextWitherId: 1,
     nextSkullId: 0,
     withers: [{
@@ -148,7 +155,7 @@ const makeBoundaryExplosion = () => {
         state: {
           phase: 'charging',
           healthPoints: WitherHealthPoints(300),
-          chargeRemainingSecs: WitherChargeRemainingSecs(0.05),
+          chargeRemainingSecs: WitherChargeRemainingSecs(chargeRemainingSecs),
           feetPosition: position(PositionAxis(15), PositionAxis(64), PositionAxis(0)),
           velocity: position(PositionAxis(0), PositionAxis(0), PositionAxis(0)),
         },
@@ -164,6 +171,7 @@ const makeBoundaryExplosion = () => {
 }
 
 describe('coordinator-backed multiplayer block writes', () => {
+  afterEach(() => vi.restoreAllMocks())
   it('establishes a coordinator revision baseline that the real client reducer accepts before deltas and resync', () => {
     const fixture = makeFixture({ state: { revision: 9 } })
     const joined = networkMessages(fixture.initialAlice)
@@ -259,7 +267,14 @@ describe('coordinator-backed multiplayer block writes', () => {
     ])
     expect(fixture.bob).toEqual([])
     expect(fixture.core.snapshot().blocks).toStrictEqual(beforeBlocks)
-    expect(fixture.lastState().inventories).toStrictEqual(beforeInventory)
+    fixture.alice.length = 0
+    expect(fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: WORLD }).accepted).toBe(true)
+    const freshSnapshots = networkMessages(fixture.alice).filter((message) => message._tag === 'AuthoritativeSnapshot')
+    expect(freshSnapshots).toHaveLength(1)
+    expect(freshSnapshots[0]?.inventories).toStrictEqual(beforeInventory)
+    expect(freshSnapshots[0]?.inventories).toContainEqual(expect.objectContaining({
+      player: ALICE, state: expect.objectContaining({ slots: [{ item: 'stone', count: 16 }, null] }),
+    }))
     expect(Effect.runSync(coordinator.revision)).toBe(1)
     expect(Effect.runSync(coordinator.dimensionRevision('overworld'))).toBe(0)
     expect(Effect.runSync(coordinator.snapshot(OWNER, Schema.Number))).toMatchObject({ revision: 1, state: 1 })
@@ -353,40 +368,129 @@ describe('coordinator-backed multiplayer block writes', () => {
     expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(before + 1)
   })
 
-  it('publishes no partial falling-block batch when the resident chunk disappears before commit', () => {
+  it('discards a failed falling batch, runs later item aging in the same tick, and never retries it', () => {
+    const drop = EntityId.make('expiring-drop')
     const fixture = makeFixture({
       source: floorTerrain(63, 'stone'),
-      state: { blocks: [{ at: P, block: 'stone' }, { at: { x: 1, y: 65, z: 0 }, block: 'sand' }] },
+      state: {
+        blocks: [{ at: P, block: 'stone' }, { at: { x: 1, y: 65, z: 0 }, block: 'sand' }],
+        entities: [{ _tag: 'item-drop', entityId: drop, at: { x: 7, y: 65, z: 7 }, stack: { item: 'stone', count: 1 }, ageTicks: 5_999 }],
+      },
     })
     expect(fixture.breakBlock().accepted).toBe(true)
     fixture.alice.length = 0
     fixture.bob.length = 0
-    const coordinator = fixture.worldWrite.coordinator
-    const beforeRevision = Effect.runSync(coordinator.revision)
     const beforeBlocks = fixture.core.snapshot().blocks
-    const beforeState = fixture.lastState()
-    const originalCommit = coordinator.commit
-    const commit = vi.spyOn(coordinator, 'commit').mockImplementationOnce((request) => Effect.andThen(
-      Effect.orDie(fixture.store.unload(chunkCoord(ChunkAxis(0), ChunkAxis(0)))),
-      originalCommit(request),
-    ))
-
-    const tick = fixture.core.tick(50)
-
-    expect(Result.isFailure(tick)).toBe(true)
-    if (Result.isFailure(tick)) expect(tick.failure).toMatchObject({
-      _tag: 'WorldWriteFailure', failure: { _tag: 'WorldWriteChunkUnavailable' },
-    })
-    expect(Effect.runSync(coordinator.revision)).toBe(beforeRevision)
-    expect(Effect.runSync(coordinator.dimensionRevision('overworld'))).toBe(beforeRevision)
+    const unavailable = Result.getOrThrow(Schema.decodeUnknownResult(WorldWriteChunkUnavailableSchema)({
+      _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '0,0',
+    }))
+    const commit = vi.spyOn(fixture.worldWrite.coordinator, 'commit').mockImplementationOnce(() => Effect.fail(unavailable))
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    expect(Result.isSuccess(fixture.core.tick(50))).toBe(true)
+    expect(Option.getOrThrow(Option.fromUndefinedOr(fixture.freshSnapshot().entities)).some(({ entityId }) => entityId === drop)).toBe(false)
+    expect(networkMessages(fixture.bob)).toContainEqual(expect.objectContaining({ _tag: 'EntityDespawnDelta', entityId: drop }))
     expect(fixture.core.snapshot().blocks).toStrictEqual(beforeBlocks)
-    expect(fixture.lastState().blocks).toStrictEqual(beforeState.blocks)
-    expect(fixture.deltas(fixture.alice)).toEqual([])
-    expect(fixture.deltas(fixture.bob)).toEqual([])
-    Result.getOrThrow(fixture.core.readPistonCell(P))
-    Result.getOrThrow(fixture.core.readPistonCell({ x: 1, y: 65, z: 0 }))
     expect(Effect.runSync(fixture.store.getBlock(at(P)))).toStrictEqual({ _tag: 'Block', block: AIR_BLOCK_ID })
     expect(Effect.runSync(fixture.store.getBlock(at({ x: 1, y: 65, z: 0 })))).toStrictEqual({ _tag: 'Block', block: SAND })
+    expect(fixture.deltas(fixture.bob)).toEqual([])
+    expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(1)
+    expect(logged).toHaveBeenCalledExactlyOnceWith('Multiplayer falling block batch discarded', { worldId: WORLD, failure: unavailable })
+    expect(commit).toHaveBeenCalledOnce()
+    expect(Result.isSuccess(fixture.core.tick(50))).toBe(true)
+    expect(commit).toHaveBeenCalledOnce()
+    expect(fixture.deltas(fixture.bob)).toEqual([])
+    logged.mockRestore()
+    commit.mockRestore()
+  })
+
+  const impossibleBatchReasons: ReadonlyArray<'empty' | 'duplicate-position'> = ['empty', 'duplicate-position']
+  it.each(impossibleBatchReasons)('treats impossible %s player batches as defects without changing state', (reason) => {
+    const fixture = makeFixture()
+    const beforeBlocks = fixture.core.snapshot().blocks
+    const beforeInventory = fixture.lastState().inventories
+    const failure = Result.getOrThrow(Schema.decodeUnknownResult(WorldWriteInvalidBatch)({ _tag: 'WorldWriteInvalidBatch', reason }))
+    const commit = vi.spyOn(fixture.worldWrite.coordinator, 'commit')
+    const injected = vi.spyOn(fixture.parts, 'commitWorldWrite').mockReturnValueOnce(Result.fail(failure))
+    expect(() => fixture.place()).toThrow('c7-adapter: unexpected WorldWriteInvalidBatch')
+    expect(injected).toHaveBeenCalledOnce()
+    expect(commit).not.toHaveBeenCalled()
+    expect(fixture.core.snapshot().blocks).toStrictEqual(beforeBlocks)
+    expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(0)
+    expect(Effect.runSync(fixture.worldWrite.coordinator.dimensionRevision('overworld'))).toBe(0)
+    expect(fixture.deltas(fixture.bob)).toEqual([])
+    fixture.alice.length = 0
+    expect(fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: WORLD }).accepted).toBe(true)
+    const fresh = networkMessages(fixture.alice).filter((message) => message._tag === 'AuthoritativeSnapshot')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]?.inventories).toStrictEqual(beforeInventory)
+    expect(Effect.runSync(fixture.store.getBlock(at(P)))).toStrictEqual({ _tag: 'Block', block: AIR_BLOCK_ID })
+    injected.mockRestore()
+    commit.mockRestore()
+  })
+
+  it('maps an invalid block state to unknown-block without changing inventory or blocks', () => {
+    const fixture = makeFixture()
+    const beforeInventory = fixture.lastState().inventories
+    const failure = Result.getOrThrow(Schema.decodeUnknownResult(WorldWriteInvalidBatch)({
+      _tag: 'WorldWriteInvalidBatch', reason: 'invalid-block-state', position: P,
+    }))
+    const injected = vi.spyOn(fixture.parts, 'commitWorldWrite').mockReturnValueOnce(Result.fail(failure))
+    const commit = vi.spyOn(fixture.worldWrite.coordinator, 'commit')
+    expect(fixture.place()).toMatchObject({ accepted: false, failure: { _tag: 'WorldWriteFailure', failure } })
+    expect(networkMessages(fixture.alice)).toEqual([
+      expect.objectContaining({ _tag: 'BlockMutationRejected', reason: 'unknown-block', revision: 0 }),
+    ])
+    expect(fixture.bob).toEqual([])
+    expect(commit).not.toHaveBeenCalled()
+    expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(0)
+    expect(Effect.runSync(fixture.store.getBlock(at(P)))).toStrictEqual({ _tag: 'Block', block: AIR_BLOCK_ID })
+    fixture.alice.length = 0
+    expect(fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: WORLD }).accepted).toBe(true)
+    const fresh = networkMessages(fixture.alice).filter((message) => message._tag === 'AuthoritativeSnapshot')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]?.inventories).toStrictEqual(beforeInventory)
+    injected.mockRestore()
+    commit.mockRestore()
+  })
+
+  const redstoneFailures: ReadonlyArray<Readonly<{
+    block: 'redstone_lamp' | 'door' | 'piston'
+    after: 'redstone_lamp_lit' | 'door_open' | 'piston_head'
+  }>> = [
+    { block: 'redstone_lamp', after: 'redstone_lamp_lit' },
+    { block: 'door', after: 'door_open' },
+    { block: 'piston', after: 'piston_head' },
+  ]
+  it.each(redstoneFailures)('logs a failed $block event and commits the later event in the same real redstone tick', async ({ block, after }) => {
+    const other = { x: 5, y: 64, z: 0 }
+    const fixture = makeFixture({ state: { blocks: [
+      { at: { x: 0, y: 64, z: 0 }, block: 'redstone_torch' },
+      { at: { x: 4, y: 64, z: 0 }, block: 'redstone_torch' },
+      { at: P, block }, { at: other, block },
+      ...(block === 'piston' ? [
+        { at: { ...P, z: -1 }, block: 'stone' }, { at: { ...other, z: -1 }, block: 'stone' },
+      ] : []),
+    ] } })
+    const unavailable = Result.getOrThrow(Schema.decodeUnknownResult(WorldWriteChunkUnavailableSchema)({
+      _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '0,0',
+    }))
+    const commit = vi.spyOn(fixture.worldWrite.coordinator, 'commit').mockImplementationOnce(() => Effect.fail(unavailable))
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.core }])
+    expect(await Effect.runPromise(runtime.tick(100))).toEqual(Result.succeed(undefined))
+    expect(commit).toHaveBeenCalledTimes(2)
+    expect(logged).toHaveBeenCalledExactlyOnceWith('Multiplayer redstone block write failed', {
+      dimension: 'overworld', position: expect.any(Object),
+      failure: { _tag: 'WorldWriteFailure', failure: unavailable },
+    })
+    const cells = [P, other].map((cell) => Effect.runSync(fixture.store.getBlock(at(block === 'piston' ? { ...cell, z: -1 } : cell))))
+    expect(cells).toContainEqual({ _tag: 'Block', block: Option.getOrThrow(blockIdOf(block === 'piston' ? 'stone' : block)) })
+    expect(cells).toContainEqual({ _tag: 'Block', block: Option.getOrThrow(blockIdOf(after)) })
+    expect(fixture.deltas(fixture.bob)).toHaveLength(1)
+    expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(1)
+    expect(await Effect.runPromise(runtime.tick(100))).toEqual(Result.succeed(undefined))
+    expect(commit).toHaveBeenCalledTimes(2)
+    logged.mockRestore()
     commit.mockRestore()
   })
 
@@ -505,37 +609,70 @@ describe('coordinator-backed multiplayer block writes', () => {
     expect(Effect.runSync(fixture.store.getBlock(at(untouched)))).toStrictEqual({ _tag: 'Block', block: STONE })
   })
 
-  it('rolls back a wither explosion step without publishing blocks or phase changes when commit fails', () => {
-    const { fixture, center } = makeBoundaryExplosion()
-    const beforeWither = fixture.lastState().wither
+  it('discards a failed TNT explosion and still advances the later wither step without retrying TNT', () => {
+    const boundary = makeBoundaryExplosion('overworld', 5)
+    const initial = boundary.fixture.lastState()
+    const tnt = EntityId.make('failed-explosion')
+    const fixture = makeFixture({ source: floorTerrain(63, 'stone'), state: {
+      ...initial,
+      blocks: [{ at: P, block: 'stone' }],
+      entities: [
+        { _tag: 'primed-tnt', entityId: tnt, at: { x: 1.5, y: 64, z: 0.5 }, burnedSecs: 3.99, owner: null },
+        { _tag: 'arrow', entityId: EntityId.make('unrelated-arrow'), at: { x: 5, y: 100, z: 5 },
+          velocity: { x: 10, y: 0, z: 0 }, damage: 2, owner: null, ageTicks: 0 },
+      ],
+    } })
+    Result.getOrThrow(fixture.core.readPistonCell(P))
     const beforeBlocks = fixture.core.snapshot().blocks
-    const coordinator = fixture.worldWrite.coordinator
-    const originalCommit = coordinator.commit
-    const commit = vi.spyOn(coordinator, 'commit').mockImplementationOnce((request) => Effect.andThen(
-      Effect.orDie(fixture.store.unload(chunkCoord(ChunkAxis(0), ChunkAxis(0)))),
-      originalCommit(request),
-    ))
+    const beforeWither = fixture.lastState().wither
+    const unavailable = Result.getOrThrow(Schema.decodeUnknownResult(WorldWriteChunkUnavailableSchema)({
+      _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '0,0',
+    }))
+    const commit = vi.spyOn(fixture.worldWrite.coordinator, 'commit').mockImplementationOnce(() => Effect.fail(unavailable))
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    expect(Result.isSuccess(fixture.core.tick(100))).toBe(true)
+    expect(Option.getOrThrow(Option.fromUndefinedOr(fixture.freshSnapshot().entities)).some(({ entityId }) => entityId === tnt)).toBe(false)
+    expect(fixture.freshSnapshot().entities).toContainEqual(expect.objectContaining({
+      _tag: 'arrow', entityId: EntityId.make('unrelated-arrow'), at: expect.objectContaining({ x: 6 }),
+    }))
+    expect(fixture.lastState().wither).not.toStrictEqual(beforeWither)
+    expect(fixture.lastState().wither?.withers[0]?.snapshot.state).toMatchObject({ phase: 'charging', chargeRemainingSecs: 4.9 })
+    expect(fixture.core.snapshot().blocks).toStrictEqual(beforeBlocks)
+    expect(Effect.runSync(fixture.store.getBlock(at(P)))).toStrictEqual({ _tag: 'Block', block: STONE })
+    expect(fixture.deltas(fixture.bob)).toEqual([])
+    expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(0)
+    expect(logged).toHaveBeenCalledExactlyOnceWith('Multiplayer entity block batch discarded', { worldId: WORLD, failure: unavailable })
+    expect(Result.isSuccess(fixture.core.tick(100))).toBe(true)
+    expect(commit).toHaveBeenCalledOnce()
+    expect(fixture.deltas(fixture.bob)).toEqual([])
+    logged.mockRestore()
+    commit.mockRestore()
+  })
 
-    const tick = fixture.core.tick(100)
-
-    expect(Result.isFailure(tick)).toBe(true)
-    if (Result.isFailure(tick)) expect(tick.failure).toMatchObject({
-      _tag: 'WorldWriteFailure', failure: { _tag: 'WorldWriteChunkUnavailable' },
-    })
-    expect(Effect.runSync(coordinator.revision)).toBe(0)
-    expect(Effect.runSync(coordinator.dimensionRevision('overworld'))).toBe(0)
+  it('discards a failed wither explosion and runs the later ender dragon step without retrying the explosion', () => {
+    const { fixture, center } = makeBoundaryExplosion('end')
+    const beforeBlocks = fixture.core.snapshot().blocks
+    const beforeWither = fixture.lastState().wither
+    const unavailable = Result.getOrThrow(Schema.decodeUnknownResult(WorldWriteChunkUnavailableSchema)({
+      _tag: 'WorldWriteChunkUnavailable', dimension: 'end', chunk: '0,0',
+    }))
+    const commit = vi.spyOn(fixture.worldWrite.coordinator, 'commit').mockImplementationOnce(() => Effect.fail(unavailable))
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    expect(Result.isSuccess(fixture.core.tick(100))).toBe(true)
+    expect(fixture.alice.map(decodeEnderDragonWireMessage)).toContainEqual(expect.objectContaining({ _tag: 'EnderDragonSnapshot' }))
+    expect(fixture.lastState().wither).not.toStrictEqual(beforeWither)
+    expect(fixture.lastState().wither?.withers[0]?.snapshot.state).toMatchObject({ phase: 'airborne', chargeRemainingSecs: 0 })
+    expect(Effect.runSync(fixture.worldWrite.coordinator.revision)).toBe(0)
+    expect(Effect.runSync(fixture.worldWrite.coordinator.dimensionRevision('end'))).toBe(0)
     expect(fixture.deltas(fixture.alice)).toEqual([])
     expect(fixture.deltas(fixture.bob)).toEqual([])
     expect(fixture.core.snapshot().blocks).toStrictEqual(beforeBlocks)
-    expect(fixture.core.connect('observer-socket', () => undefined)).toBe(true)
-    expect(fixture.core.receive('observer-socket', frame({
-      _tag: 'PlayerJoin', player: PlayerId.make('observer'), name: PlayerName.make('Observer'),
-      at: { x: 0, y: 64, z: 0 },
-    })).accepted).toBe(true)
-    expect(fixture.lastState().wither).toStrictEqual(beforeWither)
-    Result.getOrThrow(fixture.core.readPistonCell(center))
     expect(Effect.runSync(fixture.store.getBlock(at(center)))).toStrictEqual({ _tag: 'Block', block: STONE })
+    expect(logged).toHaveBeenCalledExactlyOnceWith('Multiplayer wither block batch discarded', { worldId: WORLD, failure: unavailable })
+    expect(Result.isSuccess(fixture.core.tick(100))).toBe(true)
     expect(commit).toHaveBeenCalledOnce()
+    expect(fixture.deltas(fixture.bob)).toEqual([])
+    logged.mockRestore()
     commit.mockRestore()
   })
 

@@ -278,8 +278,8 @@ type BlockWriteError = WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteC
 type BlockCommitDelta = ReplicatedWorldDelta<ReplicatedOwnerChange>
 type BlockCommit = Readonly<{ frame: WireText }>
 
-// These are the installed protocol codec's existing frame, depth, and collection caps.
-// This block-only path registers no owner states.
+// Explicit host limits are required: the pinned protocol codec exports no default limits.
+// createReplicatedOwnerRegistry validates them against its internal caps. This path has no owner states.
 const replicatedOwners = Result.getOrThrow(createReplicatedOwnerRegistry([], {
   maxCollectionItems: 31_149, maxDeltaBlockChanges: 31_149, maxSnapshotBlockReads: 31_149,
   maxDepth: 13, maxDeltaFrameBytes: 4_194_304, maxSnapshotFrameBytes: 4_194_304,
@@ -399,7 +399,6 @@ export interface ChunkStorePart {
   readonly store: ChunkStoreApi
   readonly peek: (coord: ChunkCoord) => ReadonlyChunkWithBlockStates | undefined
   readonly load: (coord: ChunkCoord) => Result.Result<ReadonlyChunkWithBlockStates, ChunkStoreError>
-  readonly unload: (coord: ChunkCoord) => Result.Result<boolean, ChunkPersistenceError>
   /**
    * A ChunkWindow over exactly `chunks`, by value: it reads no store, so a later load that evicts these chunks from
    * the store does not change it.
@@ -414,7 +413,8 @@ export interface MultiplayerServerCoreParts {
   readonly makeWorldWrite: (options: ServerWorldWriteOptions) => Result.Result<ServerWorldWrite, WorldCommitCoordinatorError>
   readonly generateChunk: (source: ChunkSource, coord: ChunkCoord) => Result.Result<Chunk, ChunkStoreError>
   readonly worldWriteRevisions: (write: ServerWorldWrite, dimension: Dimension) => Readonly<{ world: WorldRevision; dimension: DimensionRevision }>
-  readonly commitWorldWrite: (write: ServerWorldWrite, dimension: Dimension, batch: WorldWriteBatch, rollback?: () => void) => Result.Result<Readonly<{ commit: WorldWriteCommit; delta: BlockCommitDelta }>, BlockWriteError>
+  readonly dieInvalidBlockBatch: (failure: Exclude<WorldWriteInvalidBatch, { reason: 'invalid-block-state' }>) => never
+  readonly commitWorldWrite: (write: ServerWorldWrite, dimension: Dimension, batch: WorldWriteBatch) => Result.Result<Readonly<{ commit: WorldWriteCommit; delta: BlockCommitDelta }>, BlockWriteError>
 }
 
 /** The block box a core simulates; every bound must be finite and each minimum at most its maximum. */
@@ -915,9 +915,23 @@ const overrideBlockId = (block: string | null): Option.Option<BlockId> =>
   block === null ? Option.some(AIR_BLOCK_ID) : isBlockType(block) ? blockIdOf(block) : Option.none()
 
 /** Saved edits are updated only from committed deltas, then replayed when terrain is regenerated. */
-class BlockOverrides extends Map<string, BlockOverride> {
+class BlockOverrides {
+  readonly #records: Map<string, BlockOverride>
+
+  constructor(values: ReadonlyArray<BlockOverride> = []) {
+    this.#records = new Map(values.map((value) => [positionKey(value.at), value]))
+  }
+
   record(value: BlockOverride): void {
-    super.set(positionKey(value.at), value)
+    this.#records.set(positionKey(value.at), value)
+  }
+
+  get(key: string): BlockOverride | undefined {
+    return this.#records.get(key)
+  }
+
+  values(): IterableIterator<BlockOverride> {
+    return this.#records.values()
   }
 }
 const survivalActivityInput = (activity: HungerActivity, amount: number): SurvivalActivityInput => {
@@ -1331,7 +1345,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   )
   const playerClients = new Map<PlayerId, ClientId>()
   const movementBudgets = new Map<PlayerId, MovementBudget>()
-  const blocks = new BlockOverrides([...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])].map((mutation) => [positionKey(mutation.at), mutation]))
+  const blocks = new BlockOverrides([...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])])
   const plannedBlocks = new Map<string, BlockOverride>()
   const world = makeWorldReader(options.chunkSource, options.parts, blocks, plannedBlocks)
   const worldWrite = options.parts.makeWorldWrite({
@@ -1343,7 +1357,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   if (Result.isFailure(worldWrite)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: worldWrite.failure })
   const blockAt = world.blockAt
   const blockRevisions = () => options.parts.worldWriteRevisions(worldWrite.success, dimension)
-  const commitBlockEdits = (edits: ReadonlyArray<BlockOverride>, rollback?: () => void): Result.Result<BlockCommit, MultiplayerServerCoreFailure> => {
+  const commitBlockEdits = (edits: ReadonlyArray<BlockOverride>): Result.Result<BlockCommit, MultiplayerServerCoreFailure> => {
     const expected = blockRevisions()
     const batchEdits: Array<unknown> = []
     const prepared = new Map<string, Readonly<{ beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
@@ -1373,7 +1387,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     if (Result.isFailure(batch)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: batch.failure })
     const preview = encodeFrame({ _tag: 'ReplicatedWorldDelta', world: worldId, revision: expected.world + 1, changes: [], blockChanges: previewChanges }, replicatedOwners)
     if (Result.isFailure(preview)) return Result.fail({ _tag: 'WorldWriteEncodingFailure', failure: preview.failure })
-    const committed = options.parts.commitWorldWrite(worldWrite.success, dimension, batch.success, rollback)
+    const committed = options.parts.commitWorldWrite(worldWrite.success, dimension, batch.success)
     if (Result.isFailure(committed)) return Result.fail({ _tag: 'WorldWriteFailure', failure: committed.failure })
     // The coordinator publishes this validated batch; all wire states were encoded before that publication.
     const changes = committed.success.delta.blockChanges.map((change) => {
@@ -1944,7 +1958,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   }
 
   /** The next falling-block moves, planned from current blocks; `commit` applies them and clears their pending cells. */
-  const planPendingFallingBlocks = (): Result.Result<Readonly<{ moved: boolean; commit: () => Result.Result<BlockCommit | undefined, MultiplayerServerCoreFailure> }>, MultiplayerServerCoreFailure> => {
+  const planPendingFallingBlocks = (): Result.Result<Readonly<{ moved: boolean; discard: () => void; commit: () => Result.Result<BlockCommit | undefined, MultiplayerServerCoreFailure> }>, MultiplayerServerCoreFailure> => {
     const targets = Array.from(fallingPending.values()).slice(0, FALLING_BLOCK_MOVES_PER_TICK)
     let registryLookupFailure: string | undefined
     let blockReadFailure: MultiplayerServerCoreFailure | undefined
@@ -1990,15 +2004,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       }
       resolvedMoves.push({ source: move.source, target: move.target, block: blockResult.success })
     }
+    const discard = (): void => { for (const target of targets) fallingPending.delete(positionKey(target)) }
     return Result.succeed({
       moved: resolvedMoves.length > 0,
+      discard,
       commit: () => {
         const edits = new Map<string, BlockOverride>()
         for (const move of resolvedMoves) edits.set(positionKey(move.source), { at: move.source, block: null })
         for (const move of resolvedMoves) edits.set(positionKey(move.target), { at: move.target, block: move.block })
         const committed = edits.size === 0 ? Result.succeed(undefined) : commitBlockEdits([...edits.values()])
         if (Result.isFailure(committed)) return Result.fail(committed.failure)
-        for (const target of targets) fallingPending.delete(positionKey(target))
+        discard()
         for (const move of resolvedMoves) {
           disturbFallingBlocks([{ x: move.target.x, y: move.target.y - 1, z: move.target.z }, move.source])
         }
@@ -3923,6 +3939,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     message: Extract<NetworkMessage, { _tag: 'BlockPlace' | 'BlockBreak' }>,
     failure: MultiplayerServerCoreFailure,
   ): ReceiveResult => {
+    if (failure._tag === 'WorldWriteFailure' && failure.failure._tag === 'WorldWriteInvalidBatch'
+      && failure.failure.reason !== 'invalid-block-state') {
+      return options.parts.dieInvalidBlockBatch(failure.failure)
+    }
     const reason = failure._tag === 'WorldWriteFailure'
       ? failure.failure._tag === 'WorldWriteConflict' ? 'stale-revision'
         : failure.failure._tag === 'WorldWriteChunkUnavailable' ? 'out-of-bounds' : 'unknown-block'
@@ -5322,7 +5342,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         },
         commit: () => {
           if (plannedBlocks.size === 0) return Result.succeed(undefined)
-          const committed = commitBlockEdits([...plannedBlocks.values()], undo)
+          const committed = commitBlockEdits([...plannedBlocks.values()])
           if (Result.isFailure(committed)) return Result.fail(committed.failure)
           plannedBlocks.clear()
           const delta = committed.success
@@ -5606,8 +5626,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         if (Result.isFailure(reserved)) return failStep(reserved.failure)
       }
       const fallingCommit = fallingBlocksResult.success.commit()
-      if (Result.isFailure(fallingCommit)) return failStep(fallingCommit.failure)
-      if (fallingCommit.success !== undefined) {
+      if (Result.isFailure(fallingCommit)) {
+        if (fallingCommit.failure._tag !== 'WorldWriteFailure') return failStep(fallingCommit.failure)
+        fallingBlocksResult.success.discard()
+        console.error('Multiplayer falling block batch discarded', { worldId, failure: fallingCommit.failure.failure })
+      } else if (fallingCommit.success !== undefined) {
         Result.getOrThrow(advanceRevision())
         stateChanged = true
         const delta = fallingCommit.success
@@ -5655,456 +5678,470 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       if (Result.isFailure(reserved)) return failStep(reserved.failure)
     }
     if (entityStepRuns) {
-      const stepUndo = beginStepUndo()
-      const failEntityStep = (failure: MultiplayerServerCoreFailure): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
-        stepUndo.undo()
-        return failStep(failure)
-      }
-      const movedEntities: AuthoritativeDelta[] = []
-      const damagedPlayers = new Set<PlayerId>()
-      const deadPlayers = new Set<PlayerId>()
-      let worldChanged = false
-      const movingMobs: MovingMob[] = []
-      for (const [key, recovery] of eyeOfEnderRecoveries) {
-        const remainingSecs = recovery.remainingSecs - elapsedSecs
-        if (remainingSecs > 0) {
-          // The update keeps the stored recovery position, which writePositions or load validation admitted.
-          Result.getOrThrow(writePositions([{ _tag: 'eye-of-ender-recovery', recovery: { ...recovery, remainingSecs } }]))
-          worldChanged = true
-          continue
+      const runEntityStep = (discardExplosions: boolean): Result.Result<void, MultiplayerServerCoreFailure> => {
+        const refusalCount = refusals.length
+        const stepUndo = beginStepUndo()
+        const failEntityStep = (failure: MultiplayerServerCoreFailure): Result.Result<void, MultiplayerServerCoreFailure> => {
+          stepUndo.undo()
+          refusals.length = refusalCount
+          return Result.fail(failure)
         }
-        const drop: AuthoritativeEntityState = {
-          _tag: 'item-drop',
-          entityId: recovery.entityId,
-          at: recovery.at,
-          stack: { item: 'eye_of_ender', count: 1 },
-        }
-        // The drop copies the stored recovery position, which writePositions or load validation admitted.
-        Result.getOrThrow(writePositions([{ _tag: 'entity', entity: drop }]))
-        eyeOfEnderRecoveries.delete(key)
-        movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
-        worldChanged = true
-      }
-      const applyExplosion = (
-        center: Readonly<{ x: number; y: number; z: number }>,
-        explosion: Explosion,
-      ): Result.Result<void, MultiplayerServerCoreFailure> => {
-        // The centre is a stored entity position, which writePositions or load validation kept in an addressable
-        // cell, so each axis is finite.
-        const centerPosition = Result.getOrThrow(positionFromNumbers(center.x, center.y, center.z))
-        let blockReadFailure: MultiplayerServerCoreFailure | undefined
-        const blockReader = (position: BlockPos) => {
-          if (!isInBounds(position) || !world.isLoaded(position)) return undefined
-          const block = blockAt(position)
-          if (Result.isFailure(block)) {
-            blockReadFailure ??= block.failure
-            return undefined
-          }
-          return block.success === null ? { resistance: 0, destructible: false } : {
-            resistance: 1,
-            destructible: block.success !== 'bedrock',
-          }
-        }
-        const planResult = planExplosion({
-          center: centerPosition,
-          radius: explosion.power,
-          seed: revision,
-          blocks: blockReader,
-          entities: [],
-        })
-        if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
-        if (Result.isFailure(planResult)) {
-          return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
-        }
-        const plan = planResult.success
-        const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
-        for (const [player, presence] of players) {
-          if (presence.world !== worldId) continue
-          const playerVitals = vitals.get(player)
-          if (playerVitals === undefined) continue
-          const distance = Math.hypot(
-            presence.at.x - center.x,
-            presence.at.y + 0.9 - center.y,
-            presence.at.z - center.z,
-          )
-          // The power is a TNT, creeper, or wither constant. The centre and the player are stored positions, which
-          // writePositions or load validation kept in addressable cells, so the distance is finite.
-          const damage = Result.getOrThrow(explosionDamageAt(explosion, distance))
-          if (damage.amount > 0) damageSteps.push({ player, playerVitals, amount: damage.amount })
-        }
-        // Explosion resolution always needs a snapshot, including an empty crater.
-        worldChanged = true
-        for (const position of plan.destroyedBlocks) stepUndo.destroyBlock(position)
-        for (const { player, playerVitals, amount } of damageSteps) {
-          const wasAlive = playerVitals.health > 0
-          playerVitals.health = Math.max(0, playerVitals.health - amount)
-          damagedPlayers.add(player)
-          if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
-        }
-        return Result.succeed(undefined)
-      }
-      for (const entity of entities.values()) {
-        if (entity._tag === 'arrow') {
-          const ageTicks = entity.ageTicks + elapsedTicks
-          const at = {
-            x: entity.at.x + entity.velocity.x * elapsedSecs,
-            y: entity.at.y + entity.velocity.y * elapsedSecs,
-            z: entity.at.z + entity.velocity.z * elapsedSecs,
-          }
-          const velocity = { ...entity.velocity, y: entity.velocity.y - ARROW_GRAVITY * elapsedSecs }
-          // The flight is written before the raycast, which then only reads cells between two admitted positions.
-          // A hit below despawns the arrow, so the early write never reaches a client.
-          const updated = { ...entity, at, velocity, ageTicks }
-          const flown = writePositions([{ _tag: 'entity', entity: updated }])
-          if (Result.isFailure(flown)) {
-            // Keeping the arrow would retry the same flight every tick, so it is despawned.
-            refuse(flown.failure, entity._tag, 'removed')
-            entities.delete(entity.entityId)
-            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+        const movedEntities: AuthoritativeDelta[] = []
+        const damagedPlayers = new Set<PlayerId>()
+        const deadPlayers = new Set<PlayerId>()
+        let worldChanged = false
+        const movingMobs: MovingMob[] = []
+        for (const [key, recovery] of eyeOfEnderRecoveries) {
+          const remainingSecs = recovery.remainingSecs - elapsedSecs
+          if (remainingSecs > 0) {
+            // The update keeps the stored recovery position, which writePositions or load validation admitted.
+            Result.getOrThrow(writePositions([{ _tag: 'eye-of-ender-recovery', recovery: { ...recovery, remainingSecs } }]))
+            worldChanged = true
             continue
           }
-          const travel = {
-            x: at.x - entity.at.x,
-            y: at.y - entity.at.y,
-            z: at.z - entity.at.z,
+          const drop: AuthoritativeEntityState = {
+            _tag: 'item-drop',
+            entityId: recovery.entityId,
+            at: recovery.at,
+            stack: { item: 'eye_of_ender', count: 1 },
           }
-          // Both ends passed writePositions or load validation, so they lie in addressable cells and are finite.
-          const fromPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
-          const toPosition = Result.getOrThrow(positionFromNumbers(at.x, at.y, at.z))
+          // The drop copies the stored recovery position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: drop }]))
+          eyeOfEnderRecoveries.delete(key)
+          movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
+          worldChanged = true
+        }
+        const applyExplosion = (
+          center: Readonly<{ x: number; y: number; z: number }>,
+          explosion: Explosion,
+        ): Result.Result<void, MultiplayerServerCoreFailure> => {
+          if (discardExplosions) return Result.succeed(undefined)
+          // The centre is a stored entity position, which writePositions or load validation kept in an addressable
+          // cell, so each axis is finite.
+          const centerPosition = Result.getOrThrow(positionFromNumbers(center.x, center.y, center.z))
           let blockReadFailure: MultiplayerServerCoreFailure | undefined
-          const blockImpactResult = raycastArrowBlock(fromPosition, toPosition, (x, y, z) => {
-            const position: BlockPos = { x, y, z }
-            if (!isInBounds(position)) return true
+          const blockReader = (position: BlockPos) => {
+            if (!isInBounds(position) || !world.isLoaded(position)) return undefined
             const block = blockAt(position)
             if (Result.isFailure(block)) {
               blockReadFailure ??= block.failure
-              return true
+              return undefined
             }
-            return block.success !== null && options.passableBlocks?.has(block.success) !== true
+            return block.success === null ? { resistance: 0, destructible: false } : {
+              resistance: 1,
+              destructible: block.success !== 'bedrock',
+            }
+          }
+          const planResult = planExplosion({
+            center: centerPosition,
+            radius: explosion.power,
+            seed: revision,
+            blocks: blockReader,
+            entities: [],
           })
-          if (blockReadFailure !== undefined) return failEntityStep(blockReadFailure)
-          if (Result.isFailure(blockImpactResult)) {
-            return failEntityStep({ _tag: 'ArrowRaycastFailure', failure: blockImpactResult.failure })
+          if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
+          if (Result.isFailure(planResult)) {
+            return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
           }
-          const blockImpact = blockImpactResult.success
-          const travelDistance = Math.hypot(travel.x, travel.y, travel.z)
-          const blockProjection = Option.isNone(blockImpact) ? undefined : blockImpact.value.distance / travelDistance
-          const blockWasHit = Option.isSome(blockImpact)
-          const livingHits: Array<Readonly<{
-            candidate: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
-            projection: number
-          }>> = []
-          for (const candidate of entities.values()) {
-            if (candidate._tag !== 'living') continue
-            // A stored entity position is finite, and adding 0.9 to it stays finite.
-            const targetPosition = Result.getOrThrow(positionFromNumbers(candidate.at.x, candidate.at.y + 0.9, candidate.at.z))
-            const projection = arrowHitProjection(fromPosition, toPosition, targetPosition)
-            if (projection !== undefined) livingHits.push({ candidate, projection })
-          }
-          livingHits.sort((left, right) => left.projection - right.projection)
-          const livingHit = livingHits[0]
-          const playerHits: Array<Readonly<{ player: PlayerId; projection: number }>> = []
+          const plan = planResult.success
+          const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
           for (const [player, presence] of players) {
-            if (player === entity.owner || presence.world !== worldId || (vitals.get(player)?.health ?? 0) <= 0) continue
-            // A stored player position is finite, and adding 0.9 to it stays finite.
-            const targetPosition = Result.getOrThrow(positionFromNumbers(presence.at.x, presence.at.y + 0.9, presence.at.z))
-            const projection = arrowHitProjection(fromPosition, toPosition, targetPosition)
-            if (projection !== undefined) playerHits.push({ player, projection })
+            if (presence.world !== worldId) continue
+            const playerVitals = vitals.get(player)
+            if (playerVitals === undefined) continue
+            const distance = Math.hypot(
+              presence.at.x - center.x,
+              presence.at.y + 0.9 - center.y,
+              presence.at.z - center.z,
+            )
+            // The power is a TNT, creeper, or wither constant. The centre and the player are stored positions, which
+            // writePositions or load validation kept in addressable cells, so the distance is finite.
+            const damage = Result.getOrThrow(explosionDamageAt(explosion, distance))
+            if (damage.amount > 0) damageSteps.push({ player, playerVitals, amount: damage.amount })
           }
-          playerHits.sort((left, right) => left.projection - right.projection)
-          const playerHit = playerHits[0]
-          const livingWasHit = livingHit !== undefined
-            && (blockProjection === undefined || livingHit.projection < blockProjection)
-          const playerWasHit = playerHit !== undefined
-            && (blockProjection === undefined || playerHit.projection < blockProjection)
-            && (livingHit === undefined || playerHit.projection < livingHit.projection)
-          let livingHitExperienceReward = 0
-          let livingHitDrops: ReadonlyArray<AuthoritativeEntityState> = []
-          if (!playerWasHit && livingWasHit && livingHit !== undefined && livingHit.candidate.health <= entity.damage) {
-            const kind = supportedMobKind(livingHit.candidate.entityType)
-            if (kind !== undefined) {
-              livingHitExperienceReward = mobXpReward(
-                { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
-                mobExperienceReward(kind),
-              )
-              livingHitDrops = mobLoot(
-                kind,
-                (index) => `${String(options.seed)}:${String(entity.owner)}:${String(entity.entityId)}:${String(livingHit.candidate.entityId)}:${String(index)}`,
-              ).map((stack, index): AuthoritativeEntityState => ({
-                _tag: 'item-drop',
-                entityId: `${livingHit.candidate.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-                at: livingHit.candidate.at,
-                stack,
-              }))
-            }
+          // Explosion resolution always needs a snapshot, including an empty crater.
+          worldChanged = true
+          for (const position of plan.destroyedBlocks) stepUndo.destroyBlock(position)
+          for (const { player, playerVitals, amount } of damageSteps) {
+            const wasAlive = playerVitals.health > 0
+            playerVitals.health = Math.max(0, playerVitals.health - amount)
+            damagedPlayers.add(player)
+            if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
           }
-          if (ageTicks >= ARROW_LIFESPAN_TICKS || blockWasHit || livingWasHit || playerWasHit) {
-            entities.delete(entity.entityId)
-            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
-            if (Option.isSome(blockImpact) && !livingWasHit && !playerWasHit) {
-              const drop: AuthoritativeEntityState = {
-                _tag: 'item-drop',
-                entityId: `${entity.entityId}:pickup:${String(revision + 1)}` as AuthoritativeEntityState['entityId'],
-                at: blockImpact.value.point,
-                stack: { item: 'arrow', count: 1 },
-              }
-              const dropped = writePositions([{ _tag: 'entity', entity: drop }])
-              if (Result.isFailure(dropped)) refuse(dropped.failure, drop._tag, 'skipped')
-              else movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
+          return Result.succeed(undefined)
+        }
+        for (const entity of entities.values()) {
+          if (entity._tag === 'arrow') {
+            const ageTicks = entity.ageTicks + elapsedTicks
+            const at = {
+              x: entity.at.x + entity.velocity.x * elapsedSecs,
+              y: entity.at.y + entity.velocity.y * elapsedSecs,
+              z: entity.at.z + entity.velocity.z * elapsedSecs,
             }
-            if (playerWasHit) {
-              const playerVitals = vitals.get(playerHit.player)
-              if (playerVitals !== undefined) {
-                const wasAlive = playerVitals.health > 0
-                playerVitals.health = Math.max(0, playerVitals.health - entity.damage)
-                damagedPlayers.add(playerHit.player)
-                if (wasAlive && playerVitals.health <= 0) deadPlayers.add(playerHit.player)
+            const velocity = { ...entity.velocity, y: entity.velocity.y - ARROW_GRAVITY * elapsedSecs }
+            // The flight is written before the raycast, which then only reads cells between two admitted positions.
+            // A hit below despawns the arrow, so the early write never reaches a client.
+            const updated = { ...entity, at, velocity, ageTicks }
+            const flown = writePositions([{ _tag: 'entity', entity: updated }])
+            if (Result.isFailure(flown)) {
+              // Keeping the arrow would retry the same flight every tick, so it is despawned.
+              refuse(flown.failure, entity._tag, 'removed')
+              entities.delete(entity.entityId)
+              movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+              continue
+            }
+            const travel = {
+              x: at.x - entity.at.x,
+              y: at.y - entity.at.y,
+              z: at.z - entity.at.z,
+            }
+            // Both ends passed writePositions or load validation, so they lie in addressable cells and are finite.
+            const fromPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
+            const toPosition = Result.getOrThrow(positionFromNumbers(at.x, at.y, at.z))
+            let blockReadFailure: MultiplayerServerCoreFailure | undefined
+            const blockImpactResult = raycastArrowBlock(fromPosition, toPosition, (x, y, z) => {
+              const position: BlockPos = { x, y, z }
+              if (!isInBounds(position)) return true
+              const block = blockAt(position)
+              if (Result.isFailure(block)) {
+                blockReadFailure ??= block.failure
+                return true
               }
-            } else if (livingWasHit && livingHit !== undefined) {
-              const hit = livingHit.candidate
-              const health = hit.health - entity.damage
-              if (health > 0) {
-                const updated = { ...hit, health }
-                // The update keeps the stored entity position, which writePositions or load validation admitted.
-                Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
-                movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-              } else {
-                entities.delete(hit.entityId)
-                movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: hit.entityId })
-                if (entity.owner !== null) {
-                  const ownerVitals = vitals.get(entity.owner)
-                  const owner = players.get(entity.owner)
-                  if (livingHitExperienceReward > 0 && ownerVitals !== undefined) {
-                    ownerVitals.experience += livingHitExperienceReward
-                    if (owner !== undefined) movedEntities.push({
-                      _tag: 'PlayerVitalsDelta', world: owner.world, revision: 0, player: entity.owner, state: vitalsSnapshot(ownerVitals),
-                    })
+              return block.success !== null && options.passableBlocks?.has(block.success) !== true
+            })
+            if (blockReadFailure !== undefined) return failEntityStep(blockReadFailure)
+            if (Result.isFailure(blockImpactResult)) {
+              return failEntityStep({ _tag: 'ArrowRaycastFailure', failure: blockImpactResult.failure })
+            }
+            const blockImpact = blockImpactResult.success
+            const travelDistance = Math.hypot(travel.x, travel.y, travel.z)
+            const blockProjection = Option.isNone(blockImpact) ? undefined : blockImpact.value.distance / travelDistance
+            const blockWasHit = Option.isSome(blockImpact)
+            const livingHits: Array<Readonly<{
+              candidate: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
+              projection: number
+            }>> = []
+            for (const candidate of entities.values()) {
+              if (candidate._tag !== 'living') continue
+              // A stored entity position is finite, and adding 0.9 to it stays finite.
+              const targetPosition = Result.getOrThrow(positionFromNumbers(candidate.at.x, candidate.at.y + 0.9, candidate.at.z))
+              const projection = arrowHitProjection(fromPosition, toPosition, targetPosition)
+              if (projection !== undefined) livingHits.push({ candidate, projection })
+            }
+            livingHits.sort((left, right) => left.projection - right.projection)
+            const livingHit = livingHits[0]
+            const playerHits: Array<Readonly<{ player: PlayerId; projection: number }>> = []
+            for (const [player, presence] of players) {
+              if (player === entity.owner || presence.world !== worldId || (vitals.get(player)?.health ?? 0) <= 0) continue
+              // A stored player position is finite, and adding 0.9 to it stays finite.
+              const targetPosition = Result.getOrThrow(positionFromNumbers(presence.at.x, presence.at.y + 0.9, presence.at.z))
+              const projection = arrowHitProjection(fromPosition, toPosition, targetPosition)
+              if (projection !== undefined) playerHits.push({ player, projection })
+            }
+            playerHits.sort((left, right) => left.projection - right.projection)
+            const playerHit = playerHits[0]
+            const livingWasHit = livingHit !== undefined
+              && (blockProjection === undefined || livingHit.projection < blockProjection)
+            const playerWasHit = playerHit !== undefined
+              && (blockProjection === undefined || playerHit.projection < blockProjection)
+              && (livingHit === undefined || playerHit.projection < livingHit.projection)
+            let livingHitExperienceReward = 0
+            let livingHitDrops: ReadonlyArray<AuthoritativeEntityState> = []
+            if (!playerWasHit && livingWasHit && livingHit !== undefined && livingHit.candidate.health <= entity.damage) {
+              const kind = supportedMobKind(livingHit.candidate.entityType)
+              if (kind !== undefined) {
+                livingHitExperienceReward = mobXpReward(
+                  { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
+                  mobExperienceReward(kind),
+                )
+                livingHitDrops = mobLoot(
+                  kind,
+                  (index) => `${String(options.seed)}:${String(entity.owner)}:${String(entity.entityId)}:${String(livingHit.candidate.entityId)}:${String(index)}`,
+                ).map((stack, index): AuthoritativeEntityState => ({
+                  _tag: 'item-drop',
+                  entityId: `${livingHit.candidate.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+                  at: livingHit.candidate.at,
+                  stack,
+                }))
+              }
+            }
+            if (ageTicks >= ARROW_LIFESPAN_TICKS || blockWasHit || livingWasHit || playerWasHit) {
+              entities.delete(entity.entityId)
+              movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+              if (Option.isSome(blockImpact) && !livingWasHit && !playerWasHit) {
+                const drop: AuthoritativeEntityState = {
+                  _tag: 'item-drop',
+                  entityId: `${entity.entityId}:pickup:${String(revision + 1)}` as AuthoritativeEntityState['entityId'],
+                  at: blockImpact.value.point,
+                  stack: { item: 'arrow', count: 1 },
+                }
+                const dropped = writePositions([{ _tag: 'entity', entity: drop }])
+                if (Result.isFailure(dropped)) refuse(dropped.failure, drop._tag, 'skipped')
+                else movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
+              }
+              if (playerWasHit) {
+                const playerVitals = vitals.get(playerHit.player)
+                if (playerVitals !== undefined) {
+                  const wasAlive = playerVitals.health > 0
+                  playerVitals.health = Math.max(0, playerVitals.health - entity.damage)
+                  damagedPlayers.add(playerHit.player)
+                  if (wasAlive && playerVitals.health <= 0) deadPlayers.add(playerHit.player)
+                }
+              } else if (livingWasHit && livingHit !== undefined) {
+                const hit = livingHit.candidate
+                const health = hit.health - entity.damage
+                if (health > 0) {
+                  const updated = { ...hit, health }
+                  // The update keeps the stored entity position, which writePositions or load validation admitted.
+                  Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
+                  movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
+                } else {
+                  entities.delete(hit.entityId)
+                  movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: hit.entityId })
+                  if (entity.owner !== null) {
+                    const ownerVitals = vitals.get(entity.owner)
+                    const owner = players.get(entity.owner)
+                    if (livingHitExperienceReward > 0 && ownerVitals !== undefined) {
+                      ownerVitals.experience += livingHitExperienceReward
+                      if (owner !== undefined) movedEntities.push({
+                        _tag: 'PlayerVitalsDelta', world: owner.world, revision: 0, player: entity.owner, state: vitalsSnapshot(ownerVitals),
+                      })
+                    }
+                  }
+                  // Each drop copies the slain entity's stored position, which writePositions or load validation admitted.
+                  Result.getOrThrow(writePositions(livingHitDrops.map((drop) => ({ _tag: 'entity', entity: drop }))))
+                  for (const drop of livingHitDrops) {
+                    movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
                   }
                 }
-                // Each drop copies the slain entity's stored position, which writePositions or load validation admitted.
-                Result.getOrThrow(writePositions(livingHitDrops.map((drop) => ({ _tag: 'entity', entity: drop }))))
-                for (const drop of livingHitDrops) {
-                  movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
-                }
               }
+              continue
             }
+            movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
             continue
           }
-          movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-          continue
-        }
-        if (entity._tag === 'primed-tnt') {
-          const burnedSecs = entity.burnedSecs + elapsedSecs
-          if (burnedSecs >= PRIMED_TNT_FUSE_SECS) {
-            const explosionResult = applyExplosion(entity.at, { source: 'tnt', power: TNT_EXPLOSION_POWER })
-            if (Result.isFailure(explosionResult)) return failEntityStep(explosionResult.failure)
-            entities.delete(entity.entityId)
-            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+          if (entity._tag === 'primed-tnt') {
+            const burnedSecs = entity.burnedSecs + elapsedSecs
+            if (burnedSecs >= PRIMED_TNT_FUSE_SECS) {
+              const explosionResult = applyExplosion(entity.at, { source: 'tnt', power: TNT_EXPLOSION_POWER })
+              if (Result.isFailure(explosionResult)) return failEntityStep(explosionResult.failure)
+              entities.delete(entity.entityId)
+              movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+              continue
+            }
+            const updated = { ...entity, burnedSecs }
+            // The update keeps the stored entity position, which writePositions or load validation admitted.
+            Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
+            movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
             continue
           }
-          const updated = { ...entity, burnedSecs }
-          // The update keeps the stored entity position, which writePositions or load validation admitted.
-          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
-          movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-          continue
-        }
-        if (entity._tag !== 'living') continue
-        const targetEntry = [...players.entries()]
-          .filter(([player, presence]) => presence.world === worldId && (vitals.get(player)?.health ?? 0) > 0)
-          .map(([player, presence]) => [player, presence, Math.hypot(
-            presence.at.x - entity.at.x,
-            presence.at.y - entity.at.y,
-            presence.at.z - entity.at.z,
-          )] as const)
-          .sort((left, right) => left[2] - right[2])[0]
-        const initialMobState = mobWireState(entity.mobState)
-        const hostileMobState = isAuthoritativeHostileMob(entity.entityType)
-          ? { ...initialMobState, ageTicks: (initialMobState.ageTicks ?? 0) + elapsedTicks }
-          : initialMobState
-        if (isAuthoritativeHostileMob(entity.entityType)) {
-          // mobWireState validated every field and the roll is in [0, 1). The distance is finite because every
-          // stored entity and player position passed writePositions or load validation, so each lies in an
-          // addressable cell.
-          const verdict = Result.getOrThrow(despawnVerdict({
-            distanceToPlayerBlocks: targetEntry?.[2],
-            persistent: hostileMobState.persistent === true,
-            ...(hostileMobState.named === undefined ? {} : { named: hostileMobState.named }),
-            ...(hostileMobState.tamed === undefined ? {} : { tamed: hostileMobState.tamed }),
-            ...(hostileMobState.ageTicks === undefined ? {} : { ageTicks: hostileMobState.ageTicks }),
-            randomRoll: deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:despawn:${String(hostileMobState.ageTicks)}`),
-            difficulty: options.difficulty ?? 'normal',
-          }))
-          if (verdict._tag === 'Despawn') {
-            entities.delete(entity.entityId)
-            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+          if (entity._tag !== 'living') continue
+          const targetEntry = [...players.entries()]
+            .filter(([player, presence]) => presence.world === worldId && (vitals.get(player)?.health ?? 0) > 0)
+            .map(([player, presence]) => [player, presence, Math.hypot(
+              presence.at.x - entity.at.x,
+              presence.at.y - entity.at.y,
+              presence.at.z - entity.at.z,
+            )] as const)
+            .sort((left, right) => left[2] - right[2])[0]
+          const initialMobState = mobWireState(entity.mobState)
+          const hostileMobState = isAuthoritativeHostileMob(entity.entityType)
+            ? { ...initialMobState, ageTicks: (initialMobState.ageTicks ?? 0) + elapsedTicks }
+            : initialMobState
+          if (isAuthoritativeHostileMob(entity.entityType)) {
+            // mobWireState validated every field and the roll is in [0, 1). The distance is finite because every
+            // stored entity and player position passed writePositions or load validation, so each lies in an
+            // addressable cell.
+            const verdict = Result.getOrThrow(despawnVerdict({
+              distanceToPlayerBlocks: targetEntry?.[2],
+              persistent: hostileMobState.persistent === true,
+              ...(hostileMobState.named === undefined ? {} : { named: hostileMobState.named }),
+              ...(hostileMobState.tamed === undefined ? {} : { tamed: hostileMobState.tamed }),
+              ...(hostileMobState.ageTicks === undefined ? {} : { ageTicks: hostileMobState.ageTicks }),
+              randomRoll: deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:despawn:${String(hostileMobState.ageTicks)}`),
+              difficulty: options.difficulty ?? 'normal',
+            }))
+            if (verdict._tag === 'Despawn') {
+              entities.delete(entity.entityId)
+              movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+              continue
+            }
+          }
+          if (entity.entityType === CREEPER_KIND) {
+            const step = stepCreeperFuse(
+              creeperFuseForSimulation(hostileMobState),
+              {
+                distanceToTargetBlocks: targetEntry?.[2],
+                charged: hostileMobState.charged === true,
+              },
+              creeperDeltaTime(elapsedSecs),
+            )
+            if (step.explosion !== undefined) {
+              const explosionResult = applyExplosion(entity.at, step.explosion)
+              if (Result.isFailure(explosionResult)) return failEntityStep(explosionResult.failure)
+              entities.delete(entity.entityId)
+              movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+              continue
+            }
+            const mobState = creeperWireState(step.fuse, hostileMobState)
+            const updated = { ...entity, mobState }
+            // The update keeps the stored entity position, which writePositions or load validation admitted.
+            Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
+            movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
             continue
           }
-        }
-        if (entity.entityType === CREEPER_KIND) {
-          const step = stepCreeperFuse(
-            creeperFuseForSimulation(hostileMobState),
-            {
-              distanceToTargetBlocks: targetEntry?.[2],
-              charged: hostileMobState.charged === true,
-            },
-            creeperDeltaTime(elapsedSecs),
-          )
-          if (step.explosion !== undefined) {
-            const explosionResult = applyExplosion(entity.at, step.explosion)
-            if (Result.isFailure(explosionResult)) return failEntityStep(explosionResult.failure)
-            entities.delete(entity.entityId)
-            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
-            continue
-          }
-          const mobState = creeperWireState(step.fuse, hostileMobState)
-          const updated = { ...entity, mobState }
-          // The update keeps the stored entity position, which writePositions or load validation admitted.
-          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
-          movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-          continue
-        }
-        if (entity.entityType === ENDERMAN_KIND) {
-          const mobState = hostileMobState
-          const urge = endermanTeleportUrge({
-            damagedThisStep: mobState.provoked,
-            stuckTicks: mobState.motionPhase,
-            roll: deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:enderman:urge`),
-          })
-          let at = entity.at
-          if (urge._tag === 'Teleport') {
-            const anchor = urge.anchor === 'self' ? entity.at : targetEntry?.[1].at
-            if (anchor !== undefined) {
-              const rolls = Array.from(
-                { length: ENDERMAN_TELEPORT_ATTEMPTS * 2 },
-                (_, index) => deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:enderman:teleport:${String(index)}`),
-              )
-              // The candidate positions must come from mx-gameplay's own
-              // `endermanTeleportCandidateCells`, not a hand-rolled offset loop here:
-              // `resolveSafeEndermanTeleport` derives its own candidates from `anchor`
-              // and `rolls` internally, and a cell array built from different positions
-              // never matches what it looks up, so every candidate reads as unloaded and
-              // the teleport is always refused.
-              let blockReadFailure: MultiplayerServerCoreFailure | undefined
-              // A candidate outside addressable cells has no block to read, so it is left out like one out of bounds.
-              const cells: EndermanTeleportCell[] = endermanTeleportCandidateCells(entity.at, anchor, rolls)
-                .filter((position) => isInAddressableCell(position) && isInBounds({
-                  x: Math.floor(position.x),
-                  y: Math.floor(position.y),
-                  z: Math.floor(position.z),
-                }))
-                .map((position) => {
-                  const blockPosition = {
+          if (entity.entityType === ENDERMAN_KIND) {
+            const mobState = hostileMobState
+            const urge = endermanTeleportUrge({
+              damagedThisStep: mobState.provoked,
+              stuckTicks: mobState.motionPhase,
+              roll: deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:enderman:urge`),
+            })
+            let at = entity.at
+            if (urge._tag === 'Teleport') {
+              const anchor = urge.anchor === 'self' ? entity.at : targetEntry?.[1].at
+              if (anchor !== undefined) {
+                const rolls = Array.from(
+                  { length: ENDERMAN_TELEPORT_ATTEMPTS * 2 },
+                  (_, index) => deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:enderman:teleport:${String(index)}`),
+                )
+                // The candidate positions must come from mx-gameplay's own
+                // `endermanTeleportCandidateCells`, not a hand-rolled offset loop here:
+                // `resolveSafeEndermanTeleport` derives its own candidates from `anchor`
+                // and `rolls` internally, and a cell array built from different positions
+                // never matches what it looks up, so every candidate reads as unloaded and
+                // the teleport is always refused.
+                let blockReadFailure: MultiplayerServerCoreFailure | undefined
+                // A candidate outside addressable cells has no block to read, so it is left out like one out of bounds.
+                const cells: EndermanTeleportCell[] = endermanTeleportCandidateCells(entity.at, anchor, rolls)
+                  .filter((position) => isInAddressableCell(position) && isInBounds({
                     x: Math.floor(position.x),
                     y: Math.floor(position.y),
                     z: Math.floor(position.z),
-                  }
-                  const block = blockAt(blockPosition)
-                  if (Result.isFailure(block)) {
-                    blockReadFailure ??= block.failure
-                    return { position, block: 'air', solid: true }
-                  }
-                  return {
-                    position,
-                    block: block.success ?? 'air',
-                    solid: block.success !== null && options.passableBlocks?.has(block.success) !== true,
-                  }
-                })
-              if (blockReadFailure !== undefined) return failEntityStep(blockReadFailure)
-              at = resolveSafeEndermanTeleport(entity.at, anchor, rolls, cells)
+                  }))
+                  .map((position) => {
+                    const blockPosition = {
+                      x: Math.floor(position.x),
+                      y: Math.floor(position.y),
+                      z: Math.floor(position.z),
+                    }
+                    const block = blockAt(blockPosition)
+                    if (Result.isFailure(block)) {
+                      blockReadFailure ??= block.failure
+                      return { position, block: 'air', solid: true }
+                    }
+                    return {
+                      position,
+                      block: block.success ?? 'air',
+                      solid: block.success !== null && options.passableBlocks?.has(block.success) !== true,
+                    }
+                  })
+                if (blockReadFailure !== undefined) return failEntityStep(blockReadFailure)
+                at = resolveSafeEndermanTeleport(entity.at, anchor, rolls, cells)
+              }
             }
-          }
-          const updated = { ...entity, at, mobState: { ...mobState, provoked: false } }
-          const teleported = writePositions([{ _tag: 'entity', entity: updated }])
-          if (Result.isFailure(teleported)) {
-            refuse(teleported.failure, entity.entityType, 'kept')
+            const updated = { ...entity, at, mobState: { ...mobState, provoked: false } }
+            const teleported = writePositions([{ _tag: 'entity', entity: updated }])
+            if (Result.isFailure(teleported)) {
+              refuse(teleported.failure, entity.entityType, 'kept')
+              continue
+            }
+            movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
             continue
           }
+          const passiveKind = supportedPassiveMobKind(entity.entityType)
+          const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
+          // Only supported kinds are repaired below; load and spawn validation skip the others, so they are left as they are.
+          if (passiveKind === undefined && hostileKind === undefined) continue
+          // validateEcosystemMobStates checked loaded and spawned mobs of supported kinds, and the tick only writes
+          // mx-gameplay results back.
+          const state = Result.getOrThrow(ecosystemMobStateForSimulation(entity.mobState)) ?? initialEcosystemMobState()
+          // The mob and its target player are stored positions, which writePositions or load validation kept in
+          // addressable cells, so each axis is finite.
+          const selfPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
+          const movement = mobMovements.get(entity.entityId)
+          const ecosystem = movement === undefined ? state : { ...state, movement }
+          // Every ecosystem mob, passive ones included, gets its nearest living player, as mx-gameplay's entities stage
+          // hands each mob the player; mx-gameplay's rules decide whether that player is close enough to flee or chase.
+          const target = targetEntry === undefined
+            ? undefined
+            : { player: targetEntry[0], at: Result.getOrThrow(positionFromNumbers(targetEntry[1].at.x, targetEntry[1].at.y, targetEntry[1].at.z)) }
+          if (passiveKind !== undefined) {
+            movingMobs.push({ entity, kind: passiveKind, mobState: initialMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
+            continue
+          }
+          if (hostileKind === undefined) continue
+          movingMobs.push({ entity, kind: hostileKind, mobState: hostileMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
+        }
+        // Ecosystem mobs move as one roster after the loop: mx-gameplay plans the whole roster once per game tick.
+        const plannedMobs = planMobs(movingMobs, elapsedTicks)
+        if (Result.isFailure(plannedMobs)) return failEntityStep(plannedMobs.failure)
+        for (const { entity, mobState, ecosystem, feet, target, attackDamages } of plannedMobs.success) {
+          const at = {
+            ...feet,
+            x: Math.min(bounds.maxX, Math.max(bounds.minX, feet.x)),
+            z: Math.min(bounds.maxZ, Math.max(bounds.minZ, feet.z)),
+          }
+          const updated = {
+            ...entity,
+            at,
+            mobState: {
+              ...mobState,
+              attackCooldownSecs: ecosystem.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
+              motionPhase: ecosystem.motionPhase,
+              provoked: ecosystem.provoked,
+            },
+          }
+          const walked = writePositions([{ _tag: 'entity', entity: updated }])
+          if (Result.isFailure(walked)) {
+            // A refused mob keeps its position and movement, and none of its attacks from this step apply.
+            refuse(walked.failure, entity.entityType, 'kept')
+            continue
+          }
+          if (ecosystem.movement === undefined) mobMovements.delete(entity.entityId)
+          else mobMovements.set(entity.entityId, ecosystem.movement)
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-          continue
-        }
-        const passiveKind = supportedPassiveMobKind(entity.entityType)
-        const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
-        // Only supported kinds are repaired below; load and spawn validation skip the others, so they are left as they are.
-        if (passiveKind === undefined && hostileKind === undefined) continue
-        // validateEcosystemMobStates checked loaded and spawned mobs of supported kinds, and the tick only writes
-        // mx-gameplay results back.
-        const state = Result.getOrThrow(ecosystemMobStateForSimulation(entity.mobState)) ?? initialEcosystemMobState()
-        // The mob and its target player are stored positions, which writePositions or load validation kept in
-        // addressable cells, so each axis is finite.
-        const selfPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
-        const movement = mobMovements.get(entity.entityId)
-        const ecosystem = movement === undefined ? state : { ...state, movement }
-        // Every ecosystem mob, passive ones included, gets its nearest living player, as mx-gameplay's entities stage
-        // hands each mob the player; mx-gameplay's rules decide whether that player is close enough to flee or chase.
-        const target = targetEntry === undefined
-          ? undefined
-          : { player: targetEntry[0], at: Result.getOrThrow(positionFromNumbers(targetEntry[1].at.x, targetEntry[1].at.y, targetEntry[1].at.z)) }
-        if (passiveKind !== undefined) {
-          movingMobs.push({ entity, kind: passiveKind, mobState: initialMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
-          continue
-        }
-        if (hostileKind === undefined) continue
-        movingMobs.push({ entity, kind: hostileKind, mobState: hostileMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
-      }
-      // Ecosystem mobs move as one roster after the loop: mx-gameplay plans the whole roster once per game tick.
-      const plannedMobs = planMobs(movingMobs, elapsedTicks)
-      if (Result.isFailure(plannedMobs)) return failEntityStep(plannedMobs.failure)
-      for (const { entity, mobState, ecosystem, feet, target, attackDamages } of plannedMobs.success) {
-        const at = {
-          ...feet,
-          x: Math.min(bounds.maxX, Math.max(bounds.minX, feet.x)),
-          z: Math.min(bounds.maxZ, Math.max(bounds.minZ, feet.z)),
-        }
-        const updated = {
-          ...entity,
-          at,
-          mobState: {
-            ...mobState,
-            attackCooldownSecs: ecosystem.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
-            motionPhase: ecosystem.motionPhase,
-            provoked: ecosystem.provoked,
-          },
-        }
-        const walked = writePositions([{ _tag: 'entity', entity: updated }])
-        if (Result.isFailure(walked)) {
-          // A refused mob keeps its position and movement, and none of its attacks from this step apply.
-          refuse(walked.failure, entity.entityType, 'kept')
-          continue
-        }
-        if (ecosystem.movement === undefined) mobMovements.delete(entity.entityId)
-        else mobMovements.set(entity.entityId, ecosystem.movement)
-        movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-        const playerVitals = target === undefined ? undefined : vitals.get(target.player)
-        if (target !== undefined && playerVitals !== undefined) {
-          for (const damage of attackDamages) {
-            const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - damage)
-            damagedPlayers.add(target.player)
-            if (wasAlive && playerVitals.health <= 0) deadPlayers.add(target.player)
+          const playerVitals = target === undefined ? undefined : vitals.get(target.player)
+          if (target !== undefined && playerVitals !== undefined) {
+            for (const damage of attackDamages) {
+              const wasAlive = playerVitals.health > 0
+              playerVitals.health = Math.max(0, playerVitals.health - damage)
+              damagedPlayers.add(target.player)
+              if (wasAlive && playerVitals.health <= 0) deadPlayers.add(target.player)
+            }
           }
         }
-      }
-      // A despawned or slain mob leaves no movement behind.
-      for (const id of mobMovements.keys()) if (!entities.has(id)) mobMovements.delete(id)
-      const blockCommit = stepUndo.commit()
-      if (Result.isFailure(blockCommit)) return failEntityStep(blockCommit.failure)
-      if (movedEntities.length > 0 || damagedPlayers.size > 0 || worldChanged) {
-        // revisionAfter(1) succeeded before this step changed anything, and nothing in it advances the revision.
-        Result.getOrThrow(advanceRevision())
-        stateChanged = true
-        postPersistenceDeltas.push(...movedEntities.map((delta) => ({ ...delta, revision })))
-        postPersistenceDeltas.push(...applyPlayerDeaths([...deadPlayers], revision))
-        if (worldChanged) worldSnapshotRequired = true
-        for (const player of damagedPlayers) {
-          const presence = players.get(player)
-          if (presence !== undefined) postPersistenceDeltas.push({
-            _tag: 'PlayerVitalsDelta',
-            world: presence.world,
-            revision,
-            player,
-            state: vitalsSnapshot(vitals.get(player) as MutableVitalsState),
-          })
+        // A despawned or slain mob leaves no movement behind.
+        for (const id of mobMovements.keys()) if (!entities.has(id)) mobMovements.delete(id)
+        const blockCommit = stepUndo.commit()
+        if (Result.isFailure(blockCommit)) return failEntityStep(blockCommit.failure)
+        if (movedEntities.length > 0 || damagedPlayers.size > 0 || worldChanged) {
+          // revisionAfter(1) succeeded before this step changed anything, and nothing in it advances the revision.
+          Result.getOrThrow(advanceRevision())
+          stateChanged = true
+          postPersistenceDeltas.push(...movedEntities.map((delta) => ({ ...delta, revision })))
+          postPersistenceDeltas.push(...applyPlayerDeaths([...deadPlayers], revision))
+          if (worldChanged) worldSnapshotRequired = true
+          for (const player of damagedPlayers) {
+            const presence = players.get(player)
+            if (presence !== undefined) postPersistenceDeltas.push({
+              _tag: 'PlayerVitalsDelta',
+              world: presence.world,
+              revision,
+              player,
+              state: vitalsSnapshot(vitals.get(player) as MutableVitalsState),
+            })
+          }
         }
+        return Result.succeed(undefined)
+      }
+      const first = runEntityStep(false)
+      if (Result.isFailure(first)) {
+        if (first.failure._tag !== 'WorldWriteFailure') return failStep(first.failure)
+        console.error('Multiplayer entity block batch discarded', { worldId, failure: first.failure.failure })
+        // Consume the blasts, but recompute unrelated motion and combat against the unchanged blocks.
+        const remaining = runEntityStep(true)
+        if (Result.isFailure(remaining)) return failStep(remaining.failure)
       }
     }
 
@@ -6137,176 +6174,190 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     }
 
     if (witherState.withers.length > 0 || witherState.skulls.length > 0) {
-      const previousSnapshot = snapshotWitherRuntime(witherState)
-      const dimensions = new Set([
-        ...witherState.withers.map((wither) => wither.dimension),
-        ...witherState.skulls.map((skull) => skull.dimension),
-      ])
-      let advanced = witherState
-      const damagedPlayers = new Set<PlayerId>()
-      const deadPlayers = new Set<PlayerId>()
-      let worldChanged = false
-      // Melee and explosions advance the revision once for this whole step, so that advance is checked before the
-      // first of them is applied. A later explosion's block read can still fail after melee or an earlier explosion
-      // applied, so a failure undoes the step's changes.
-      let revisionReserved = false
-      const stepUndo = beginStepUndo()
-      const failWitherStep = (failure: MultiplayerServerCoreFailure): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
-        stepUndo.undo()
-        return failStep(failure)
-      }
-      for (const dimension of dimensions) {
-        const dimensionWithers = advanced.withers.filter((wither) => wither.dimension === dimension)
-        const targetEntry = [...players.entries()]
-          .filter(([player, presence]) => presence.world === dimension && (vitals.get(player)?.health ?? 0) > 0)
-          .map(([player, presence]) => [player, presence, Math.min(...dimensionWithers.map((wither) => Math.hypot(
-            presence.at.x - wither.state.feetPosition.x,
-            presence.at.y - wither.state.feetPosition.y,
-            presence.at.z - wither.state.feetPosition.z,
-          )))] as const)
-          .filter((entry) => entry[2] <= WITHER_TARGET_RANGE)
-          .sort((left, right) => left[2] - right[2])[0]
-        const target = targetEntry?.[1].at ?? dimensionWithers[0]?.state.feetPosition ?? { x: 0, y: 64, z: 0 }
-        // mc-sim returns one dimension's melee, launches, and explosions summed over its withers, so a wither whose
-        // step leaves addressable cells is left out and the dimension is stepped again. The refused wither keeps its
-        // state, and none of its step's movement, regeneration, charge, launch, or melee applies.
-        const refusedWitherIds = new Set<string>()
-        const advanceDimension = (): Result.Result<WitherRuntimeAdvance, MultiplayerServerCoreFailure> => {
-          let skullBlockReadFailure: MultiplayerServerCoreFailure | undefined
-          const stepped = advanceWitherRuntime(
-            { ...advanced, withers: advanced.withers.filter((wither) => !refusedWitherIds.has(wither.id)) },
-            dimension,
-            target,
-            elapsedMs / 1_000,
-            (_skull, position) => {
-              // A cell outside addressable cells holds no block; the skull flies on and is refused below.
-              if (!isInAddressableCell(position)) return false
-              const block = blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) })
-              if (Result.isFailure(block)) {
-                skullBlockReadFailure ??= block.failure
-                return false
-              }
-              return block.success !== null
-            },
-          )
-          if (skullBlockReadFailure !== undefined) return Result.fail(skullBlockReadFailure)
-          if (Result.isFailure(stepped)) return Result.fail({ _tag: 'WitherRuntimeFailure', operation: 'advance', failure: stepped.failure })
-          return Result.succeed(stepped.success)
+      const runWitherStep = (discardExplosions: boolean): Result.Result<void, MultiplayerServerCoreFailure> => {
+        const previousSnapshot = snapshotWitherRuntime(witherState)
+        const dimensions = new Set([
+          ...witherState.withers.map((wither) => wither.dimension),
+          ...witherState.skulls.map((skull) => skull.dimension),
+        ])
+        let advanced = witherState
+        const damagedPlayers = new Set<PlayerId>()
+        const deadPlayers = new Set<PlayerId>()
+        let worldChanged = false
+        // Melee and explosions advance the revision once for this whole step, so that advance is checked before the
+        // first of them is applied. A later explosion's block read can still fail after melee or an earlier explosion
+        // applied, so a failure undoes the step's changes.
+        let revisionReserved = false
+        const refusalCount = refusals.length
+        const stepUndo = beginStepUndo()
+        const failWitherStep = (failure: MultiplayerServerCoreFailure): Result.Result<void, MultiplayerServerCoreFailure> => {
+          stepUndo.undo()
+          refusals.length = refusalCount
+          return Result.fail(failure)
         }
-        let advanceResult = advanceDimension()
-        // Each pass leaves out at least one more wither, so the passes end within the number of withers.
-        while (Result.isSuccess(advanceResult)) {
-          const outside = advanceResult.success.state.withers
-            .filter((wither) => wither.dimension === dimension)
-            .flatMap((wither) => {
-              const refused = firstOutsideAddressableCells(witherPositions(wither))
-              return refused === undefined ? [] : [refused]
-            })
-          if (outside.length === 0) break
-          for (const refused of outside) {
-            refuse(refused, 'wither', 'kept')
-            refusedWitherIds.add(refused.id)
-          }
-          advanceResult = advanceDimension()
-        }
-        if (Result.isFailure(advanceResult)) return failWitherStep(advanceResult.failure)
-        const steppedWithers = new Map(advanceResult.success.state.withers.map((wither) => [wither.id, wither]))
-        const hasEffects = advanceResult.success.explosions.length > 0
-          || (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined)
-        if (hasEffects && !revisionReserved) {
-          const reserved = revisionAfter(1)
-          if (Result.isFailure(reserved)) return failWitherStep(reserved.failure)
-          revisionReserved = true
-        }
-        advanced = {
-          ...advanceResult.success.state,
-          // A refused wither was left out of the step, so it is the only one steppedWithers lacks.
-          withers: advanced.withers.map((wither) => steppedWithers.get(wither.id) ?? wither),
-          skulls: advanceResult.success.state.skulls.filter((skull) => {
-            if (skull.dimension !== dimension) return true
-            const outside = firstOutsideAddressableCells(witherSkullPositions(skull))
-            // Keeping a skull in flight would retry the same step every tick, so it leaves the next WitherSnapshot.
-            if (outside !== undefined) refuse(outside, 'wither-skull', 'removed')
-            return outside === undefined
-          }),
-        }
-        if (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined) {
-          const playerVitals = vitals.get(targetEntry[0])
-          if (playerVitals !== undefined) {
-            const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - advanceResult.success.meleeDamage)
-            damagedPlayers.add(targetEntry[0])
-            if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
-          }
-        }
-        for (const explosion of advanceResult.success.explosions) {
-          let explosionBlockReadFailure: MultiplayerServerCoreFailure | undefined
-          const blockReader = (position: BlockPos) => {
-            if (!isInBounds(position) || !world.isLoaded(position)) return undefined
-            const block = blockAt(position)
-            if (Result.isFailure(block)) {
-              explosionBlockReadFailure ??= block.failure
-              return undefined
-            }
-            return block.success === null ? { resistance: 0, destructible: false } : {
-              resistance: explosion.destroysResistantBlocks ? 0 : 1,
-              destructible: block.success !== 'bedrock',
-            }
-          }
-          const planResult = planExplosion({ center: explosion.position, radius: explosion.power, seed: revision + witherRevision, blocks: blockReader, entities: [] })
-          if (explosionBlockReadFailure !== undefined) return failWitherStep(explosionBlockReadFailure)
-          if (Result.isFailure(planResult)) {
-            return failWitherStep({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
-          }
-          const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
-          for (const [player, presence] of players) {
-            if (presence.world !== dimension) continue
-            const playerVitals = vitals.get(player)
-            if (playerVitals === undefined) continue
-            const distance = Math.hypot(
-              presence.at.x - explosion.position.x,
-              presence.at.y + 0.9 - explosion.position.y,
-              presence.at.z - explosion.position.z,
+        for (const dimension of dimensions) {
+          const dimensionWithers = advanced.withers.filter((wither) => wither.dimension === dimension)
+          const targetEntry = [...players.entries()]
+            .filter(([player, presence]) => presence.world === dimension && (vitals.get(player)?.health ?? 0) > 0)
+            .map(([player, presence]) => [player, presence, Math.min(...dimensionWithers.map((wither) => Math.hypot(
+              presence.at.x - wither.state.feetPosition.x,
+              presence.at.y - wither.state.feetPosition.y,
+              presence.at.z - wither.state.feetPosition.z,
+            )))] as const)
+            .filter((entry) => entry[2] <= WITHER_TARGET_RANGE)
+            .sort((left, right) => left[2] - right[2])[0]
+          const target = targetEntry?.[1].at ?? dimensionWithers[0]?.state.feetPosition ?? { x: 0, y: 64, z: 0 }
+          // mc-sim returns one dimension's melee, launches, and explosions summed over its withers, so a wither whose
+          // step leaves addressable cells is left out and the dimension is stepped again. The refused wither keeps its
+          // state, and none of its step's movement, regeneration, charge, launch, or melee applies.
+          const refusedWitherIds = new Set<string>()
+          const advanceDimension = (): Result.Result<WitherRuntimeAdvance, MultiplayerServerCoreFailure> => {
+            let skullBlockReadFailure: MultiplayerServerCoreFailure | undefined
+            const stepped = advanceWitherRuntime(
+              { ...advanced, withers: advanced.withers.filter((wither) => !refusedWitherIds.has(wither.id)) },
+              dimension,
+              target,
+              elapsedMs / 1_000,
+              (_skull, position) => {
+                // A cell outside addressable cells holds no block; the skull flies on and is refused below.
+                if (!isInAddressableCell(position)) return false
+                const block = blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) })
+                if (Result.isFailure(block)) {
+                  skullBlockReadFailure ??= block.failure
+                  return false
+                }
+                return block.success !== null
+              },
             )
-            // The power is a wither constant. A skull explodes one finite step from a position writePositions or load
-            // validation admitted, and the player's stored position passed the same check, so the distance is finite.
-            const damageAmount = Result.getOrThrow(explosionDamageAmount(explosion.power, distance))
-            if (damageAmount > 0) damageSteps.push({ player, playerVitals, amount: damageAmount })
+            if (skullBlockReadFailure !== undefined) return Result.fail(skullBlockReadFailure)
+            if (Result.isFailure(stepped)) return Result.fail({ _tag: 'WitherRuntimeFailure', operation: 'advance', failure: stepped.failure })
+            return Result.succeed(stepped.success)
           }
-          for (const position of planResult.success.destroyedBlocks) {
-            stepUndo.destroyBlock(position)
-            worldChanged = true
+          let advanceResult = advanceDimension()
+          // Each pass leaves out at least one more wither, so the passes end within the number of withers.
+          while (Result.isSuccess(advanceResult)) {
+            const outside = advanceResult.success.state.withers
+              .filter((wither) => wither.dimension === dimension)
+              .flatMap((wither) => {
+                const refused = firstOutsideAddressableCells(witherPositions(wither))
+                return refused === undefined ? [] : [refused]
+              })
+            if (outside.length === 0) break
+            for (const refused of outside) {
+              refuse(refused, 'wither', 'kept')
+              refusedWitherIds.add(refused.id)
+            }
+            advanceResult = advanceDimension()
           }
-          for (const { player, playerVitals, amount } of damageSteps) {
-            const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - amount)
-            damagedPlayers.add(player)
-            if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
+          if (Result.isFailure(advanceResult)) return failWitherStep(advanceResult.failure)
+          const steppedWithers = new Map(advanceResult.success.state.withers.map((wither) => [wither.id, wither]))
+          const hasEffects = advanceResult.success.explosions.length > 0
+            || (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined)
+          if (hasEffects && !revisionReserved) {
+            const reserved = revisionAfter(1)
+            if (Result.isFailure(reserved)) return failWitherStep(reserved.failure)
+            revisionReserved = true
+          }
+          advanced = {
+            ...advanceResult.success.state,
+            // A refused wither was left out of the step, so it is the only one steppedWithers lacks.
+            withers: advanced.withers.map((wither) => steppedWithers.get(wither.id) ?? wither),
+            skulls: advanceResult.success.state.skulls.filter((skull) => {
+              if (skull.dimension !== dimension) return true
+              const outside = firstOutsideAddressableCells(witherSkullPositions(skull))
+              // Keeping a skull in flight would retry the same step every tick, so it leaves the next WitherSnapshot.
+              if (outside !== undefined) refuse(outside, 'wither-skull', 'removed')
+              return outside === undefined
+            }),
+          }
+          if (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined) {
+            const playerVitals = vitals.get(targetEntry[0])
+            if (playerVitals !== undefined) {
+              const wasAlive = playerVitals.health > 0
+              playerVitals.health = Math.max(0, playerVitals.health - advanceResult.success.meleeDamage)
+              damagedPlayers.add(targetEntry[0])
+              if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
+            }
+          }
+          for (const explosion of advanceResult.success.explosions) {
+            if (discardExplosions) continue
+            let explosionBlockReadFailure: MultiplayerServerCoreFailure | undefined
+            const blockReader = (position: BlockPos) => {
+              if (!isInBounds(position) || !world.isLoaded(position)) return undefined
+              const block = blockAt(position)
+              if (Result.isFailure(block)) {
+                explosionBlockReadFailure ??= block.failure
+                return undefined
+              }
+              return block.success === null ? { resistance: 0, destructible: false } : {
+                resistance: explosion.destroysResistantBlocks ? 0 : 1,
+                destructible: block.success !== 'bedrock',
+              }
+            }
+            const planResult = planExplosion({ center: explosion.position, radius: explosion.power, seed: revision + witherRevision, blocks: blockReader, entities: [] })
+            if (explosionBlockReadFailure !== undefined) return failWitherStep(explosionBlockReadFailure)
+            if (Result.isFailure(planResult)) {
+              return failWitherStep({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
+            }
+            const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
+            for (const [player, presence] of players) {
+              if (presence.world !== dimension) continue
+              const playerVitals = vitals.get(player)
+              if (playerVitals === undefined) continue
+              const distance = Math.hypot(
+                presence.at.x - explosion.position.x,
+                presence.at.y + 0.9 - explosion.position.y,
+                presence.at.z - explosion.position.z,
+              )
+              // The power is a wither constant. A skull explodes one finite step from a position writePositions or load
+              // validation admitted, and the player's stored position passed the same check, so the distance is finite.
+              const damageAmount = Result.getOrThrow(explosionDamageAmount(explosion.power, distance))
+              if (damageAmount > 0) damageSteps.push({ player, playerVitals, amount: damageAmount })
+            }
+            for (const position of planResult.success.destroyedBlocks) {
+              stepUndo.destroyBlock(position)
+              worldChanged = true
+            }
+            for (const { player, playerVitals, amount } of damageSteps) {
+              const wasAlive = playerVitals.health > 0
+              playerVitals.health = Math.max(0, playerVitals.health - amount)
+              damagedPlayers.add(player)
+              if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
+            }
           }
         }
-      }
-      const blockCommit = stepUndo.commit()
-      if (Result.isFailure(blockCommit)) return failWitherStep(blockCommit.failure)
-      if (worldChanged || damagedPlayers.size > 0) {
-        // revisionAfter(1) succeeded before the first melee or explosion, and nothing in this step advanced since.
-        Result.getOrThrow(advanceRevision())
-        stateChanged = true
-        const deathDeltas = applyPlayerDeaths([...deadPlayers], revision)
-        if (worldChanged) worldSnapshotRequired = true
-        postPersistenceDeltas.push(...deathDeltas)
-        for (const player of damagedPlayers) {
-          const presence = players.get(player)
-          if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) })
+        const blockCommit = stepUndo.commit()
+        if (Result.isFailure(blockCommit)) return failWitherStep(blockCommit.failure)
+        if (worldChanged || damagedPlayers.size > 0) {
+          // revisionAfter(1) succeeded before the first melee or explosion, and nothing in this step advanced since.
+          Result.getOrThrow(advanceRevision())
+          stateChanged = true
+          const deathDeltas = applyPlayerDeaths([...deadPlayers], revision)
+          if (worldChanged) worldSnapshotRequired = true
+          postPersistenceDeltas.push(...deathDeltas)
+          for (const player of damagedPlayers) {
+            const presence = players.get(player)
+            if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) })
+          }
         }
+        const nextSnapshot = snapshotWitherRuntime(advanced)
+        if (JSON.stringify(nextSnapshot) !== JSON.stringify(previousSnapshot)) {
+          // Every refused wither kept its stored, admitted state and every refused skull was removed above.
+          Result.getOrThrow(writePositions([{ _tag: 'wither', state: advanced }]))
+          stateChanged = true
+          const witherMessage = witherSnapshot()
+          postPersistenceSends.push(() => broadcastWither(witherMessage))
+        }
+        return Result.succeed(undefined)
       }
-      const nextSnapshot = snapshotWitherRuntime(advanced)
-    if (JSON.stringify(nextSnapshot) !== JSON.stringify(previousSnapshot)) {
-      // Every refused wither kept its stored, admitted state and every refused skull was removed above.
-      Result.getOrThrow(writePositions([{ _tag: 'wither', state: advanced }]))
-      stateChanged = true
-      const witherMessage = witherSnapshot()
-      postPersistenceSends.push(() => broadcastWither(witherMessage))
-    }
+      const first = runWitherStep(false)
+      if (Result.isFailure(first)) {
+        if (first.failure._tag !== 'WorldWriteFailure') return failStep(first.failure)
+        console.error('Multiplayer wither block batch discarded', { worldId, failure: first.failure.failure })
+        // Advance the one-shot phase and skull events without reapplying the rejected blast effects.
+        const remaining = runWitherStep(true)
+        if (Result.isFailure(remaining)) return failStep(remaining.failure)
+      }
     }
 
     if (dimension === 'end') {

@@ -11,7 +11,7 @@ import {
   type SurvivalHungerState,
   type ChunkWindow,
 } from '@nerima-games/mx-gameplay'
-import { Effect, Exit, Result } from 'effect'
+import { Effect, Result } from 'effect'
 
 import type { MultiplayerServerCoreParts } from '../core.js'
 import { commitBlockBatch, makeServerWorldWrite } from '../world-write-port.js'
@@ -79,12 +79,8 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
   worldWriteRevisions: (write, dimension) => Effect.runSync(Effect.gen(function* () {
     return { world: yield* write.coordinator.revision, dimension: yield* write.coordinator.dimensionRevision(dimension) }
   })),
-  commitWorldWrite: (write, dimension, batch, rollback) => {
-    const commit = commitBlockBatch(write.coordinator, dimension, batch)
-    return Effect.runSync(Effect.result(rollback === undefined ? commit : commit.pipe(
-      Effect.onExit((exit) => Effect.sync(() => { if (Exit.isFailure(exit)) rollback() })),
-    )))
-  },
+  dieInvalidBlockBatch: (failure) => Effect.runSync(Effect.die(new Error('c7-adapter: unexpected WorldWriteInvalidBatch', { cause: failure }))),
+  commitWorldWrite: (write, dimension, batch) => Effect.runSync(Effect.result(commitBlockBatch(write.coordinator, dimension, batch))),
   survivalHunger: {
     create: (vitals, difficulty) => Effect.runSync(Effect.gen(function* () {
       // The in-memory vitals normalise spawn saturation against the given hunger.
@@ -111,7 +107,6 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
       load: (coord) => Effect.runSync(Effect.result(store.load(coord).pipe(
         Effect.catchTag('DirtyChunkEvictionError', (failure) => Effect.andThen(store.unload(failure.coord), store.load(coord))),
       ))),
-      unload: (coord) => Effect.runSync(Effect.result(store.unload(coord))),
       openWindow: openWindowOver,
     }
   },
