@@ -11,14 +11,14 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import {
-  CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
+  CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, type ChunkCoord, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
   PositionAxis, SimulationTick, position, type Position,
 } from '@nerima-games/mc-kernel'
 import { DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
-import type { ChunkSource } from '@nerima-games/mc-worldgen'
+import { ChunkCapacity, makeChunkStore, type ChunkSource } from '@nerima-games/mc-worldgen'
 import {
-  chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, planMobMovementRoster,
-  SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS, stepEcosystemMob, type EcosystemMobState,
+  chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, openChunkWindow, planMobMovementRoster,
+  SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS, stepEcosystemMob,
 } from '@nerima-games/mx-gameplay'
 import { Effect, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
@@ -3368,34 +3368,77 @@ describe('multiplayer server authoritative state', () => {
   // The core reads the save's block edits over the terrain, so the independent plan reads them too.
   const pastureWithEdits = floorTerrain(63, 'stone', initialState().blocks)
 
+  type PlannedMob = Readonly<{ id: string; kind: string; start: Position; target?: Position }>
+  type SavedEntity = NonNullable<MultiplayerServerState['entities']>[number]
+
   /**
-   * A lone cow planned through the published mx-gameplay API with the inputs the core gives it: a ChunkWindow over
-   * the same terrain, then per game tick one stepEcosystemMob and one planMobMovementRoster, with no target, at
-   * simulation ticks 1 to `gameTicks` in the overworld.
+   * mx-gameplay's own plan for a roster, computed without the core. Each server tick opens one ChunkWindow over every
+   * chunk around the mobs' feet at that tick's start, from a dedicated ChunkStore large enough to hold them all. Each
+   * game tick then steps every mob's AI with stepEcosystemMob (toward its target, if it has one) and plans the whole
+   * roster once with planMobMovementRoster, at simulation ticks 1, 2, … in the overworld.
    */
-  const plannedCowFeet = (terrain: ChunkSource, start: Position, gameTicks: number): Position => {
-    const store = makeMultiplayerServerCoreParts().openChunkStore(terrain)
-    const coords = chunkCoordsAround(start, CHUNK_SIZE_XZ)
-    for (const coord of coords) Result.getOrThrow(store.load(coord))
-    const world = mobMovementWorldFromChunkWindow(store.openWindow(coords))
-    let ecosystem: EcosystemMobState = initialEcosystemMobState()
-    let feet = start
-    for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
-      ecosystem = stepEcosystemMob(EntityKind('cow'), ecosystem, feet, undefined, DeltaTimeSecs(Number(DEFAULT_TICK_DURATION))).state
-      const planned = Result.getOrThrow(planMobMovementRoster({
-        nextSerial: EntitySerial(0),
-        entities: [{
-          id: KernelEntityId('cow-1'), kind: EntityKind('cow'), feetPosition: feet, healthPoints: EntityHealthPoints(10),
-          behaviour: ecosystem, dimension: 'overworld',
-        }],
-      }, undefined, world, SimulationTick(gameTick + 1), 'overworld'))
-      expect(planned.faults).toEqual([])
-      const [cow] = planned.roster.entities
-      if (cow === undefined || cow.behaviour?._tag !== 'EcosystemMob') throw new Error('the planner keeps the cow as an ecosystem mob')
-      feet = cow.feetPosition
-      ecosystem = cow.behaviour
+  const plannedRoster = (terrain: ChunkSource, mobs: ReadonlyArray<PlannedMob>, serverTicks: ReadonlyArray<number>): ReadonlyMap<string, Position> => {
+    let current = mobs.map((mob) => ({ ...mob, feet: mob.start, ecosystem: initialEcosystemMobState() }))
+    let simulationTick = 0
+    for (const gameTicks of serverTicks) {
+      const coords = new Map<string, ChunkCoord>()
+      for (const { feet } of current) {
+        for (const coord of chunkCoordsAround(feet, CHUNK_SIZE_XZ)) coords.set(`${String(coord.cx)},${String(coord.cz)}`, coord)
+      }
+      const window = Effect.runSync(Effect.gen(function* () {
+        const store = yield* makeChunkStore(terrain, ChunkCapacity(coords.size))
+        for (const coord of coords.values()) yield* store.load(coord)
+        return yield* openChunkWindow(store, [...coords.values()])
+      }))
+      const world = mobMovementWorldFromChunkWindow(window)
+      for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
+        simulationTick += 1
+        const stepped = current.map((mob) => ({
+          ...mob,
+          ecosystem: stepEcosystemMob(EntityKind(mob.kind), mob.ecosystem, mob.feet, mob.target, DeltaTimeSecs(Number(DEFAULT_TICK_DURATION))).state,
+        }))
+        const planned = Result.getOrThrow(planMobMovementRoster({
+          nextSerial: EntitySerial(0),
+          entities: stepped.map((mob) => ({
+            id: KernelEntityId(mob.id), kind: EntityKind(mob.kind), feetPosition: mob.feet, healthPoints: EntityHealthPoints(10),
+            behaviour: mob.ecosystem, dimension: 'overworld',
+          })),
+        }, undefined, world, SimulationTick(simulationTick), 'overworld'))
+        expect(planned.faults).toEqual([])
+        current = stepped.map((mob, index) => {
+          const entity = planned.roster.entities[index]
+          if (entity?.id !== mob.id || entity.behaviour?._tag !== 'EcosystemMob') throw new Error('the planner keeps each mob in order')
+          return { ...mob, feet: entity.feetPosition, ecosystem: entity.behaviour }
+        })
+      }
     }
+    return new Map(current.map((mob) => [mob.id, mob.feet]))
+  }
+
+  /** A lone cow planned by plannedRoster for one server tick of `gameTicks` game ticks. */
+  const plannedCowFeet = (terrain: ChunkSource, start: Position, gameTicks: number): Position => {
+    const feet = plannedRoster(terrain, [{ id: 'cow-1', kind: 'cow', start }], [gameTicks]).get('cow-1')
+    if (feet === undefined) throw new Error('the plan keeps the cow')
     return feet
+  }
+
+  /** Cows `cow-0`, `cow-1`, … standing at `starts`, as the save holds them and as plannedRoster plans them. */
+  const cowsAt = (starts: ReadonlyArray<Readonly<{ x: number; y: number; z: number }>>) => ({
+    entities: starts.map((at, index): SavedEntity => ({
+      _tag: 'living', entityId: entityId(`cow-${String(index)}`), entityType: 'cow', at, health: 10, maxHealth: 10,
+    })),
+    planned: starts.map((at, index): PlannedMob => ({
+      id: `cow-${String(index)}`, kind: 'cow', start: position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z)),
+    })),
+  })
+
+  /** Every persisted mob stands exactly where the independent plan puts it. */
+  const expectPlannedPositions = (persisted: ReadonlyArray<SavedEntity> | undefined, planned: ReadonlyMap<string, Position>) => {
+    expect(persisted?.map(({ entityId: id }) => String(id))).toEqual([...planned.keys()])
+    for (const entity of persisted ?? []) {
+      const feet = planned.get(String(entity.entityId))
+      expect(entity.at).toEqual(feet === undefined ? undefined : { x: feet.x, y: feet.y, z: feet.z })
+    }
   }
 
   it('advances passive mob movement and persists its AI state authoritatively', () => {
@@ -3448,30 +3491,85 @@ describe('multiplayer server authoritative state', () => {
     })
   })
 
-  it('moves every cow as the planner computes for it when their windows together exceed the chunk store', () => {
+  it('moves every cow as one roster plan computes when their windows together exceed the chunk store', () => {
     // R-SV3b's layout: 29 cows 64 blocks apart need 9 chunks each, 261 in all, more than the store keeps resident.
-    const starts = Array.from({ length: 29 }, (_, index) => ({ x: 64 * index, y: 64, z: 8 }))
-    const fixture = makeFixture({
-      ...initialState(),
-      entities: starts.map((at, index) => ({
-        _tag: 'living', entityId: entityId(`cow-${String(index)}`), entityType: 'cow', at, health: 10, maxHealth: 10,
-      })),
-    }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
-    const gameTicks = 1_000 / (Number(DEFAULT_TICK_DURATION) * 1_000)
+    const cows = cowsAt(Array.from({ length: 29 }, (_, index) => ({ x: 64 * index, y: 64, z: 8 })))
+    const fixture = makeFixture({ ...initialState(), entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+
+    expect(fixture.server.tick(250)).toEqual(Result.succeed({ refusals: [] }))
+
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [5]))
+  })
+
+  it('plans a chained herd as one roster when its windows exceed the chunk store', () => {
+    // R-SV3b's layout: 83 cows 16 blocks apart chain 255 chunks, and the last cow adds 3 more. Loading the 258 chunks
+    // evicts some of them from the LRU store before the planner reads them.
+    const cows = cowsAt([
+      ...Array.from({ length: 83 }, (_, index) => ({ x: 16 * index, y: 64, z: 8 })),
+      { x: 0, y: 64, z: 24 },
+    ])
+    const fixture = makeFixture({ ...initialState(), entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+
+    expect(fixture.server.tick(100)).toEqual(Result.succeed({ refusals: [] }))
+
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [2]))
+  })
+
+  it('shares one roster\'s search budget and order among cows whose windows share no chunk', () => {
+    // R-SV3b's layout: two herds of 8 cows, 64 blocks apart. At simulation tick 1 the planner starts at the second
+    // cow and spends its 8 searches before reaching cow-0, which therefore stays where it is.
+    const cows = cowsAt([
+      ...Array.from({ length: 8 }, () => ({ x: 0, y: 64, z: 8 })),
+      ...Array.from({ length: 8 }, () => ({ x: 64, y: 64, z: 8 })),
+    ])
+    const fixture = makeFixture({ ...initialState(), entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+
+    expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
+
+    const persisted = fixture.persisted.at(-1)?.entities
+    expectPlannedPositions(persisted, plannedRoster(pastureWithEdits, cows.planned, [1]))
+    expect(persisted?.[0]?.at).toEqual({ x: 0, y: 64, z: 8 })
+
+    // A second server tick continues each cow's movement from the first, as one longer plan would.
+    expect(fixture.server.tick(100)).toEqual(Result.succeed({ refusals: [] }))
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(pastureWithEdits, cows.planned, [1, 2]))
+  })
+
+  it('plans with a saved edit inside a herd whose windows exceed the chunk store', () => {
+    // A saved stone in cow-0's path, in a layout whose 261 chunks overflow the LRU store while they load.
+    const wall = { at: { x: 1, y: 64, z: 8 }, block: 'stone' }
+    const cows = cowsAt(Array.from({ length: 29 }, (_, index) => ({ x: 64 * index, y: 64, z: 8 })))
+    const blocks = [...initialState().blocks, wall]
+    const fixture = makeFixture({ ...initialState(), blocks, entities: cows.entities }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
 
     expect(fixture.server.tick(1_000)).toEqual(Result.succeed({ refusals: [] }))
 
-    const persisted = fixture.persisted.at(-1)?.entities ?? []
-    expect(persisted).toHaveLength(starts.length)
-    for (const [index, start] of starts.entries()) {
-      // No two cows share a chunk, so each is planned as the lone member of its roster.
-      const expected = plannedCowFeet(pastureWithEdits, position(PositionAxis(start.x), PositionAxis(start.y), PositionAxis(start.z)), gameTicks)
-      expect(persisted[index]).toEqual(expect.objectContaining({
-        entityId: `cow-${String(index)}`,
-        at: { x: expected.x, y: expected.y, z: expected.z },
-      }))
-      expect(Math.hypot(expected.x - start.x, expected.z - start.z)).toBeGreaterThan(0)
-    }
+    expectPlannedPositions(fixture.persisted.at(-1)?.entities, plannedRoster(floorTerrain(63, 'stone', blocks), cows.planned, [20]))
+    // The edit reaches cow-0's plan: on the bare floor it stays at y = 64, and here it climbs the stone.
+    expect(fixture.persisted.at(-1)?.entities?.[0]?.at.y).toBeGreaterThan(64)
+  })
+
+  it('moves a zombie toward its nearest player as one roster plan computes', () => {
+    // mx-gameplay steps the zombie's AI toward the player, then plans its path; the player stands 8 blocks away, beyond
+    // the zombie's 1.5-block melee reach.
+    const zombieStart = { x: 6, y: 64, z: 8 }
+    const fixture = makeFixture({
+      ...initialState(),
+      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 0 } }],
+      entities: [{ _tag: 'living', entityId: entityId('zombie-0'), entityType: 'zombie', at: zombieStart, health: 20, maxHealth: 20 }],
+    }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+
+    expect(fixture.server.tick(1_000)).toEqual(Result.succeed({ refusals: [] }))
+
+    const planned = plannedRoster(pastureWithEdits, [{
+      id: 'zombie-0', kind: 'zombie',
+      start: position(PositionAxis(zombieStart.x), PositionAxis(zombieStart.y), PositionAxis(zombieStart.z)),
+      target: position(PositionAxis(pastureJoinAt.x), PositionAxis(pastureJoinAt.y), PositionAxis(pastureJoinAt.z)),
+    }], [20])
+    const persisted = fixture.persisted.at(-1)?.entities
+    expectPlannedPositions(persisted, planned)
+    const [zombie] = persisted ?? []
+    expect(zombie === undefined ? Number.POSITIVE_INFINITY : Math.abs(zombie.at.x - pastureJoinAt.x)).toBeLessThan(zombieStart.x - pastureJoinAt.x)
   })
 
   it('leaves a living entity of an unsupported kind untouched instead of repairing its state', () => {
