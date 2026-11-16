@@ -7,8 +7,8 @@ import { dirname } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 
-import { AIR_BLOCK_ID, blockIdOf, BlockStateValuesSchema, encodeBlockState, isBlockType } from '@nerima-games/mc-kernel'
-import { CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
+import { AIR_BLOCK_ID, blockIdOf, BlockPositionSchema, BlockStateValuesSchema, encodeBlockState, isBlockType } from '@nerima-games/mc-kernel'
+import { containerCapacity, CONTAINER_STORAGE_SNAPSHOT_VERSION, ContainerStorageSnapshotSchema, durabilityForItem, DurabilitySchema, isDamageableItemType, isValidDurabilityForItem, LegacyItemStackSchema, type ContainerStoredStack, type Durability } from '@nerima-games/mc-sim'
 import {
   CHUNK_HEIGHT,
   generatedChunkSource,
@@ -17,6 +17,7 @@ import {
 } from '@nerima-games/mc-worldgen'
 import {
   AuthoritativeSnapshot,
+  ContainerKind,
   EntityId as EntityIdSchema,
   PlayerId as PlayerIdSchema,
   decodeFrame,
@@ -195,10 +196,148 @@ export const resolveMultiplayerRuntimeOptions = (
 }
 
 interface PersistedServerState {
-  readonly format: 1
+  readonly format: 2
   readonly worldId: string
   readonly seed: number
-  readonly state: MultiplayerServerState
+  readonly state: unknown
+}
+
+type SavedItemStackFailure = Extract<MultiplayerServerCoreFailure, { _tag: 'SavedItemStackFailure' }>
+
+type SavedContainerIdFailure = Extract<MultiplayerServerCoreFailure, { _tag: 'SavedContainerIdInvalid' }>
+type ServerStateWriteFailure = SavedItemStackFailure | SavedContainerIdFailure
+const migratedContainerId = (value: unknown, worldId: string, format: 1 | 2): Result.Result<string, ServerStateWriteFailure> => {
+  const parsed = Schema.decodeUnknownResult(Schema.String)(value)
+  if (Result.isFailure(parsed)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: parsed.failure })
+  const id = parsed.success
+  const dimension = dimensionForWorld(worldId)
+  const prefix = format === 1 ? worldId : dimension
+  if (!id.startsWith(`${prefix}:`)) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  const suffix = id.slice(prefix.length + 1)
+  const match = /^(-?\d+),(-?\d+),(-?\d+)$/.exec(suffix)
+  if (match === null || match[0] !== suffix) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  const position = Schema.decodeUnknownResult(BlockPositionSchema)({ x: Number(match[1]), y: Number(match[2]), z: Number(match[3]) })
+  if (Result.isFailure(position) || position.success.y < 0 || position.success.y >= CHUNK_HEIGHT) {
+    return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  }
+  const canonical = `${dimension}:${String(position.success.x)},${String(position.success.y)},${String(position.success.z)}`
+  if (format === 2 && id !== canonical) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  return Result.succeed(canonical)
+}
+
+type SavedItemTransform = Readonly<{
+  state: unknown
+  containerItems: ReadonlyMap<string, ContainerStoredStack>
+}>
+const savedStackFields = Schema.Struct({ item: Schema.String, count: Schema.Number, components: Schema.Unknown })
+const itemPaths: ReadonlyArray<ReadonlyArray<string>> = [
+  ['inventories', '*', 'state', 'slots', '*'],
+  ...['head', 'chest', 'legs', 'feet', 'offhand'].map((slot) => ['inventories', '*', 'state', 'equipment', slot]),
+  ['containers', '*', 'slots', '*'],
+  ...['input', 'fuel', 'output'].map((slot) => ['furnaces', '*', slot]),
+  ['villagerTrades', '*', 'offers', '*', 'input', '*'],
+  ['villagerTrades', '*', 'offers', '*', 'output'],
+  ['entities', '*', 'stack'],
+]
+const transformSavedItems = (
+  value: unknown,
+  format: 1 | 2,
+  direction: 'read' | 'write',
+): Result.Result<SavedItemTransform, SavedItemStackFailure> => {
+  const containerItems = new Map<string, ContainerStoredStack>()
+  const stackAt = (value: unknown, path: string): Result.Result<unknown, SavedItemStackFailure> => {
+    if (value === null) return Result.succeed(null)
+    const record = Schema.decodeUnknownResult(Schema.Record(Schema.String, Schema.Unknown))(value)
+    if (Result.isFailure(record)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: record.failure })
+    const fields = Schema.decodeUnknownResult(Schema.Struct({ item: Schema.String, count: Schema.Number }))(record.success)
+    if (Result.isFailure(fields)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: fields.failure })
+    const stack = record.success
+    const container = path.startsWith('containers.')
+    if (direction === 'read' && format === 1 && Object.hasOwn(stack, 'components')) {
+      const components = Schema.decodeUnknownResult(Schema.Null)(stack['components'])
+      if (Result.isFailure(components)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: components.failure })
+    }
+    const canonical = direction === 'write' && (container || (Object.hasOwn(stack, 'components') && stack['components'] !== null))
+      ? Schema.decodeUnknownResult(Schema.toType(LegacyItemStackSchema))({
+          ...fields.success, components: stack['components'],
+        })
+      : Schema.decodeUnknownResult(LegacyItemStackSchema)({
+          ...fields.success,
+          components: direction === 'write' || format === 1 ? null : stack['components'],
+        })
+    if (Result.isFailure(canonical)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: canonical.failure })
+    const encoded = Schema.encodeResult(LegacyItemStackSchema)(canonical.success)
+    if (Result.isFailure(encoded)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: encoded.failure })
+    const saved = Schema.decodeUnknownResult(savedStackFields)(encoded.success)
+    if (Result.isFailure(saved)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: saved.failure })
+    if (!container) {
+      const components = Schema.decodeUnknownResult(Schema.Null)(saved.success.components)
+      if (Result.isFailure(components)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: components.failure })
+    }
+    const durability = Schema.decodeUnknownResult(Schema.NullOr(DurabilitySchema))(
+      Object.hasOwn(stack, 'durability') ? stack['durability']
+        : container ? format === 1 && direction === 'read' ? durabilityForItem(canonical.success.item) : undefined
+        : null,
+    )
+    if (Result.isFailure(durability)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: durability.failure })
+    if (container) {
+      const paired = Schema.decodeUnknownResult(Schema.declare((value: unknown): value is Durability | null =>
+        isDamageableItemType(canonical.success.item) ? isValidDurabilityForItem(canonical.success.item, value) : value === null,
+      ))(durability.success)
+      if (Result.isFailure(paired)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: paired.failure })
+    }
+    if (direction === 'write') {
+      return Result.succeed({
+        ...saved.success,
+        ...(container || durability.success !== null ? { durability: durability.success } : {}),
+      })
+    }
+    if (container) containerItems.set(path, { ...canonical.success, durability: durability.success })
+    return Result.succeed({
+      item: canonical.success.item, count: canonical.success.count,
+      ...(durability.success === null ? {} : { durability: durability.success }),
+    })
+  }
+  const visit = (value: unknown, selectors: ReadonlyArray<string>, path: string): Result.Result<unknown, SavedItemStackFailure> => {
+    const [selector, ...rest] = selectors
+    if (selector === undefined) return stackAt(value, path)
+    if (selector === '*' && Array.isArray(value)) {
+      const entries: Array<unknown> = []
+      for (const [index, entry] of value.entries()) {
+        const transformed = visit(entry, rest, `${path}.${String(index)}`)
+        if (Result.isFailure(transformed)) return transformed
+        entries.push(transformed.success)
+      }
+      return Result.succeed(entries)
+    }
+    if (!isRecord(value) || !Object.hasOwn(value, selector)) return Result.succeed(value)
+    const transformed = visit(value[selector], rest, path === '' ? selector : `${path}.${selector}`)
+    return Result.map(transformed, (entry) => ({ ...value, [selector]: entry }))
+  }
+  let state = value
+  for (const path of itemPaths) {
+    const transformed = visit(state, path, '')
+    if (Result.isFailure(transformed)) return Result.fail(transformed.failure)
+    state = transformed.success
+  }
+  return Result.succeed({ state, containerItems })
+}
+
+
+const validatePersistentContainers = (
+  containers: MultiplayerServerState['containers'],
+  worldId: string,
+): Result.Result<void, ServerStateWriteFailure> => {
+  for (const container of containers) {
+    const id = migratedContainerId(container.containerId, worldId, 2)
+    if (Result.isFailure(id)) return Result.fail(id.failure)
+  }
+  const decoded = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({
+    version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
+    containers: containers.map(({ containerId, kind, slots }) => ({ id: containerId, kind, slots })),
+  })
+  if (Result.isFailure(decoded)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: decoded.failure })
+  return Result.succeed(undefined)
 }
 
 const isBlockPos = (value: unknown): value is BlockPos => {
@@ -222,9 +361,11 @@ const isOrientation = (value: unknown): value is Orientation => {
     && typeof orientation['pitchRadians'] === 'number' && Number.isFinite(orientation['pitchRadians'])
 }
 
-const decodeServerState = (value: unknown, worldId: string): Result.Result<MultiplayerServerState | undefined, MultiplayerServerCoreFailure> => {
-  if (!isRecord(value)) return Result.succeed(undefined)
-  const state = value
+const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Result.Result<MultiplayerServerState | undefined, MultiplayerServerCoreFailure> => {
+  const items = transformSavedItems(value, format, 'read')
+  if (Result.isFailure(items)) return Result.fail(items.failure)
+  if (!isRecord(items.success.state)) return Result.succeed(undefined)
+  const state = items.success.state
   const revision = state['revision']
   const blocksValue = state['blocks']
   if (!isNonNegativeSafeInteger(revision) || !Array.isArray(blocksValue)) return Result.succeed(undefined)
@@ -375,6 +516,46 @@ const decodeServerState = (value: unknown, worldId: string): Result.Result<Multi
       })
   if (enchantmentsValue !== undefined && enchantments.length !== enchantmentsValue.length) return Result.succeed(undefined)
 
+  const savedContainers = state['containers'] === undefined ? [] : state['containers']
+  const migratedContainers = Array.isArray(savedContainers)
+    ? savedContainers.map((container) => {
+        if (format !== 1 || !isRecord(container) || !Array.isArray(container['slots'])) return container
+        const kind = Schema.decodeUnknownResult(ContainerKind)(container['kind'] === undefined ? 'chest' : container['kind'])
+        if (Result.isFailure(kind)) return container
+        const slots = container['slots']
+        return {
+          ...container,
+          kind: kind.success,
+          slots: [...slots, ...Array.from({ length: Math.max(0, containerCapacity(kind.success) - slots.length) }, () => null)],
+        }
+      })
+    : savedContainers
+  const canonicalIds: Array<unknown> = []
+  if (Array.isArray(migratedContainers)) {
+    for (const container of migratedContainers) {
+      if (!isRecord(container) || typeof container['containerId'] !== 'string') {
+        canonicalIds.push(container)
+        continue
+      }
+      const id = migratedContainerId(container['containerId'], worldId, format)
+      if (Result.isFailure(id)) return Result.fail(id.failure)
+      canonicalIds.push({ ...container, containerId: id.success })
+    }
+  }
+  const stored = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({
+    version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
+    containers: Array.isArray(migratedContainers)
+      ? canonicalIds.map((container, containerIndex) => !isRecord(container) ? container : ({
+          id: container['containerId'], kind: container['kind'],
+          slots: Array.isArray(container['slots'])
+            ? container['slots'].map((slot, slotIndex) => slot === null ? null
+              : items.success.containerItems.get(`containers.${String(containerIndex)}.slots.${String(slotIndex)}`))
+            : container['slots'],
+        }))
+      : migratedContainers,
+  })
+  if (Result.isFailure(stored)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: stored.failure })
+  const containers = stored.success.containers.map(({ id, kind, slots }) => ({ containerId: id, kind, slots }))
   const decoded = Schema.decodeUnknownResult(AuthoritativeSnapshot)({
     _tag: 'AuthoritativeSnapshot',
     world: worldId,
@@ -382,17 +563,13 @@ const decodeServerState = (value: unknown, worldId: string): Result.Result<Multi
     inventories: state['inventories'] ?? [],
     vitals: state['vitals'] ?? [],
     timeWeather: state['timeWeather'] ?? { timeOfDay: 6_000, weather: 'clear' },
-    containers: Array.isArray(state['containers'])
-      ? state['containers'].map((container) => {
-          if (!isRecord(container) || container['kind'] !== undefined) return container
-          const slots = Array.isArray(container['slots']) ? container['slots'] : []
-          return {
-            ...container,
-            kind: 'chest',
-            slots: [...slots, ...Array.from({ length: Math.max(0, CHEST_CONTAINER_CAPACITY - slots.length) }, () => null)],
-          }
-        })
-      : [],
+    containers: containers.map((container) => ({
+      ...container,
+      slots: container.slots.map((stack) => stack === null ? null : ({
+        item: stack.item, count: stack.count,
+        ...(stack.durability === null ? {} : { durability: stack.durability }),
+      })),
+    })),
     furnaces: state['furnaces'] ?? [],
     villagerTrades: state['villagerTrades'] ?? [],
     entities: state['entities'] ?? [],
@@ -407,7 +584,7 @@ const decodeServerState = (value: unknown, worldId: string): Result.Result<Multi
     vitals: snapshot.vitals,
     timeWeather: snapshot.timeWeather,
     ...(weatherClock === undefined ? {} : { weatherClock }),
-    containers: snapshot.containers,
+    containers,
     furnaces: snapshot.furnaces,
     villagerTrades: snapshot.villagerTrades,
     entities: snapshot.entities ?? [],
@@ -445,10 +622,11 @@ export const loadServerState = async (
   }
   if (!isRecord(value)) throw new Error(`invalid multiplayer state file: ${path}`)
   const persisted = value
-  if (persisted['format'] !== 1 || persisted['worldId'] !== worldId || persisted['seed'] !== seed) {
+  const format = persisted['format']
+  if ((format !== 1 && format !== 2) || persisted['worldId'] !== worldId || persisted['seed'] !== seed) {
     throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
   }
-  const decodedState = decodeServerState(persisted['state'], worldId)
+  const decodedState = decodeServerState(persisted['state'], worldId, format)
   if (Result.isFailure(decodedState)) return Result.fail(decodedState.failure)
   const state = decodedState.success
   if (state === undefined) {
@@ -463,12 +641,17 @@ export const writeServerState = async (
   worldId: string,
   seed: number,
   state: MultiplayerServerState,
-): Promise<void> => {
+): Promise<Result.Result<void, ServerStateWriteFailure>> => {
+  const encoded = transformSavedItems(state, 2, 'write')
+  if (Result.isFailure(encoded)) return Result.fail(encoded.failure)
+  const validContainers = validatePersistentContainers(state.containers, worldId)
+  if (Result.isFailure(validContainers)) return validContainers
   await mkdir(dirname(path), { recursive: true })
   const temporaryPath = `${path}.${String(process.pid)}.${randomUUID()}.tmp`
-  const persisted: PersistedServerState = { format: 1, worldId, seed, state }
+  const persisted: PersistedServerState = { format: 2, worldId, seed, state: encoded.success.state }
   await writeFile(temporaryPath, `${JSON.stringify(persisted)}\n`, 'utf8')
   await rename(temporaryPath, path)
+  return Result.succeed(undefined)
 }
 
 export type LatestStatePersistence<State> = {
@@ -478,14 +661,16 @@ export type LatestStatePersistence<State> = {
 
 export const createLatestStatePersistence = <State>(
   write: (state: State) => Promise<void>,
+  onFailure: (failure: unknown) => void,
 ): LatestStatePersistence<State> => {
   let pending!: State
   let hasPending = false
   let running: Promise<void> | undefined
   let failure: unknown
+  let failed = false
 
   const start = (): void => {
-    if (running !== undefined || !hasPending) return
+    if (running !== undefined || !hasPending || failed) return
     let complete!: () => void
     running = new Promise<void>((resolve) => { complete = resolve })
     void (async () => {
@@ -494,34 +679,34 @@ export const createLatestStatePersistence = <State>(
         hasPending = false
         try {
           await write(state)
-          failure = undefined
         } catch (error: unknown) {
-          if (!hasPending) {
-            pending = state
-            hasPending = true
-          }
           failure = error
+          failed = true
+          hasPending = false
+          onFailure(error)
           return
         }
       }
     })().finally(() => {
       running = undefined
-      if (hasPending && failure === undefined) start()
+      if (hasPending && !failed) start()
       complete()
     })
   }
 
   return {
     request: (state) => {
+      if (failed) return
       pending = state
       hasPending = true
       start()
     },
     drain: async () => {
+      if (failed) throw failure
       while (running !== undefined || hasPending) {
         start()
         await running
-        if (failure !== undefined) throw failure
+        if (failed) throw failure
       }
     },
   }
@@ -591,10 +776,21 @@ export const startMultiplayerServer = async (
     ? undefined
     : await loadLegacyPlayerClaims(options.legacyPlayerClaimsFile)
   const reconnectAuth = await createReconnectAuth(stateFile)
+  let persistenceFailed = false
+  const onPersistenceFailure = (failure: unknown): void => {
+    if (persistenceFailed) return
+    persistenceFailed = true
+    console.error('Multiplayer state persistence failed', { failure })
+    if (options.installSignalHandlers === true) process.exitCode = 1
+    void close().catch((shutdownFailure: unknown) => {
+      if (shutdownFailure !== failure) console.error('Multiplayer server shutdown failed', { failure: shutdownFailure })
+    })
+  }
   const persistence = stateFile === undefined
     ? undefined
-    : createLatestStatePersistence((state: MultiplayerServerState) =>
-        writeServerState(stateFile, options.worldId, options.seed, state),
+    : createLatestStatePersistence(async (state: MultiplayerServerState) =>
+        Result.getOrThrow(await writeServerState(stateFile, options.worldId, options.seed, state)),
+        onPersistenceFailure,
       )
   const endStateFile = stateFile === undefined ? undefined : `${stateFile}.end`
   const endInitialStateResult = endStateFile === undefined
@@ -604,8 +800,9 @@ export const startMultiplayerServer = async (
   const endInitialState = endInitialStateResult.success
   const endPersistence = endStateFile === undefined
     ? undefined
-    : createLatestStatePersistence((state: MultiplayerServerState) =>
-        writeServerState(endStateFile, 'end', options.seed, state),
+    : createLatestStatePersistence(async (state: MultiplayerServerState) =>
+        Result.getOrThrow(await writeServerState(endStateFile, 'end', options.seed, state)),
+        onPersistenceFailure,
       )
   const netherStateFile = stateFile === undefined ? undefined : `${stateFile}.nether`
   const netherInitialStateResult = netherStateFile === undefined
@@ -615,8 +812,9 @@ export const startMultiplayerServer = async (
   const netherInitialState = netherInitialStateResult.success
   const netherPersistence = netherStateFile === undefined
     ? undefined
-    : createLatestStatePersistence((state: MultiplayerServerState) =>
-        writeServerState(netherStateFile, 'nether', options.seed, state),
+    : createLatestStatePersistence(async (state: MultiplayerServerState) =>
+        Result.getOrThrow(await writeServerState(netherStateFile, 'nether', options.seed, state)),
+        onPersistenceFailure,
       )
   const endSpawnAt: BlockPos = { x: 0, y: 64, z: 0 }
   const overworldNetherPortalAt: BlockPos = { x: overworldSpawnAt.x - 1, y: overworldSpawnAt.y, z: overworldSpawnAt.z }
@@ -864,7 +1062,7 @@ export const startMultiplayerServer = async (
       pendingFrameCount += 1
       pendingFrameBytes += frameBytes
       _messageQueue = _messageQueue.then(async () => {
-        if (disconnected) return
+        if (disconnected || persistenceFailed) return
         if (activePlayer !== undefined) {
           const realm = activeRealms.get(clientId)
           if (realm === undefined) {
@@ -938,7 +1136,9 @@ export const startMultiplayerServer = async (
     const elapsedMs = now - lastTickAt
     lastTickAt = now
     pendingServerTick = pendingServerTick.then(async () => {
+      if (persistenceFailed) return
       const redstoneResult = await Effect.runPromise(redstoneRuntime.tick(elapsedMs))
+      if (persistenceFailed) return
       if (Result.isFailure(redstoneResult)) {
         console.error('Multiplayer redstone tick failed', { failure: redstoneResult.failure })
       }
@@ -960,7 +1160,7 @@ export const startMultiplayerServer = async (
   }, 50)
   let closing: Promise<void> | undefined
   const signalHandlers = new Map<NodeJS.Signals, () => void>()
-  const close = (): Promise<void> => {
+  function close(): Promise<void> {
     if (closing !== undefined) return closing
     closing = new Promise<void>((resolve, reject) => {
       clearInterval(serverTickTimer)

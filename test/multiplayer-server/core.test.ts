@@ -13,7 +13,8 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import type { Dimension } from '@nerima-games/mc-worldgen'
-import { AIR_BLOCK_ID, blockIdOf, EncodedBlockStateSchema } from '@nerima-games/mc-kernel'
+import { CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
+import { AIR_BLOCK_ID, blockIdOf, EncodedBlockStateSchema, itemStackFromUnknown } from '@nerima-games/mc-kernel'
 import { Option, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
@@ -1196,14 +1197,14 @@ describe('authoritative multiplayer server core', () => {
 
     it('drops a chest\'s stored items instead of destroying them', () => {
       const at = { x: 1, y: 64, z: 1 }
-      const containerId = `world-1:${String(at.x)},${String(at.y)},${String(at.z)}`
+      const containerId = `overworld:${String(at.x)},${String(at.y)},${String(at.z)}`
       const fixture = makeFixture(
         ({ x, y, z }) => x === at.x && y === at.y && z === at.z ? 'chest' : null,
         6_000,
         { x: 0, y: 64, z: 0 },
         'clear',
         'overworld',
-        { metadata: { containers: [{ containerId, kind: 'chest', slots: [{ item: 'stone', count: 5 }, null] }] } },
+        { metadata: { containers: [{ containerId, kind: 'chest', slots: [{ ...Result.getOrThrow(itemStackFromUnknown('stone', 5)), durability: null }, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)] }] } },
       )
       const frames = fixture.connect('socket-a')
       fixture.receive('socket-a', join('alice'))

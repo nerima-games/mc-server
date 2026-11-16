@@ -28,10 +28,10 @@ import {
   SurvivalAuthority,
   type SurvivalEvent,
 } from '@nerima-games/mx-multiplayer'
-import { AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
-import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
+import { itemStackFromUnknown, maxStackCountForStack, BlockStateFacingSchema, type BlockStateFacing, itemStackEqualsIgnoringCount, AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { ContainerSlotSchema, applyRedstoneHostEvents, type RedstoneWorldRuntimeService, type RedstoneHostLookup, type RedstoneHostWritePort, PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { blockIndex, readBlock, type Chunk, type ChunkWithBlockStates, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
-import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange } from '@nerima-games/mc-sim'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange, type ContainerStoredStack, type Container, type ContainerStorageSnapshot, type ContainerStorageServiceApi, type HopperServiceApi, type ContainerStorageServiceFailure, ContainerStorageSnapshotSchema, containerStorageOwnerRegistration, hopperOwnerRegistration, CONTAINER_STORAGE_REPLICATED_OWNER_ID, type ReplicatedOwnerCandidate } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -144,7 +144,7 @@ import {
   type SurvivalHungerState,
   type StatusEffectApplication,
 } from '@nerima-games/mx-gameplay'
-import { Brand, Effect, Option, Result, Schema } from 'effect'
+import { Brand, Cause, Effect, Exit, Option, Result, Schema } from 'effect'
 import {
   SleepAuthority,
   decodeSleepWireMessage,
@@ -204,7 +204,7 @@ import {
   spendExperienceLevels,
 } from '../multiplayer-shared/anvil-repair.js'
 import { frameTag, specializedFrameWireLengths, unknownRecord } from './wire-frame-validation.js'
-import type { ServerWorldWrite, ServerWorldWriteOptions } from './world-write-port.js'
+import { commitCoordinatorRequest, type ServerWorldWrite, type ServerWorldWriteOptions } from './world-write-port.js'
 import {
   addStackToInventory,
   cloneInventory,
@@ -274,9 +274,16 @@ export type GeneratedBlockReadFailure =
   | Readonly<{ _tag: 'GeneratedBlockIdFailure'; failure: BlockIdFailure }>
   | Readonly<{ _tag: 'GeneratedBlockRegistryFailure'; failure: BlockRegistryFailure }>
 
+type HopperHostFailure = ReturnType<typeof applyRedstoneHostEvents<never>> extends Effect.Effect<unknown, infer Failure> ? Failure : never
+
 type BlockWriteError = WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteChunkUnavailable
 type BlockCommitDelta = ReplicatedWorldDelta<ReplicatedOwnerChange>
 type BlockCommit = Readonly<{ frame: WireText }>
+type PreparedBlockBatch = Readonly<{
+  batch: WorldWriteBatch
+  prepared: ReadonlyMap<string, Readonly<{ beforeState: EncodedBlockState; afterState: EncodedBlockState }>>
+  previewChanges: ReadonlyArray<Extract<NetworkMessage, { _tag: 'ReplicatedWorldDelta' }>['blockChanges'][number]>
+}>
 
 // Explicit host limits are required: the pinned protocol codec exports no default limits.
 // createReplicatedOwnerRegistry validates them against its internal caps. This path has no owner states.
@@ -289,6 +296,11 @@ const replicatedOwners = Result.getOrThrow(createReplicatedOwnerRegistry([], {
 export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'WorldWriteEncodingFailure'; failure: ProtocolError }>
   | Readonly<{ _tag: 'WorldWriteFailure'; failure: BlockWriteError }>
+  | Readonly<{ _tag: 'HopperFailure'; failure: HopperHostFailure | MultiplayerServerCoreFailure }>
+  | Readonly<{ _tag: 'UnsupportedContainerItemComponents'; containerId: string; slot: number }>
+  | Readonly<{ _tag: 'SavedContainerIdInvalid'; containerId: string }>
+  | Readonly<{ _tag: 'ContainerStorageFailure'; failure: ContainerStorageServiceFailure }>
+  | Readonly<{ _tag: 'SavedItemStackFailure'; path: string; failure: Schema.SchemaError }>
   | Readonly<{ _tag: 'SavedBlockStateFailure'; at: BlockPos; failure: Schema.SchemaError | BlockStateCodecFailure }>
   | Readonly<{ _tag: 'BlockBatchSchemaFailure'; failure: Schema.SchemaError }>
   | Readonly<{ _tag: 'WorldWriteInitializationFailure'; failure: Schema.SchemaError | WorldCommitCoordinatorError }>
@@ -413,8 +425,12 @@ export interface MultiplayerServerCoreParts {
   readonly makeWorldWrite: (options: ServerWorldWriteOptions) => Result.Result<ServerWorldWrite, WorldCommitCoordinatorError>
   readonly generateChunk: (source: ChunkSource, coord: ChunkCoord) => Result.Result<Chunk, ChunkStoreError>
   readonly worldWriteRevisions: (write: ServerWorldWrite, dimension: Dimension) => Readonly<{ world: WorldRevision; dimension: DimensionRevision }>
+  readonly dieUnexpectedRedstoneRequest: () => never
   readonly dieInvalidBlockBatch: (failure: Exclude<WorldWriteInvalidBatch, { reason: 'invalid-block-state' }>) => never
-  readonly commitWorldWrite: (write: ServerWorldWrite, dimension: Dimension, batch: WorldWriteBatch) => Result.Result<Readonly<{ commit: WorldWriteCommit; delta: BlockCommitDelta }>, BlockWriteError>
+  readonly makeContainerServices: (write: ServerWorldWrite) => Readonly<{ containers: ContainerStorageServiceApi; hoppers: HopperServiceApi }>
+  readonly containerStorageSnapshot: (service: ContainerStorageServiceApi) => ContainerStorageSnapshot
+  readonly commitContainerStorage: (write: ServerWorldWrite, snapshot: ContainerStorageSnapshot) => Result.Result<BlockCommitDelta, WorldCommitCoordinatorError>
+  readonly commitWorldWrite: (write: ServerWorldWrite, dimension: Dimension, batch: WorldWriteBatch, changes?: ReadonlyArray<ReplicatedOwnerCandidate>) => Result.Result<Readonly<{ commit: WorldWriteCommit; delta: BlockCommitDelta }>, BlockWriteError>
 }
 
 /** The block box a core simulates; every bound must be finite and each minimum at most its maximum. */
@@ -460,6 +476,10 @@ export interface WeatherClockState {
   readonly seed: number
 }
 
+export type PersistentContainerState = Omit<AuthoritativeSnapshot['containers'][number], 'slots'> & {
+  readonly slots: ReadonlyArray<ContainerStoredStack | null>
+}
+
 export interface MultiplayerServerState {
   readonly revision: number
   readonly blocks: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null; state?: BlockStateValues }>>
@@ -469,7 +489,7 @@ export interface MultiplayerServerState {
   readonly vitals: AuthoritativeSnapshot['vitals']
   readonly timeWeather: AuthoritativeSnapshot['timeWeather']
   readonly weatherClock?: WeatherClockState
-  readonly containers: AuthoritativeSnapshot['containers']
+  readonly containers: ReadonlyArray<PersistentContainerState>
   readonly furnaces: AuthoritativeSnapshot['furnaces']
   readonly villagerTrades: AuthoritativeSnapshot['villagerTrades']
   readonly entities?: ReadonlyArray<AuthoritativeEntityState>
@@ -608,8 +628,6 @@ const containerKindForBlock = (block: string): ContainerKind | undefined => {
   }
 }
 
-const emptyContainerSlots = (kind: ContainerKind): Array<ItemStack | null> =>
-  Array.from({ length: containerCapacity(kind) }, () => null)
 
 export const isWeatherClockState = (value: unknown): value is WeatherClockState => {
   const record = unknownRecord(value)
@@ -840,12 +858,6 @@ interface MutableVitalsState {
   experience: number
 }
 
-interface MutableContainerState {
-  readonly containerId: string
-  readonly kind: ContainerKind
-  readonly slots: Array<ItemStack | null>
-}
-
 interface MutableFurnaceState {
   readonly furnaceId: string
   input: ItemStack | null
@@ -1007,11 +1019,15 @@ const END_PORTAL_FRAME_FILLED_BLOCK = 'end_portal_frame_filled'
 const positionKey = ({ x, y, z }: BlockPos): string => `${String(x)},${String(y)},${String(z)}`
 
 const vitalsSnapshot = (state: MutableVitalsState): VitalsState => ({ ...state })
-const containerSnapshot = (state: MutableContainerState): ContainerState => ({
-  containerId: state.containerId,
-  kind: state.kind,
-  slots: state.slots.map(cloneStack),
-})
+const wireContainerStack = (stack: ContainerStoredStack | null): ItemStack | null =>
+  stack === null ? null : {
+    item: stack.item, count: stack.count,
+    ...(stack.durability === null ? {} : { durability: { ...stack.durability } }),
+  }
+
+const hasNondefaultContainerComponents = (stack: ContainerStoredStack): boolean =>
+  !itemStackEqualsIgnoringCount({ item: stack.item, count: stack.count, components: stack.components }, Result.getOrThrow(itemStack(stack.item, 1)))
+
 const furnaceSnapshot = (state: MutableFurnaceState): FurnaceState => ({
   furnaceId: state.furnaceId,
   input: cloneStack(state.input),
@@ -1132,7 +1148,8 @@ export interface MultiplayerServerCore {
   readonly prepareRealmTransfer: () => Result.Result<WireText, MultiplayerServerCoreFailure>
   readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText) => boolean
   readonly snapshot: () => WorldSnapshot
-  readonly applyHopperTransfer: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyHopperEvents: (runtime: RedstoneWorldRuntimeService) => Effect.Effect<Result.Result<void, MultiplayerServerCoreFailure>>
+  readonly readHopperState: (at: BlockPos) => Result.Result<Readonly<{ facing: BlockStateFacing; enabled: boolean }>, MultiplayerServerCoreFailure>
   readonly applyDispenserTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
   readonly applyDropperTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
   readonly applyRedstoneBlockState: (
@@ -1332,6 +1349,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   if (Result.isFailure(decodedWorldId)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: decodedWorldId.failure })
   const worldId = decodedWorldId.success
   const dimension = options.dimension ?? 'overworld'
+  const decodedDimension = Schema.decodeUnknownResult(DimensionIdSchema)(dimension)
+  if (Result.isFailure(decodedDimension)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: decodedDimension.failure })
+  const hostDimension = decodedDimension.success
   // Bounds come from the caller's configuration; a non-finite bound would fail every lightning strike and bounds test.
   const validBounds = validateServerBounds(options.bounds ?? DEFAULT_BOUNDS)
   if (Result.isFailure(validBounds)) return Result.fail(validBounds.failure)
@@ -1349,17 +1369,54 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const blocks = new BlockOverrides([...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])])
   const plannedBlocks = new Map<string, BlockOverride>()
   const world = makeWorldReader(options.chunkSource, options.parts, blocks, plannedBlocks)
+  const initialContainers: Array<Container> = []
+  for (const state of options.initialState?.containers ?? []) {
+    const match = /^([\s\S]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(state.containerId)
+    if (match === null || match[0] !== state.containerId || match[1] !== dimension) {
+      return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: state.containerId })
+    }
+    const at = { x: Number(match[2]), y: Number(match[3]), z: Number(match[4]) }
+    const address = Schema.decodeUnknownResult(BlockPositionSchema)(at)
+    if (Result.isFailure(address) || at.y < bounds.minY || at.y > bounds.maxY
+      || state.containerId !== `${dimension}:${String(at.x)},${String(at.y)},${String(at.z)}`) {
+      return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: state.containerId })
+    }
+    initialContainers.push({ id: state.containerId, kind: state.kind, slots: state.slots })
+  }
+  const initialStorage = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({ version: 3, containers: initialContainers })
+  if (Result.isFailure(initialStorage)) return Result.fail({ _tag: 'ContainerStorageFailure', failure: initialStorage.failure })
   const worldWrite = options.parts.makeWorldWrite({
     world: worldId,
-    owners: [],
+    owners: [containerStorageOwnerRegistration(initialStorage.success), hopperOwnerRegistration({ hoppers: [] })],
     dimension,
     chunkStores: { forDimension: () => world.chunkStore },
   })
   if (Result.isFailure(worldWrite)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: worldWrite.failure })
+  const storageServices = options.parts.makeContainerServices(worldWrite.success)
+  const storageSnapshot = () => options.parts.containerStorageSnapshot(storageServices.containers)
+  const storageIdAt = (at: BlockPos): string => `${dimension}:${String(at.x)},${String(at.y)},${String(at.z)}`
+  const storedContainerAt = (at: BlockPos): Container | undefined => storageSnapshot().containers.find((container) => container.id === storageIdAt(at))
+  const containerSnapshot = (state: Container): ContainerState => ({
+    containerId: `${worldId}${state.id.slice(dimension.length)}`, kind: state.kind, slots: state.slots.map(wireContainerStack),
+  })
+  const persistentContainers = (): ReadonlyArray<PersistentContainerState> =>
+    storageSnapshot().containers.map((state) => ({ containerId: state.id, kind: state.kind, slots: state.slots }))
+  const containerChangesFor = (edits: ReadonlyArray<BlockOverride>): ReadonlyArray<ReplicatedOwnerCandidate> => {
+    const current = storageSnapshot()
+    let containers = current.containers
+    for (const edit of edits) {
+      const id = storageIdAt(edit.at)
+      const kind = containerKindForBlock(edit.block ?? '')
+      const previous = containers.find((container) => container.id === id)
+      if (kind === previous?.kind) continue
+      containers = containers.filter((container) => container.id !== id)
+      if (kind !== undefined) containers = [...containers, { id, kind, slots: Array.from({ length: containerCapacity(kind) }, () => null) }]
+    }
+    return containers === current.containers ? [] : [{ ownerId: CONTAINER_STORAGE_REPLICATED_OWNER_ID, state: { version: current.version, containers } }]
+  }
   const blockAt = world.blockAt
   const blockRevisions = () => options.parts.worldWriteRevisions(worldWrite.success, dimension)
-  const commitBlockEdits = (edits: ReadonlyArray<BlockOverride>): Result.Result<BlockCommit, MultiplayerServerCoreFailure> => {
-    const expected = blockRevisions()
+  const prepareBlockBatch = (edits: ReadonlyArray<BlockOverride>, expected = blockRevisions()): Result.Result<PreparedBlockBatch, MultiplayerServerCoreFailure> => {
     const batchEdits: Array<unknown> = []
     const prepared = new Map<string, Readonly<{ beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
     const previewChanges: Array<Extract<NetworkMessage, { _tag: 'ReplicatedWorldDelta' }>['blockChanges'][number]> = []
@@ -1386,9 +1443,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     }
     const batch = Schema.decodeUnknownResult(WorldWriteBatchSchema)({ world: worldId, dimension, expectedWorldRevision: expected.world, expectedDimensionRevision: expected.dimension, edits: batchEdits })
     if (Result.isFailure(batch)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: batch.failure })
+    return Result.succeed({ batch: batch.success, prepared, previewChanges })
+  }
+  const commitBlockEdits = (edits: ReadonlyArray<BlockOverride>): Result.Result<BlockCommit, MultiplayerServerCoreFailure> => {
+    const expected = blockRevisions()
+    const preparedBatch = prepareBlockBatch(edits, expected)
+    if (Result.isFailure(preparedBatch)) return Result.fail(preparedBatch.failure)
+    const { batch, prepared, previewChanges } = preparedBatch.success
     const preview = encodeFrame({ _tag: 'ReplicatedWorldDelta', world: worldId, revision: expected.world + 1, changes: [], blockChanges: previewChanges }, replicatedOwners)
     if (Result.isFailure(preview)) return Result.fail({ _tag: 'WorldWriteEncodingFailure', failure: preview.failure })
-    const committed = options.parts.commitWorldWrite(worldWrite.success, dimension, batch.success)
+    const committed = options.parts.commitWorldWrite(worldWrite.success, dimension, batch, containerChangesFor(edits))
     if (Result.isFailure(committed)) return Result.fail({ _tag: 'WorldWriteFailure', failure: committed.failure })
     // The coordinator publishes this validated batch; all wire states were encoded before that publication.
     const changes = committed.success.delta.blockChanges.map((change) => {
@@ -1400,7 +1464,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         : { at: change.position, block, state: change.state })
       return { dimension: change.dimension, position: change.position, before: change.before, after: change.after, beforeState: cell.beforeState, afterState: cell.afterState }
     })
-    const message = { _tag: 'ReplicatedWorldDelta', world: committed.success.delta.world, revision: committed.success.delta.revision, changes: committed.success.delta.changes, blockChanges: changes }
+    const message = { _tag: 'ReplicatedWorldDelta', world: committed.success.delta.world, revision: committed.success.delta.revision, changes: [], blockChanges: changes }
     // Successful commits increment the expected world revision once and publish the checked cell changes.
     // The preflight above admitted the same wire fields and bounds; a failure here is a coordinator invariant defect.
     return Result.succeed({ frame: Result.getOrThrow(encodeFrame(message, replicatedOwners)) })
@@ -1451,13 +1515,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     ? { ...options.initialState.weatherClock }
     : { ...DEFAULT_WEATHER_CLOCK }
   let thunderStrikeSequence = Math.floor(timeWeather.timeOfDay / THUNDER_STRIKE_INTERVAL_TICKS)
-  const containers = new Map<string, MutableContainerState>(
-    (options.initialState?.containers ?? []).map((state) => [state.containerId, {
-      containerId: state.containerId,
-      kind: state.kind,
-      slots: state.slots.map(cloneStack),
-    }]),
-  )
   const furnaces = new Map<string, MutableFurnaceState>(
     (options.initialState?.furnaces ?? []).map((state) => [state.furnaceId, furnaceFromSnapshot(state)]),
   )
@@ -1857,7 +1914,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     inventories: [...inventories].map(([player, state]) => ({ player, state: inventorySnapshot(state) })),
     vitals: [...vitals].map(([player, state]) => ({ player, state: vitalsSnapshot(state) })),
     timeWeather: { ...timeWeather },
-    containers: [...containers.values()].map(containerSnapshot),
+    containers: storageSnapshot().containers.map(containerSnapshot),
     furnaces: [...furnaces.values()].map(furnaceSnapshot),
     villagerTrades,
     entities: [...entities.values()],
@@ -2031,8 +2088,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     JSON.stringify([worldId, at.x, at.y, at.z])
 
   const parseContainerId = (containerId: string): BlockPos | null => {
-    const match = /^([^:]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(containerId)
-    if (match === null || match[1] !== worldId) return null
+    const match = /^([\s\S]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(containerId)
+    if (match === null || match[0] !== containerId || match[1] !== worldId) return null
     const at = { x: Number(match[2]), y: Number(match[3]), z: Number(match[4]) }
     if (!Number.isSafeInteger(at.x) || !Number.isSafeInteger(at.y) || !Number.isSafeInteger(at.z)) return null
     return isInBounds(at) && containerIdAt(at) === containerId ? at : null
@@ -2096,7 +2153,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     vitals: [...vitals].map(([player, state]) => ({ player, state: vitalsSnapshot(state) })),
     timeWeather: { ...timeWeather },
     weatherClock: { ...weatherClock },
-    containers: [...containers.values()].map(containerSnapshot),
+    containers: persistentContainers(),
     furnaces: [...furnaces.values()].map(furnaceSnapshot),
     villagerTrades,
     entities: [...entities.values()],
@@ -2129,57 +2186,37 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
 
   const notifyStateChanged = (): void => options.onStateChanged?.(persistentState())
 
-  const containerAt = (position: BlockPos): Result.Result<MutableContainerState | undefined, MultiplayerServerCoreFailure> => {
+  const containerAt = (position: BlockPos): Result.Result<Container | undefined, MultiplayerServerCoreFailure> => {
     if (!isInBounds(position)) return Result.succeed(undefined)
     const block = blockAt(position)
     if (Result.isFailure(block)) return Result.fail(block.failure)
     const expectedKind = containerKindForBlock(block.success ?? '')
-    const container = containers.get(containerIdAt(position))
+    const container = storedContainerAt(position)
     return Result.succeed(expectedKind === undefined || container?.kind !== expectedKind ? undefined : container)
   }
 
   const readContainerSlots = (at: BlockPos): Result.Result<ReadonlyArray<ContainerSlotSnapshot> | undefined, MultiplayerServerCoreFailure> => {
     const container = containerAt(at)
     if (Result.isFailure(container)) return Result.fail(container.failure)
-    return Result.succeed(container.success?.slots.map((stack) => stack === null || stack === undefined
+    return Result.succeed(container.success?.slots.map((stack) => stack === null
       ? { count: 0, maxStack: 64 }
-      : { count: stack.count, maxStack: isItemType(stack.item) ? maxStackCountOfItem(stack.item) : 64 }))
+      : { count: stack.count, maxStack: maxStackCountForStack(stack) }))
   }
 
-  const applyHopperTransfer = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
-    const moveFirstStack = (source: MutableContainerState, destination: MutableContainerState): Result.Result<boolean, MultiplayerServerCoreFailure> => {
-      // moveStack changes the slots as it succeeds, so the advance is checked before any attempt.
-      const reserved = revisionAfter(1)
-      if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
-      for (let sourceIndex = 0; sourceIndex < source.slots.length; sourceIndex += 1) {
-        if (source.slots[sourceIndex] === null || source.slots[sourceIndex] === undefined) continue
-        for (let destinationIndex = 0; destinationIndex < destination.slots.length; destinationIndex += 1) {
-          if (moveStack(source.slots, sourceIndex, destination.slots, destinationIndex, 1) !== null) continue
-          // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
-          Result.getOrThrow(advanceRevision())
-          notifyStateChanged()
-          broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(source) })
-          broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(destination) })
-          return Result.succeed(true)
-        }
-      }
-      return Result.succeed(false)
-    }
+  const commitStorage = (container: Container): Result.Result<BlockCommitDelta, MultiplayerServerCoreFailure> => {
+    const snapshot = storageSnapshot()
+    const candidate = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({
+      version: snapshot.version, containers: snapshot.containers.map((current) => current.id === container.id ? container : current),
+    })
+    if (Result.isFailure(candidate)) return Result.fail({ _tag: 'ContainerStorageFailure', failure: candidate.failure })
+    const committed = options.parts.commitContainerStorage(worldWrite.success, candidate.success)
+    return Result.mapError(committed, (failure): MultiplayerServerCoreFailure => ({ _tag: 'ContainerStorageFailure', failure }))
+  }
 
-    const hopperResult = containerAt(at)
-    if (Result.isFailure(hopperResult)) return Result.fail(hopperResult.failure)
-    const hopper = hopperResult.success
-    if (hopper?.kind !== 'hopper') return Result.succeed(false)
-    const belowResult = containerAt({ x: at.x, y: at.y - 1, z: at.z })
-    if (Result.isFailure(belowResult)) return Result.fail(belowResult.failure)
-    const below = belowResult.success
-    if (below !== undefined && hopper.slots.some((stack) => stack !== null && stack !== undefined)) {
-      return moveFirstStack(hopper, below)
-    }
-    const aboveResult = containerAt({ x: at.x, y: at.y + 1, z: at.z })
-    if (Result.isFailure(aboveResult)) return Result.fail(aboveResult.failure)
-    const above = aboveResult.success
-    return above === undefined ? Result.succeed(false) : moveFirstStack(above, hopper)
+  const broadcastStorageClock = (delta: BlockCommitDelta): void => {
+    broadcastFrame(Result.getOrThrow(encodeFrame({
+      _tag: 'ReplicatedWorldDelta', world: delta.world, revision: delta.revision, changes: [], blockChanges: [],
+    }, replicatedOwners)))
   }
 
   const applyItemDropperTrigger = (at: BlockPos, kind: 'dispenser' | 'dropper'): Result.Result<boolean, MultiplayerServerCoreFailure> => {
@@ -2187,31 +2224,182 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     const block = blockAt(at)
     if (Result.isFailure(block)) return Result.fail(block.failure)
     if (block.success !== kind) return Result.succeed(false)
-    const container = containers.get(containerIdAt(at))
+    const container = storedContainerAt(at)
     if (container?.kind !== kind) return Result.succeed(false)
-    const slot = container.slots.findIndex((stack) => stack !== null && stack !== undefined)
+    const slot = container.slots.findIndex((stack) => stack !== null)
     if (slot < 0) return Result.succeed(false)
-
     const source = container.slots[slot]
     if (source === null || source === undefined) return Result.succeed(false)
+    if (hasNondefaultContainerComponents(source)) return Result.fail({ _tag: 'UnsupportedContainerItemComponents', containerId: containerIdAt(at), slot })
     const reserved = revisionAfter(1)
     if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
     const entity: AuthoritativeEntityState = {
       _tag: 'item-drop',
       entityId: `${kind}:${positionKey(at)}:drop:${String(reserved.success)}:${String(slot)}` as AuthoritativeEntityState['entityId'],
       at: { x: at.x + 0.5, y: at.y + 0.5, z: at.z - 0.25 },
-      stack: { ...source, count: 1 },
+      stack: { ...wireContainerStack(source), item: source.item, count: 1 },
     }
-    const dropped = writePositions([{ _tag: 'entity', entity }])
-    if (Result.isFailure(dropped)) return Result.fail(dropped.failure)
-    container.slots[slot] = source.count === 1 ? null : { ...source, count: source.count - 1 }
-    // revisionAfter(1) succeeded above, and writing the drop does not advance the revision.
+    const outside = firstOutsideAddressableCells(positionsOfWrite({ _tag: 'entity', entity }))
+    if (outside !== undefined) return Result.fail(outside)
+    const slots = [...container.slots]
+    if (source.count === 1) slots[slot] = null
+    else {
+      const remainder = itemStack(source.item, source.count - 1, { components: source.components })
+      if (Result.isFailure(remainder)) return Result.fail({ _tag: 'ItemStackFailure', failure: remainder.failure })
+      slots[slot] = { ...remainder.success, durability: source.durability }
+    }
+    const next = { ...container, slots }
+    const committed = commitStorage(next)
+    if (Result.isFailure(committed)) return Result.fail(committed.failure)
+    Result.getOrThrow(writePositions([{ _tag: 'entity', entity }]))
     Result.getOrThrow(advanceRevision())
     notifyStateChanged()
-    broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(container) })
+    broadcastStorageClock(committed.success)
+    broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(next) })
     broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity })
     return Result.succeed(true)
   }
+
+  const readHopperState = (at: BlockPos): Result.Result<Readonly<{ facing: BlockStateFacing; enabled: boolean }>, MultiplayerServerCoreFailure> => {
+    const cell = world.readCell(at)
+    if (Result.isFailure(cell)) return Result.fail(cell.failure)
+    const state = decodeBlockState(cell.success.block, cell.success.state)
+    if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at, failure: state.failure })
+    const hopper = Schema.decodeUnknownResult(Schema.Struct({ facing: BlockStateFacingSchema, enabled: Schema.Boolean }))(state.success)
+    return Result.mapError(hopper, (failure): MultiplayerServerCoreFailure => ({ _tag: 'SavedBlockStateFailure', at, failure }))
+  }
+
+  const applyHopperEvents = (runtime: RedstoneWorldRuntimeService): Effect.Effect<Result.Result<void, MultiplayerServerCoreFailure>> => Effect.gen(function* () {
+    const events = yield* runtime.drainHopperTransferEvents
+    if (events.length === 0) return Result.succeed(undefined)
+    const beforeStorage = storageSnapshot()
+    const contexts = new Map<string, ReturnType<RedstoneHostLookup['readHopperTransferContext']>>()
+    const cells = new Map<string, ResultSuccess<ReturnType<typeof world.readCell>>>()
+    const adjacent = (at: BlockPos): Result.Result<ReturnType<RedstoneHostLookup['readHopperTransferContext']>['sourceAbove'], MultiplayerServerCoreFailure> => {
+      const container = containerAt(at)
+      if (Result.isFailure(container)) return Result.fail(container.failure)
+      if (container.success === undefined) return Result.succeed(null)
+      const kind = container.success.kind
+      const position = Schema.decodeUnknownResult(BlockPositionSchema)(at)
+      return Result.mapError(Result.map(position, (position) => ({ address: { dimension: hostDimension, position }, kind })),
+        (failure): MultiplayerServerCoreFailure => ({ _tag: 'BlockBatchSchemaFailure', failure }))
+    }
+    for (const event of events) {
+      const cell = world.readCell(event.position)
+      if (Result.isFailure(cell)) return Result.fail(cell.failure)
+      cells.set(positionKey(event.position), cell.success)
+      const hopper = readHopperState(event.position)
+      if (Result.isFailure(hopper)) return Result.fail(hopper.failure)
+      const offsets: Record<BlockStateFacing, readonly [number, number, number]> = { down: [0, -1, 0], up: [0, 1, 0], north: [0, 0, -1], south: [0, 0, 1], west: [-1, 0, 0], east: [1, 0, 0] }
+      const offset = offsets[hopper.success.facing]
+      const above = adjacent({ x: event.position.x, y: event.position.y + 1, z: event.position.z })
+      if (Result.isFailure(above)) return Result.fail(above.failure)
+      const facing = adjacent({ x: event.position.x + offset[0], y: event.position.y + offset[1], z: event.position.z + offset[2] })
+      if (Result.isFailure(facing)) return Result.fail(facing.failure)
+      contexts.set(positionKey(event.position), { powered: !hopper.success.enabled, sourceAbove: above.success, destinationFacing: facing.success })
+    }
+    const expected = blockRevisions()
+    const stagedEdits = new Map<string, WorldWriteBatch['edits'][number]>()
+    const preparedCells = new Map<string, Readonly<{ beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
+    const previewChanges = new Map<string, PreparedBlockBatch['previewChanges'][number]>()
+    const prepare = (edits: ReadonlyArray<BlockOverride>, revisions = expected): Result.Result<WorldWriteBatch, MultiplayerServerCoreFailure> => {
+      const prepared = prepareBlockBatch(edits, revisions)
+      if (Result.isFailure(prepared)) return Result.fail(prepared.failure)
+      for (const edit of prepared.success.batch.edits) stagedEdits.set(positionKey(edit.position), edit)
+      for (const [key, state] of prepared.success.prepared) preparedCells.set(key, state)
+      for (const change of prepared.success.previewChanges) previewChanges.set(positionKey(change.position), change)
+      const preview = encodeFrame({ _tag: 'ReplicatedWorldDelta', world: worldId, revision: expected.world + 1, changes: [], blockChanges: [...previewChanges.values()] }, replicatedOwners)
+      if (Result.isFailure(preview)) return Result.fail({ _tag: 'WorldWriteEncodingFailure', failure: preview.failure })
+      return Result.succeed(prepared.success.batch)
+    }
+    const lookup: RedstoneHostLookup = {
+      isLeverActive: (at) => Result.getOrThrow(isLeverActive(at)),
+      isPoweredRailPowered: (at) => Result.getOrThrow(isPoweredRailPowered(at)),
+      readContainerSlots: (at) => {
+        const slots = Result.getOrThrow(readContainerSlots(at))
+        return slots === undefined ? undefined : Result.getOrThrow(Schema.decodeUnknownResult(Schema.Array(ContainerSlotSchema))(slots))
+      },
+      readHopperBlockId: (at) => Option.getOrThrow(Option.fromUndefinedOr(cells.get(positionKey(at)))).block,
+      readHopperTransferContext: (at) => Option.getOrThrow(Option.fromUndefinedOr(contexts.get(positionKey(at)))),
+      readPistonCell: (at) => Result.getOrThrow(readPistonCell(at)),
+    }
+    let ownRevisionFailure: MultiplayerServerCoreFailure | undefined
+    let committed: BlockCommitDelta | undefined
+    let frame: WireText | undefined
+    const port: RedstoneHostWritePort<MultiplayerServerCoreFailure> = {
+      coordinator: {
+        ...worldWrite.success.coordinator,
+        commit: (request) => Effect.gen(function* () {
+          const containers = request.changes.find((change) => change.ownerId === CONTAINER_STORAGE_REPLICATED_OWNER_ID)
+          if (containers !== undefined && JSON.stringify(containers.state) !== JSON.stringify(beforeStorage)) {
+            const reserved = revisionAfter(1)
+            if (Result.isFailure(reserved)) {
+              ownRevisionFailure = reserved.failure
+              // This public port admits only native commit errors; cancellation lets the helper restore its staged events.
+              return yield* Effect.interrupt
+            }
+          }
+          let validatedRequest = request
+          if (request.blockWrite !== undefined) {
+            const edits: Array<WorldWriteBatch['edits'][number]> = []
+            for (const edit of request.blockWrite.edits) {
+              const staged = stagedEdits.get(positionKey(edit.position))
+              if (staged === undefined || staged.block !== edit.block) {
+                return yield* Effect.die(new Error('Hopper commit does not match its staged block edit', { cause: { edit, staged } }))
+              }
+              // The pinned HopperService intent codec omits state; restore the host's validated state at publication.
+              edits.push(staged.state === undefined
+                ? { position: edit.position, block: edit.block }
+                : { position: edit.position, block: edit.block, state: staged.state })
+            }
+            validatedRequest = { ...request, blockWrite: { ...request.blockWrite, edits } }
+          }
+          const delta = yield* commitCoordinatorRequest(worldWrite.success.coordinator, validatedRequest)
+          const blockChanges = delta.blockChanges.map((change) => {
+            const prepared = Option.getOrThrow(Option.fromUndefinedOr(preparedCells.get(positionKey(change.position))))
+            const block = change.after === AIR_BLOCK_ID ? null : Option.getOrThrow(Option.fromUndefinedOr(Result.getOrThrow(blockTypeOfId(change.after))))
+            blocks.record(change.state === undefined ? { at: change.position, block } : { at: change.position, block, state: change.state })
+            return { dimension: change.dimension, position: change.position, before: change.before, after: change.after, beforeState: prepared.beforeState, afterState: prepared.afterState }
+          })
+          frame = Result.getOrThrow(encodeFrame({ _tag: 'ReplicatedWorldDelta', world: delta.world, revision: delta.revision, changes: [], blockChanges }, replicatedOwners))
+          committed = delta
+          return delta
+        }),
+      },
+      hopperService: storageServices.hoppers,
+      buildHopperBlockWrite: (event, id, revisions) => {
+        const cell = Option.getOrThrow(Option.fromUndefinedOr(cells.get(positionKey(event.position))))
+        const state = decodeBlockState(id, cell.state)
+        if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: event.position, failure: state.failure })
+        return prepare([{ at: event.position, block: 'hopper', state: state.success }], { world: revisions.expectedRevision, dimension: revisions.expectedDimensionRevision })
+      },
+      // The host drains every non-hopper queue before this bridge runs.
+      buildCommitRequest: () => options.parts.dieUnexpectedRedstoneRequest(),
+    }
+    yield* runtime.restoreEvents({ hopper: events, trigger: [], lamp: [], powered: [], piston: [] })
+    const attempted = yield* Effect.exit(Effect.result(applyRedstoneHostEvents(runtime, [{ dimension: hostDimension, lookup }], port)))
+    if (Exit.isFailure(attempted)) {
+      if (ownRevisionFailure !== undefined && Cause.hasInterruptsOnly(attempted.cause)) {
+        yield* runtime.drainHopperTransferEvents
+        return Result.fail(ownRevisionFailure)
+      }
+      return yield* Effect.failCause(attempted.cause)
+    }
+    const applied = attempted.value
+    if (Result.isFailure(applied)) {
+      yield* runtime.drainHopperTransferEvents
+      return Result.fail({ _tag: 'HopperFailure', failure: applied.failure })
+    }
+    if (committed !== undefined) {
+      const changed = storageSnapshot().containers.filter((container) =>
+        JSON.stringify(beforeStorage.containers.find((before) => before.id === container.id)) !== JSON.stringify(container))
+      if (changed.length > 0) Result.getOrThrow(advanceRevision())
+      notifyStateChanged()
+      if (frame !== undefined) broadcastFrame(frame)
+      for (const container of changed) broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(container) })
+    }
+    return Result.succeed(undefined)
+  })
 
   const applyDispenserTrigger = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => applyItemDropperTrigger(at, 'dispenser')
 
@@ -3542,40 +3730,56 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       case 'ContainerCommand': {
         const at = parseContainerId(message.containerId)
         if (at === null) return { accepted: false, reason: 'invalid-command' }
-        const container = containers.get(message.containerId)
+        const container = storedContainerAt(at)
         if (container === undefined) return { accepted: false, reason: 'resource-not-found' }
         const access = facilityIsAccessible(message.player, at, container.kind)
         if (Result.isFailure(access)) return rejectBlockRead(access.failure)
         if (access.success !== null) return { accepted: false, reason: access.success }
+        let next = container
         if (message.action._tag === 'move-item') {
           const playerIsSource = message.action.source._tag === 'player-slot'
           const playerSlot = playerIsSource ? message.action.source.slot : message.action.destination.slot
+          const containerSlot = playerIsSource ? message.action.destination.slot : message.action.source.slot
           if (hasInventorySlotMetadata(message.player, playerSlot)) return { accepted: false, reason: 'invalid-command' }
-          const sourceSlots = playerIsSource ? inventory.slots : container.slots
-          const destinationSlots = playerIsSource ? container.slots : inventory.slots
+          const stored = container.slots[containerSlot]
+          if (stored !== null && stored !== undefined && hasNondefaultContainerComponents(stored)) return { accepted: false, reason: 'invalid-command' }
+          const containerSlots = container.slots.map(wireContainerStack)
+          const playerSlots = inventory.slots.map((stack, index) => {
+            const durability = inventory.durability[index]
+            return stack === null || durability === null || durability === undefined
+              ? cloneStack(stack)
+              : { ...stack, durability: { ...durability } }
+          })
           const reason = moveStack(
-            sourceSlots,
-            message.action.source.slot,
-            destinationSlots,
-            message.action.destination.slot,
+            playerIsSource ? playerSlots : containerSlots, message.action.source.slot,
+            playerIsSource ? containerSlots : playerSlots, message.action.destination.slot,
             message.action.count,
           )
           if (reason !== null) return { accepted: false, reason }
+          const slots = [...container.slots]
+          const changed = containerSlots[containerSlot]
+          if (changed === null || changed === undefined) slots[containerSlot] = null
+          else {
+            const stack = itemStackFromUnknown(changed.item, changed.count)
+            if (Result.isFailure(stack)) return rejectBlockRead({ _tag: 'ItemStackFailure', failure: stack.failure })
+            slots[containerSlot] = { ...stack.success, durability: changed.durability === undefined ? null : changed.durability }
+          }
+          next = { ...container, slots }
+          const committed = commitStorage(next)
+          if (Result.isFailure(committed)) return rejectBlockRead(committed.failure)
+          inventory.slots.splice(0, inventory.slots.length, ...playerSlots)
+          const moved = playerSlots[playerSlot]
+          inventory.durability[playerSlot] = moved === null || moved === undefined || moved.durability === undefined
+            ? null : { ...moved.durability }
+          broadcastStorageClock(committed.success)
         }
         return {
           accepted: true,
           deltas: (nextRevision) => message.action._tag === 'move-item'
             ? [
-                { _tag: 'ContainerDelta', world: worldId, revision: nextRevision, state: containerSnapshot(container) },
-                {
-                  _tag: 'PlayerInventoryDelta',
-                  world: worldId,
-                  revision: nextRevision,
-                  player: message.player,
-                  state: inventorySnapshot(inventory),
-                },
-              ]
-            : [],
+                { _tag: 'ContainerDelta', world: worldId, revision: nextRevision, state: containerSnapshot(next) },
+                { _tag: 'PlayerInventoryDelta', world: worldId, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) },
+              ] : [],
         }
       }
       case 'FurnaceCommand': {
@@ -4886,11 +5090,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           ? null
           : { ...sourceStack, count: sourceStack.count - 1 }
         disturbFallingBlocks([at])
-        const containerKind = containerKindForBlock(placedBlock)
-        if (containerKind !== undefined) {
-          const containerId = containerIdAt(at)
-          containers.set(containerId, { containerId, kind: containerKind, slots: emptyContainerSlots(containerKind) })
-        } else if (placedBlock === 'furnace') {
+        if (placedBlock === 'furnace') {
           const furnaceId = furnaceIdAt(at)
           furnaces.set(furnaceId, {
             furnaceId,
@@ -4916,7 +5116,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         if (placedBlock === 'brewing_stand') {
           broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: emptyBrewingStandState() })
         }
-        if (containerKind !== undefined || placedBlock === 'furnace' || placedBlock === 'brewing_stand') broadcast(authoritativeSnapshot())
+        if (containerKindForBlock(placedBlock) !== undefined || placedBlock === 'furnace' || placedBlock === 'brewing_stand') broadcast(authoritativeSnapshot())
         return { accepted: true, message }
       }
       case 'BlockBreak': {
@@ -4969,9 +5169,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         const furnaceId = furnaceIdAt(at)
         const brewingKey = positionKey(at)
         if (containerKindForBlock(brokenBlock) !== undefined) {
-          const container = containers.get(containerId)
+          const container = storedContainerAt(at)
           if (container !== undefined) {
-            for (const stack of container.slots) if (stack !== null && stack !== undefined) storedStacks.push(stack)
+            for (const [slot, stack] of container.slots.entries()) {
+              if (stack === null) continue
+              if (hasNondefaultContainerComponents(stack)) return rejectMutation(
+                client, message, 'unauthorized-player', 'invalid-mutation',
+                { _tag: 'UnsupportedContainerItemComponents', containerId, slot },
+              )
+              const wire = wireContainerStack(stack)
+              if (wire !== null) storedStacks.push(wire)
+            }
           }
         } else if (brokenBlock === 'furnace') {
           const furnace = furnaces.get(furnaceId)
@@ -5008,8 +5216,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         poweredRails.delete(positionKey(at))
         levers.delete(positionKey(at))
         disturbFallingBlocks([at])
-        if (containerKindForBlock(brokenBlock) !== undefined) containers.delete(containerId)
-        else if (brokenBlock === 'furnace') furnaces.delete(furnaceId)
+        if (brokenBlock === 'furnace') furnaces.delete(furnaceId)
         else if (brokenBlock === 'brewing_stand') brewingStands.delete(brewingKey)
         notifyStateChanged()
         broadcastFrame(committed.success.frame)
@@ -6431,5 +6638,5 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(true)
   }
 
-  return Result.succeed({ connect, receive, disconnect, detachPlayer, prepareRealmTransfer: replicatedSnapshotFrame, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
+  return Result.succeed({ connect, receive, disconnect, detachPlayer, prepareRealmTransfer: replicatedSnapshotFrame, acceptRealmTransfer, snapshot, applyHopperEvents, readHopperState, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
 }
