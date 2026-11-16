@@ -54,8 +54,12 @@ export const migrateLegacyBrewingState = (value: unknown): Result.Result<Brewing
       : state.bottle.potion === 'awkward' && state.ingredient !== 'nether_wart'
     if (!compatible) return Result.fail(savedServerStateFailure('brewingStands', 'invalid legacy brewing recipe'))
   }
-  const powder = Math.ceil(Math.max(0, state.fuelUnits - 20) / 20)
+  const charges = Math.min(state.fuelUnits, 20)
+  // Only complete groups of 20 charges become powder; discard the remainder instead of creating fuel.
+  const powder = Math.floor((state.fuelUnits - charges) / 20)
   if (powder > 64) return Result.fail(savedServerStateFailure('brewingStands', 'legacy brewing fuel exceeds one stack'))
+  // Legacy starts already consumed the ingredient and one charge. Honor the paid output once on load;
+  // the remaining brewing time is deliberately forgiven rather than charging those inputs again.
   const bottle = state.brewing !== undefined ? potionItem(state.brewing.output)
     : state.bottle === undefined ? undefined
     : state.bottle === 'water_bottle' ? 'water_bottle' : potionItem(state.bottle.potion)
@@ -63,7 +67,7 @@ export const migrateLegacyBrewingState = (value: unknown): Result.Result<Brewing
     bottles: [bottle === undefined ? null : { item: bottle, count: 1 }, null, null],
     ingredient: state.ingredient === undefined ? null : { item: state.ingredient, count: 1 },
     fuel: powder === 0 ? null : { item: 'blaze_powder', count: powder },
-    fuelCharges: Math.min(state.fuelUnits, 20),
+    fuelCharges: charges,
     brewProgressSecs: 0,
   })
   return Result.mapError(migrated, (failure) => savedServerStateFailure('brewingStands', failure.reason))

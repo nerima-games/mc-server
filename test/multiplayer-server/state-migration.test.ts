@@ -46,13 +46,21 @@ const oldShapes = [
     wire: { ...emptyWire, bottles: [{ item, count: 1 }, null, null], fuelCharges: 7 },
   })),
   ...[
-    { units: 20, charges: 20, powder: 0 },
-    { units: 21, charges: 20, powder: 1 },
-    { units: 40, charges: 20, powder: 1 },
-    { units: 41, charges: 20, powder: 2 },
-    { units: 1300, charges: 20, powder: 64 },
-  ].map(({ units, charges, powder }) => ({
-    name: `fuel ${units}`, old: { fuelUnits: units },
+    { units: 0, charges: 0, powder: 0, dropped: 0 },
+    { units: 19, charges: 19, powder: 0, dropped: 0 },
+    { units: 20, charges: 20, powder: 0, dropped: 0 },
+    { units: 21, charges: 20, powder: 0, dropped: 1 },
+    { units: 39, charges: 20, powder: 0, dropped: 19 },
+    { units: 40, charges: 20, powder: 1, dropped: 0 },
+    { units: 41, charges: 20, powder: 1, dropped: 1 },
+    { units: 59, charges: 20, powder: 1, dropped: 19 },
+    { units: 60, charges: 20, powder: 2, dropped: 0 },
+    { units: 1299, charges: 20, powder: 63, dropped: 19 },
+    { units: 1300, charges: 20, powder: 64, dropped: 0 },
+    { units: 1301, charges: 20, powder: 64, dropped: 1 },
+    { units: 1319, charges: 20, powder: 64, dropped: 19 },
+  ].map(({ units, charges, powder, dropped }) => ({
+    name: `fuel ${units}, discarding ${dropped} charges`, old: { fuelUnits: units },
     wire: { ...emptyWire, fuelCharges: charges, fuel: powder === 0 ? null : { item: 'blaze_powder', count: powder } },
   })),
 ]
@@ -78,7 +86,7 @@ describe.each([1, 2])('format %s to format 3 migration', (format) => {
   })
 
   it.each([
-    { name: 'fuel beyond one stack', state: { fuelUnits: 1301 } },
+    { name: 'fuel producing 65 powder', state: { fuelUnits: 1320 } },
     { name: 'maximum fuel beyond one stack', state: { fuelUnits: Number.MAX_SAFE_INTEGER } },
     { name: 'negative fuel', state: { fuelUnits: -1 } },
     { name: 'fractional fuel', state: { fuelUnits: 0.5 } },
@@ -96,11 +104,11 @@ describe.each([1, 2])('format %s to format 3 migration', (format) => {
     expect(await readFile(path, 'utf8')).toBe(source)
   })
 
-  it('preserves all generated legacy brewing shapes and fuel through migration and a format 3 file round trip', async () => {
+  it('preserves generated legacy brewing shapes and whole fuel units, discarding only sub-powder charges', async () => {
     const path = join(await mkdtemp(join(tmpdir(), 'server-migration-property-')), 'state.json')
     await fc.assert(fc.asyncProperty(
       fc.constantFrom(...oldShapes),
-      fc.integer({ min: 0, max: 1300 }),
+      fc.integer({ min: 0, max: 1319 }),
       fc.nat({ max: 100_000 }),
       async ({ old, wire }, fuelUnits, burnTicksRemaining) => {
         const migrated = Result.getOrThrow(migrateLegacyBrewingState({ ...old, fuelUnits }))
@@ -109,8 +117,12 @@ describe.each([1, 2])('format %s to format 3 migration', (format) => {
         expect(newWire.ingredient).toEqual(wire.ingredient)
         expect(newWire.brewProgressSecs).toBe(0)
         expect(newWire.fuelCharges).toBe(Math.min(fuelUnits, 20))
-        const powder = Math.ceil(Math.max(0, fuelUnits - 20) / 20)
+        const excess = Math.max(0, fuelUnits - 20)
+        const powder = Math.floor(excess / 20)
         expect(newWire.fuel).toEqual(powder === 0 ? null : { item: 'blaze_powder', count: powder })
+        const recovered = newWire.fuelCharges + (newWire.fuel === null ? 0 : newWire.fuel.count * 20)
+        expect(fuelUnits - recovered).toBe(excess % 20)
+        expect(recovered).toBeLessThanOrEqual(fuelUnits)
         await writeFile(path, JSON.stringify({ format, worldId, seed, state: {
           revision: 0, blocks: [], brewingStands: [{ at, state: { ...old, fuelUnits } }],
           furnaces: [{ furnaceId: 'furnace', input: null, fuel: null, output: null, burnTicksRemaining, cookTicks: 0 }],
