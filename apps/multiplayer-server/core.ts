@@ -559,7 +559,7 @@ type MobWireState = NonNullable<Extract<AuthoritativeEntityState, { readonly _ta
 
 /**
  * An ecosystem mob between the game ticks of one tick: its stored entity and wire state, its AI state, its planned feet,
- * the player it targets (hostile kinds only), and the attacks its AI made so far.
+ * its nearest living player, and the attacks its AI made so far.
  */
 type MovingMob = Readonly<{
   entity: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
@@ -5059,7 +5059,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       // simulationTick already counts this tick's game ticks, so this game tick is the matching earlier one.
       const plannedTick = SimulationTick(simulationTick - elapsedTicks + gameTick + 1)
       // The roster's target only stands in for a mob without a movement goal, and stepEcosystemMob has just set each
-      // mob's goal toward its own nearest player, so no single roster target is needed.
+      // mob's goal from its own nearest player, or from wandering when there is none, so no roster target is needed.
       const planned = Result.getOrThrow(planMobMovementRoster(roster, undefined, movementWorld, plannedTick, dimension))
       const [fault] = planned.faults
       if (fault !== undefined) return Result.fail({ _tag: 'MobMovementFailure', fault })
@@ -5851,16 +5851,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         const selfPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
         const movement = mobMovements.get(entity.entityId)
         const ecosystem = movement === undefined ? state : { ...state, movement }
-        if (passiveKind !== undefined) {
-          movingMobs.push({
-            entity, kind: passiveKind, mobState: initialMobState, ecosystem, feet: selfPosition, target: undefined, attackDamages: [],
-          })
-          continue
-        }
-        if (hostileKind === undefined) continue
+        // Every ecosystem mob, passive ones included, gets its nearest living player, as mx-gameplay's entities stage
+        // hands each mob the player; mx-gameplay's rules decide whether that player is close enough to flee or chase.
         const target = targetEntry === undefined
           ? undefined
           : { player: targetEntry[0], at: Result.getOrThrow(positionFromNumbers(targetEntry[1].at.x, targetEntry[1].at.y, targetEntry[1].at.z)) }
+        if (passiveKind !== undefined) {
+          movingMobs.push({ entity, kind: passiveKind, mobState: initialMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
+          continue
+        }
+        if (hostileKind === undefined) continue
         movingMobs.push({ entity, kind: hostileKind, mobState: hostileMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
       }
       // Ecosystem mobs move as one roster after the loop: mx-gameplay plans the whole roster once per game tick.

@@ -3443,20 +3443,24 @@ describe('multiplayer server authoritative state', () => {
     return new Map(current.map((mob) => [mob.id, mob.feet]))
   }
 
-  /** A lone cow planned by plannedRoster for one server tick of `gameTicks` game ticks. */
+  // The core hands every ecosystem mob its nearest living player; in the pasture tests that is alice, who joined at
+  // pastureJoinAt. mx-gameplay's passive rule decides whether she is close enough to flee from.
+  const pastureTarget = position(PositionAxis(pastureJoinAt.x), PositionAxis(pastureJoinAt.y), PositionAxis(pastureJoinAt.z))
+
+  /** A lone cow planned by plannedRoster, with alice as its target, for one server tick of `gameTicks` game ticks. */
   const plannedCowFeet = (terrain: ChunkSource, start: Position, gameTicks: number): Position => {
-    const feet = plannedRoster(terrain, [{ id: 'cow-1', kind: 'cow', start }], [gameTicks]).get('cow-1')
+    const feet = plannedRoster(terrain, [{ id: 'cow-1', kind: 'cow', start, target: pastureTarget }], [gameTicks]).get('cow-1')
     if (feet === undefined) throw new Error('the plan keeps the cow')
     return feet
   }
 
-  /** Cows `cow-0`, `cow-1`, … standing at `starts`, as the save holds them and as plannedRoster plans them. */
+  /** Cows `cow-0`, `cow-1`, … standing at `starts`, as the save holds them and as plannedRoster plans them with alice. */
   const cowsAt = (starts: ReadonlyArray<Readonly<{ x: number; y: number; z: number }>>) => ({
     entities: starts.map((at, index): SavedEntity => ({
       _tag: 'living', entityId: entityId(`cow-${String(index)}`), entityType: 'cow', at, health: 10, maxHealth: 10,
     })),
     planned: starts.map((at, index): PlannedMob => ({
-      id: `cow-${String(index)}`, kind: 'cow', start: position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z)),
+      id: `cow-${String(index)}`, kind: 'cow', start: position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z)), target: pastureTarget,
     })),
   })
 
@@ -3578,6 +3582,43 @@ describe('multiplayer server authoritative state', () => {
     // The edits reach cow-1's plan: on the bare floor it stays at y = 64, and here it starts to fall.
     expect(plannedRoster(pastureWithEdits, cows.planned, [1]).get('cow-1')?.y).toBe(64)
     expect(fixture.persisted.at(-1)?.entities?.[1]?.at.y).toBeLessThan(64)
+  })
+
+  // R-SV3b's input: a cow on a stone floor with no saved edits, two blocks from where a player may stand.
+  const fleeState = (): MultiplayerServerState => ({
+    ...initialState(),
+    blocks: [],
+    containers: [],
+    furnaces: [],
+    entities: [{ _tag: 'living', entityId: entityId('cow-0'), entityType: 'cow', at: { x: 0, y: 64, z: 0 }, health: 10, maxHealth: 10 }],
+  })
+  const fleeCow = (target?: Position): PlannedMob => ({
+    id: 'cow-0', kind: 'cow', start: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)), ...(target === undefined ? {} : { target }),
+  })
+
+  it('moves a cow away from its nearest player as the published AI and planner compute', () => {
+    const playerAt = { x: 2, y: 64, z: 0 }
+    const fixture = makeFixture(fleeState(), playerAt, 'normal', { chunkSource: pastureTerrain })
+
+    expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
+
+    // mx-gameplay decides whether the player is close enough to flee from; the core only hands it the nearest player.
+    const planned = plannedRoster(pastureTerrain, [fleeCow(position(PositionAxis(playerAt.x), PositionAxis(playerAt.y), PositionAxis(playerAt.z)))], [1])
+    const persisted = fixture.persisted.at(-1)?.entities
+    expectPlannedPositions(persisted, planned)
+    expect(persisted?.[0]?.at.x).toBeLessThan(0)
+  })
+
+  it('lets a cow wander as the published AI and planner compute when no player is present', () => {
+    const fixture = makeFixture(fleeState(), { x: 2, y: 64, z: 0 }, 'normal', { chunkSource: pastureTerrain })
+    expect(fixture.receive({ _tag: 'PlayerLeave', player: playerId('alice') }).accepted).toBe(true)
+    fixture.persisted.length = 0
+
+    expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
+
+    const persisted = fixture.persisted.at(-1)?.entities
+    expectPlannedPositions(persisted, plannedRoster(pastureTerrain, [fleeCow()], [1]))
+    expect(persisted?.[0]?.at.x).toBeGreaterThan(0)
   })
 
   it('moves a zombie toward its nearest player as one roster plan computes', () => {
