@@ -1,4 +1,6 @@
+import { DimensionRevisionSchema, SimulationTick } from '@nerima-games/mc-kernel'
 import { PlayerId, WorldId, type SurvivalActorState, type SurvivalSnapshot } from '@nerima-games/mx-multiplayer'
+import { Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -12,7 +14,10 @@ import {
   SLEEP_MAX_WIRE_LENGTH,
   actorSleepLocation,
   sleepClientFromSnapshot,
+  sleepRatio,
+  type SleepAuthorityOptions,
   type SleepCommand,
+  type SleepIntentContext,
 } from '../apps/multiplayer-shared/sleep-network'
 
 const alice = PlayerId.make('alice')
@@ -44,10 +49,16 @@ const command = (player: typeof alice, session: string, requestId: string, expec
   clientTick: 5,
   bed,
 })
-const options = (sleepPercentage = 100) => ({
-  sleepPercentage,
+const options = (sleepPercentage = 100): SleepAuthorityOptions => ({
+  sleepRatio: Result.getOrThrow(sleepRatio(String(sleepPercentage))),
   validateSleep: () => ({ dimension: 'overworld', bedValid: true, nightOrThunder: true, safe: true }),
 })
+const context: SleepIntentContext = {
+  targetTick: Result.getOrThrow(SimulationTick.result(0)),
+  expectedDimensionRevision: Result.getOrThrow(Schema.decodeUnknownResult(DimensionRevisionSchema)(0)),
+}
+const makeAuthority = (state: SurvivalSnapshot, authorityOptions: SleepAuthorityOptions) =>
+  Result.getOrThrow(SleepAuthority.make(state, authorityOptions))
 
 describe('authoritative sleep network adapter', () => {
   it('decodes complete authoritative sleep messages', () => {
@@ -141,7 +152,6 @@ describe('authoritative sleep network adapter', () => {
     'invalid-game-mode',
     'out-of-reach',
     'insufficient-items',
-    'cooldown-active',
     'occupied',
     'missing-block',
     'target-not-found',
@@ -159,6 +169,14 @@ describe('authoritative sleep network adapter', () => {
       result: { accepted: false, requestId: 'sleep-rejected', revision: 1, reason },
     }
     expect(decodeSleepWireMessage(JSON.stringify(message))).toEqual(message)
+  })
+
+  it('rejects the cooldown-active reason, which no mx-gameplay 0.11.0 rule produces', () => {
+    const message = {
+      _tag: 'SleepCommandResult',
+      result: { accepted: false, requestId: 'sleep-rejected', revision: 1, reason: 'cooldown-active' },
+    }
+    expect(decodeSleepWireMessage(JSON.stringify(message))).toBeUndefined()
   })
 
   it('rejects non-object and malformed sleep frames', () => {
@@ -187,8 +205,8 @@ describe('authoritative sleep network adapter', () => {
   it('does not apply local sleep until the server accepts it', () => {
     const pending = queueSleepCommand(initialSleepClientState(), command(alice, 'a', 'sleep-a', 0))
     expect(pending.sleepers.size).toBe(0)
-    const authority = new SleepAuthority(snapshot(actor(alice, 'a')), options())
-    const result = authority.execute(command(alice, 'a', 'sleep-a', 0))
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), options())
+    const result = authority.execute(command(alice, 'a', 'sleep-a', 0), context)
     const applied = applySleepCommandResult(pending, result)
     expect(applied.sleepers.size).toBe(0)
     expect(applied.skippedRevision).toBe(1)
@@ -196,13 +214,13 @@ describe('authoritative sleep network adapter', () => {
   })
 
   it('uses ceil threshold for multiple actors and simultaneous revision ordering', () => {
-    const authority = new SleepAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
-    const first = authority.execute(command(alice, 'a', 'sleep-a', 0))
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
+    const first = authority.execute(command(alice, 'a', 'sleep-a', 0), context)
     expect(first).toMatchObject({ accepted: true, revision: 1 })
     if (!first.accepted) throw new Error('first sleep rejected')
     expect(first.events).toContainEqual({ _tag: 'SleepProgress', sleeping: 1, required: 2, connected: 2, ready: false })
-    expect(authority.execute(command(bob, 'b', 'stale-b', 0))).toMatchObject({ accepted: false, reason: 'stale-revision' })
-    const second = authority.execute(command(bob, 'b', 'sleep-b', 1))
+    expect(authority.execute(command(bob, 'b', 'stale-b', 0), context)).toMatchObject({ accepted: false, reason: 'stale-revision' })
+    const second = authority.execute(command(bob, 'b', 'sleep-b', 1), context)
     expect(second).toMatchObject({ accepted: true, revision: 2 })
     if (!second.accepted) throw new Error('second sleep rejected')
     expect(second.events.filter((event) => event._tag === 'NightSkipped')).toHaveLength(1)
@@ -210,7 +228,7 @@ describe('authoritative sleep network adapter', () => {
 
   it('rolls back rejected requests without changing authoritative sleepers', () => {
     const queued = queueSleepCommand(initialSleepClientState(), command(alice, 'wrong', 'rejected', 0))
-    const result = new SleepAuthority(snapshot(actor(alice, 'a')), options()).execute(command(alice, 'wrong', 'rejected', 0))
+    const result = makeAuthority(snapshot(actor(alice, 'a')), options()).execute(command(alice, 'wrong', 'rejected', 0), context)
     const applied = applySleepCommandResult(queued, result)
     expect(applied.sleepers.size).toBe(0)
     expect(applied.pending.size).toBe(0)
@@ -224,13 +242,111 @@ describe('authoritative sleep network adapter', () => {
     expect(twice).toEqual(once)
   })
 
+  it('wakes a sleeper through the LeaveSleep intent and rejects a sleeper that is already awake', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
+    expect(authority.execute(command(alice, 'a', 'sleep-a', 0), context)).toMatchObject({ accepted: true, revision: 1 })
+    const leave: SleepCommand = { _tag: 'LeaveSleep', actor: alice, session: 'a', requestId: 'leave-a', expectedRevision: 1, clientTick: 6 }
+    expect(authority.execute(leave, context)).toEqual({
+      accepted: true,
+      requestId: 'leave-a',
+      revision: 2,
+      events: [
+        { _tag: 'ActorSleepChanged', actor: alice, sleeping: null },
+        { _tag: 'SleepProgress', sleeping: 0, required: 2, connected: 2, ready: false },
+      ],
+    })
+    expect(authority.snapshot().actors.every((candidate) => candidate.sleeping === undefined)).toBe(true)
+    expect(authority.execute({ ...leave, requestId: 'leave-again', expectedRevision: 2 }, context)).toEqual({
+      accepted: false, requestId: 'leave-again', revision: 2, reason: 'not-sleeping',
+    })
+  })
+
+  it('maps a LeaveSleep that SurvivalAuthority rejects to invalid-command', () => {
+    // SurvivalAuthority rejects a non-integer expected revision when it validates the command header.
+    const sleepingAlice = { ...actor(alice, 'a'), sleeping: { dimension: 'overworld', bed } }
+    const authority = makeAuthority({ ...snapshot(sleepingAlice, actor(bob, 'b')), revision: 0.5 }, options(100))
+    const leave: SleepCommand = { _tag: 'LeaveSleep', actor: alice, session: 'a', requestId: 'leave-a', expectedRevision: 0.5, clientTick: 6 }
+    expect(authority.execute(leave, context)).toEqual({ accepted: false, requestId: 'leave-a', revision: 0.5, reason: 'invalid-command' })
+  })
+
+  it('reconciles sleepers whose bed stops validating and leaves valid sleepers alone', () => {
+    let bedValid = true
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), {
+      ...options(100),
+      validateSleep: () => ({ dimension: 'overworld', bedValid, nightOrThunder: true, safe: true }),
+    })
+    expect(authority.execute(command(alice, 'a', 'sleep-a', 0), context)).toMatchObject({ accepted: true, revision: 1 })
+    expect(authority.reconcile()).toEqual([])
+    bedValid = false
+    expect(authority.reconcile()).toEqual([
+      { _tag: 'ActorSleepChanged', actor: alice, sleeping: null },
+      { _tag: 'SleepProgress', sleeping: 0, required: 2, connected: 2, ready: false },
+    ])
+    expect(authority.snapshot().revision).toBe(2)
+  })
+
+  it.each([
+    ['an empty request id', actor(alice, 'a'), { requestId: '' }, 'invalid-command'],
+    ['an actor outside the roster', actor(bob, 'b'), {}, 'unauthorized-actor'],
+    ['a dead actor', { ...actor(alice, 'a'), health: 0 }, {}, 'actor-dead'],
+    ['a creative actor', { ...actor(alice, 'a'), gameMode: 'creative' }, {}, 'invalid-game-mode'],
+    ['a fractional bed position', actor(alice, 'a'), { bed: { x: 0, y: 64.5, z: 1 } }, 'invalid-command'],
+  ] as const)('rejects EnterSleep from %s', (_case, rosterActor, override, reason) => {
+    const authority = makeAuthority(snapshot(rosterActor), options())
+    const request = { ...command(alice, 'a', 'sleep-check', 0), ...override }
+    expect(authority.execute(request, context)).toEqual({ accepted: false, requestId: request.requestId, revision: 0, reason })
+  })
+
+  it.each([
+    ['invalid-bed', { bedValid: false, nightOrThunder: true, safe: true }],
+    ['not-sleep-time', { bedValid: true, nightOrThunder: false, safe: true }],
+    ['sleep-unsafe', { bedValid: true, nightOrThunder: true, safe: false }],
+  ] as const)('rejects EnterSleep with %s when validateSleep refuses the bed', (reason, validation) => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), {
+      ...options(),
+      validateSleep: () => ({ dimension: 'overworld', ...validation }),
+    })
+    expect(authority.execute(command(alice, 'a', 'sleep-check', 0), context)).toEqual({
+      accepted: false, requestId: 'sleep-check', revision: 0, reason,
+    })
+  })
+
+  it('rejects EnterSleep from an actor who is already asleep', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
+    expect(authority.execute(command(alice, 'a', 'sleep-a', 0), context)).toMatchObject({ accepted: true, revision: 1 })
+    expect(authority.execute(command(alice, 'a', 'sleep-again', 1), context)).toEqual({
+      accepted: false, requestId: 'sleep-again', revision: 1, reason: 'already-sleeping',
+    })
+  })
+
+  it('fails to restore a sleeper whose bed is not a block position', () => {
+    const sleepingAlice = { ...actor(alice, 'a'), sleeping: { dimension: 'overworld', bed: { x: 0, y: 64.5, z: 1 } } }
+    const restored = SleepAuthority.make(snapshot(sleepingAlice), options())
+    expect(Result.isFailure(restored)).toBe(true)
+  })
+
+  it('rejoins one actor with a new session and leaves the other actors untouched', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options())
+    expect(authority.rejoin(alice, 'a', 'a-next')).toBe(true)
+    expect(authority.snapshot().actors).toEqual([actor(alice, 'a-next'), actor(bob, 'b')])
+  })
+
+  it('ignores disconnects and rejoins for actors it does not hold', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), options())
+    expect(authority.disconnect(bob)).toEqual([])
+    expect(authority.rejoin(alice, 'a', '')).toBe(false)
+    expect(authority.rejoin(alice, 'wrong', 'next')).toBe(false)
+    expect(authority.rejoin(bob, 'b', 'next')).toBe(false)
+    expect(authority.snapshot()).toEqual(snapshot(actor(alice, 'a')))
+  })
+
   it('removes sleepers on disconnect and restores snapshot state on rejoin', () => {
-    const authority = new SleepAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
-    authority.execute(command(alice, 'a', 'sleep-a', 0))
+    const authority = makeAuthority(snapshot(actor(alice, 'a'), actor(bob, 'b')), options(100))
+    authority.execute(command(alice, 'a', 'sleep-a', 0), context)
     expect(authority.disconnect(alice)).toContainEqual(expect.objectContaining({ _tag: 'ActorSleepChanged', actor: alice, sleeping: null }))
 
     const sleepingBob = { ...actor(bob, 'old'), sleeping: { dimension: 'overworld', bed } }
-    const restoredAuthority = new SleepAuthority({ ...snapshot(sleepingBob), revision: 7 }, options())
+    const restoredAuthority = makeAuthority({ ...snapshot(sleepingBob), revision: 7 }, options())
     expect(restoredAuthority.rejoin(bob, 'old', 'new')).toBe(true)
     const restored = sleepClientFromSnapshot(restoredAuthority.snapshot())
     expect(restored.revision).toBe(7)
@@ -238,15 +354,26 @@ describe('authoritative sleep network adapter', () => {
     expect(sleepClientFromSnapshot(snapshot(actor(alice, 'awake'))).sleepers.size).toBe(0)
   })
 
+  it('rejects a bed beyond mx-gameplay DEFAULT_BLOCK_REACH from the actor position', () => {
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), options())
+    const farBed = { x: 0, y: 64, z: 6 }
+    const farCommand: SleepCommand = {
+      _tag: 'EnterSleep', actor: alice, session: 'a', requestId: 'far-bed', expectedRevision: 0, clientTick: 5, bed: farBed,
+    }
+    expect(authority.execute(farCommand, context)).toEqual({
+      accepted: false, requestId: 'far-bed', revision: 0, reason: 'out-of-reach',
+    })
+  })
+
   it('keeps actor membership stable and rejects a repeated session request', () => {
-    const authority = new SleepAuthority(snapshot(actor(alice, 'a')), options())
+    const authority = makeAuthority(snapshot(actor(alice, 'a')), options())
     expect(authority.addActor(actor(alice, 'replacement')).actors).toHaveLength(1)
     expect(authority.addActor(actor(bob, 'b')).actors.map((candidate) => candidate.player)).toEqual([alice, bob])
 
     const request = command(alice, 'a', 'sleep-once', 0)
-    const accepted = authority.execute(request)
+    const accepted = authority.execute(request, context)
     expect(accepted.accepted).toBe(true)
-    expect(authority.execute(request)).toEqual({
+    expect(authority.execute(request, context)).toEqual({
       accepted: false,
       requestId: 'sleep-once',
       revision: accepted.revision,

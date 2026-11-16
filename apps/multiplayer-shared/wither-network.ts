@@ -1,10 +1,16 @@
+import { Result } from 'effect'
+import { PositionAxis, position, type Position } from '@nerima-games/mc-kernel'
 import type { WireText } from '@nerima-games/mx-multiplayer'
-import type {
-  WitherDamageKind,
-  WitherPhase,
-  WitherSkullProjectileDescriptor,
-  WitherSkullVariant,
-  WitherSnapshot,
+import {
+  WitherChargeRemainingSecs as makeWitherChargeRemainingSecs,
+  WitherExplosionPower as makeWitherExplosionPower,
+  WitherHealthPoints as makeWitherHealthPoints,
+  WitherProjectileSpeed as makeWitherProjectileSpeed,
+  type WitherDamageKind,
+  type WitherPhase,
+  type WitherSkullProjectileDescriptor,
+  type WitherSkullVariant,
+  type WitherSnapshot,
 } from '@nerima-games/mc-sim'
 
 import type { RuntimeWitherSkull, WitherRuntimeSnapshot } from './wither-runtime.js'
@@ -77,7 +83,7 @@ const isNonNegativeSafeInteger = (value: unknown): value is number =>
 const isNonNegativeFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0
 
-const decodePosition = (value: unknown): WitherPosition | undefined => {
+const decodePosition = (value: unknown): Position | undefined => {
   if (!isRecord(value) || !hasExactlyKeys(value, ['x', 'y', 'z'])) return undefined
   const x = value['x']
   const y = value['y']
@@ -85,7 +91,12 @@ const decodePosition = (value: unknown): WitherPosition | undefined => {
   if (typeof x !== 'number' || !Number.isFinite(x)
     || typeof y !== 'number' || !Number.isFinite(y)
     || typeof z !== 'number' || !Number.isFinite(z)) return undefined
-  return { x, y, z }
+  // PositionAxis accepts every finite number, which the checks above already guarantee.
+  return position(
+    Result.getOrThrow(PositionAxis.result(x)),
+    Result.getOrThrow(PositionAxis.result(y)),
+    Result.getOrThrow(PositionAxis.result(z)),
+  )
 }
 
 const isWitherDamageKind = (value: unknown): value is WitherDamageKind =>
@@ -103,15 +114,21 @@ const decodeWitherSnapshot = (value: unknown): WitherSnapshot | undefined => {
     || !hasExactlyKeys(value['state'], ['phase', 'healthPoints', 'chargeRemainingSecs', 'feetPosition', 'velocity'])) return undefined
 
   const state = value['state']
+  const feetPosition = decodePosition(state['feetPosition'])
+  const velocity = decodePosition(state['velocity'])
+  if (feetPosition === undefined || velocity === undefined) return undefined
   const phase = state['phase']
   const healthPoints = state['healthPoints']
   const chargeRemainingSecs = state['chargeRemainingSecs']
-  const feetPosition = decodePosition(state['feetPosition'])
-  const velocity = decodePosition(state['velocity'])
-  if (!isWitherPhase(phase) || !isNonNegativeFiniteNumber(healthPoints)
-    || !isNonNegativeFiniteNumber(chargeRemainingSecs) || feetPosition === undefined || velocity === undefined) return undefined
-
-  return { kind: 'wither', version: 1, state: { phase, healthPoints, chargeRemainingSecs, feetPosition, velocity } }
+  if (!isWitherPhase(phase) || typeof healthPoints !== 'number' || typeof chargeRemainingSecs !== 'number') return undefined
+  const decodedHealth = makeWitherHealthPoints.result(healthPoints)
+  const decodedCharge = makeWitherChargeRemainingSecs.result(chargeRemainingSecs)
+  if (Result.isFailure(decodedHealth) || Result.isFailure(decodedCharge)) return undefined
+  return {
+    kind: 'wither',
+    version: 1,
+    state: { phase, healthPoints: decodedHealth.success, chargeRemainingSecs: decodedCharge.success, feetPosition, velocity },
+  }
 }
 
 const decodeWitherSkullDescriptor = (value: unknown): WitherSkullProjectileDescriptor | undefined => {
@@ -122,14 +139,25 @@ const decodeWitherSkullDescriptor = (value: unknown): WitherSkullProjectileDescr
   const variant = value['variant']
   const origin = decodePosition(value['origin'])
   const direction = decodePosition(value['direction'])
-  const speed = value['speed']
-  const explosivePower = value['explosivePower']
+  const speedValue = value['speed']
+  const explosivePowerValue = value['explosivePower']
   const destroysResistantBlocks = value['destroysResistantBlocks']
+  if (typeof speedValue !== 'number' || typeof explosivePowerValue !== 'number') return undefined
+  const speed = makeWitherProjectileSpeed.result(speedValue)
+  const explosivePower = makeWitherExplosionPower.result(explosivePowerValue)
   if (!isWitherSkullVariant(variant) || origin === undefined || direction === undefined
-    || !isNonNegativeFiniteNumber(speed) || !isNonNegativeFiniteNumber(explosivePower)
+    || Result.isFailure(speed) || Result.isFailure(explosivePower)
     || typeof destroysResistantBlocks !== 'boolean') return undefined
 
-  return { kind: 'wither_skull', variant, origin, direction, speed, explosivePower, destroysResistantBlocks }
+  return {
+    kind: 'wither_skull',
+    variant,
+    origin,
+    direction,
+    speed: speed.success,
+    explosivePower: explosivePower.success,
+    destroysResistantBlocks,
+  }
 }
 
 const decodeRuntimeWitherSnapshot = (value: unknown): RuntimeWitherSnapshot | undefined => {

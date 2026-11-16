@@ -7,12 +7,15 @@ import {
   emptyStatusEffectState,
   initialEnderDragonEncounter,
 } from '@nerima-games/mx-gameplay'
-import type { PlayerId } from '@nerima-games/mx-multiplayer'
+import { EntityId, type PlayerId } from '@nerima-games/mx-multiplayer'
+import { PositionAxis, position } from '@nerima-games/mc-kernel'
+import { WitherProjectileSpeed, witherSkullProjectile } from '@nerima-games/mc-sim'
+import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import type { MultiplayerServerState } from '../../apps/multiplayer-server/core'
 import { createLatestStatePersistence, loadServerState, writeServerState } from '../../apps/multiplayer-server/main'
-import { initialWitherRuntimeState, snapshotWitherRuntime } from '../../apps/multiplayer-shared/wither-runtime'
+import { initialWitherRuntimeState, snapshotWitherRuntime, summonRuntimeWither } from '../../apps/multiplayer-shared/wither-runtime'
 
 const playerId = (value: string): PlayerId => value as PlayerId
 
@@ -154,7 +157,161 @@ describe('multiplayer state file round trip', () => {
     await writeServerState(stateFile, worldId, seed, written)
     const loaded = await loadServerState(stateFile, worldId, seed)
 
-    expect(loaded).toEqual(written)
+    expect(loaded).toEqual(Result.succeed(written))
+  })
+
+  const writeStateWithCow = async (mobState: Readonly<{ attackCooldownSecs: number; motionPhase: number; provoked: boolean }>): Promise<string> => {
+    const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-round-trip-')), 'state.json')
+    await writeServerState(stateFile, worldId, seed, {
+      revision: 1,
+      blocks: [],
+      inventories: [],
+      vitals: [],
+      timeWeather: { timeOfDay: 6_000, weather: 'clear' },
+      containers: [],
+      furnaces: [],
+      villagerTrades: [],
+      entities: [{
+        _tag: 'living', entityId: EntityId.make('cow-1'), entityType: 'cow', at: { x: 0, y: 64, z: 0 }, health: 10, maxHealth: 10, mobState,
+      }],
+    })
+    return stateFile
+  }
+
+  it('loads a mob whose saved state mx-gameplay can repair', async () => {
+    const loaded = await loadServerState(await writeStateWithCow({ attackCooldownSecs: 0, motionPhase: 3, provoked: false }), worldId, seed)
+    expect(Result.isSuccess(loaded)).toBe(true)
+  })
+
+  it('fails to load a mob whose saved motion phase exceeds the safe integer range', async () => {
+    const loaded = await loadServerState(await writeStateWithCow({ attackCooldownSecs: 0, motionPhase: 2 ** 60, provoked: false }), worldId, seed)
+    expect(loaded).toMatchObject(Result.fail({ _tag: 'MobStateRepairFailure', entityId: 'cow-1' }))
+  })
+
+  describe('rejects saved positions outside addressable cells', () => {
+    // Finite, but far enough apart that coordinate differences overflow to Infinity.
+    const far = 1.7976931348623157e308
+    const loadWith = async (state: MultiplayerServerState) => {
+      const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-round-trip-')), 'state.json')
+      await writeServerState(stateFile, worldId, seed, state)
+      return loadServerState(stateFile, worldId, seed)
+    }
+
+    it('for an entity', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        entities: [{
+          _tag: 'living', entityId: EntityId.make('creeper-1'), entityType: 'creeper', at: { x: far, y: 64, z: far }, health: 20, maxHealth: 20,
+        }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'entity', id: 'creeper-1', at: { x: far, y: 64, z: far },
+      }))
+    })
+
+    it('for a player', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        playerPositions: [{ player: alice, at: { x: far, y: 64, z: 0 }, facing: { yawRadians: 0, pitchRadians: 0 } }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'player', id: 'alice', at: { x: far, y: 64, z: 0 },
+      }))
+    })
+
+    it('for a wither', async () => {
+      const wither = Result.getOrThrow(summonRuntimeWither(initialWitherRuntimeState(), worldId, { x: far, y: 64, z: 0 }))
+      const loaded = await loadWith({ ...fullyPopulatedState(), wither: snapshotWitherRuntime(wither) })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'wither', id: 'wither-1', at: { x: far, y: 64, z: 0 },
+      }))
+    })
+
+    it('for an eye of ender recovery', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        eyeOfEnderRecoveries: [{ entityId: EntityId.make('eye-1'), at: { x: 0, y: 64, z: far }, remainingSecs: 1 }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'eye-of-ender-recovery', id: 'eye-1', at: { x: 0, y: 64, z: far },
+      }))
+    })
+  })
+
+  describe('rejects saved values every later tick would fail on', () => {
+    const loadWith = async (state: MultiplayerServerState) => {
+      const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-round-trip-')), 'state.json')
+      await writeServerState(stateFile, worldId, seed, state)
+      return loadServerState(stateFile, worldId, seed)
+    }
+
+    it('for a block edit whose name the block registry lacks', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        blocks: [{ at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }],
+      })
+      expect(loaded).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }))
+    })
+
+    it('for a furnace holding an item the item registry lacks', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        furnaces: [{
+          furnaceId: '["world-1",2,64,0]', input: { item: 'legacy_ore', count: 1 }, fuel: null, output: null,
+          burnTicksRemaining: 0, cookTicks: 0,
+        }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'SavedFurnaceInvalid',
+        furnaceId: '["world-1",2,64,0]',
+        failure: { _tag: 'UnknownFurnaceItemType', slot: 'input', item: 'legacy_ore' },
+      }))
+    })
+
+    describe('for a Wither skull outside mc-sim projectile rules', () => {
+      const origin = position(PositionAxis(0), PositionAxis(64), PositionAxis(0))
+      const rules = witherSkullProjectile(origin, origin, 'normal')
+      const withSkull = (descriptor: typeof rules): MultiplayerServerState => ({
+        ...fullyPopulatedState(),
+        wither: {
+          nextWitherId: 1,
+          nextSkullId: 1,
+          withers: [],
+          skulls: [{ id: 'skull-1', ownerId: 'wither-1', dimension: worldId, descriptor, position: origin, ageSecs: 0 }],
+        },
+      })
+
+      it('rejects an overflowing direction at a speed mc-sim never gives', async () => {
+        const loaded = await loadWith(withSkull({
+          ...rules,
+          direction: position(PositionAxis(Number.MAX_VALUE), PositionAxis(0), PositionAxis(0)),
+          speed: WitherProjectileSpeed(14),
+        }))
+        expect(loaded).toEqual(Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: 'skull-1' }))
+      })
+
+      it('rejects an overflowing direction at the variant speed', async () => {
+        const loaded = await loadWith(withSkull({
+          ...rules,
+          direction: position(PositionAxis(Number.MAX_VALUE), PositionAxis(0), PositionAxis(0)),
+        }))
+        expect(loaded).toEqual(Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: 'skull-1' }))
+      })
+
+      it('rejects a unit direction with a speed mc-sim never gives the variant', async () => {
+        const loaded = await loadWith(withSkull({
+          ...rules,
+          direction: position(PositionAxis(1), PositionAxis(0), PositionAxis(0)),
+          speed: WitherProjectileSpeed(14),
+        }))
+        expect(loaded).toEqual(Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: 'skull-1' }))
+      })
+
+      it('loads a unit direction at the variant speed', async () => {
+        const state = withSkull({ ...rules, direction: position(PositionAxis(1), PositionAxis(0), PositionAxis(0)) })
+        expect(await loadWith(state)).toEqual(Result.succeed(state))
+      })
+    })
   })
 
   it('still loads a state file predating these fields, leaving the new categories empty', async () => {
@@ -171,7 +328,9 @@ describe('multiplayer state file round trip', () => {
     }
 
     await writeServerState(stateFile, worldId, seed, legacyState)
-    const loaded = await loadServerState(stateFile, worldId, seed)
+    const loadedResult = await loadServerState(stateFile, worldId, seed)
+    expect(Result.isSuccess(loadedResult)).toBe(true)
+    const loaded = Result.getOrThrow(loadedResult)
 
     expect(loaded).toMatchObject({
       revision: 1,

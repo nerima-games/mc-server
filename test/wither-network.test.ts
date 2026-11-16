@@ -6,43 +6,47 @@ import { decodeWitherWireMessage, WITHER_MAX_WIRE_LENGTH } from '../apps/multipl
 
 const wire = (message: unknown): WireText => JSON.stringify(message) as WireText
 
+const witherEntry = {
+  id: 'wither-1',
+  dimension: 'overworld',
+  snapshot: {
+    kind: 'wither',
+    version: 1,
+    state: {
+      phase: 'airborne',
+      healthPoints: 300,
+      chargeRemainingSecs: 0,
+      feetPosition: { x: 1, y: 64, z: 1 },
+      velocity: { x: 0, y: 0, z: 0 },
+    },
+  },
+  rangedCooldownSecs: 2,
+  meleeCooldownSecs: 0,
+  shotsFired: 3,
+}
+
+const skullEntry = {
+  id: 'wither-skull-1',
+  ownerId: 'wither-1',
+  dimension: 'overworld',
+  descriptor: {
+    kind: 'wither_skull',
+    variant: 'blue',
+    origin: { x: 1, y: 66, z: 1 },
+    direction: { x: 0, y: 0, z: 1 },
+    speed: 1,
+    explosivePower: 1,
+    destroysResistantBlocks: true,
+  },
+  position: { x: 1, y: 66, z: 1 },
+  ageSecs: 0,
+}
+
 const snapshot = {
   nextWitherId: 2,
   nextSkullId: 1,
-  withers: [{
-    id: 'wither-1',
-    dimension: 'overworld',
-    snapshot: {
-      kind: 'wither',
-      version: 1,
-      state: {
-        phase: 'airborne',
-        healthPoints: 300,
-        chargeRemainingSecs: 0,
-        feetPosition: { x: 1, y: 64, z: 1 },
-        velocity: { x: 0, y: 0, z: 0 },
-      },
-    },
-    rangedCooldownSecs: 2,
-    meleeCooldownSecs: 0,
-    shotsFired: 3,
-  }],
-  skulls: [{
-    id: 'wither-skull-1',
-    ownerId: 'wither-1',
-    dimension: 'overworld',
-    descriptor: {
-      kind: 'wither_skull',
-      variant: 'blue',
-      origin: { x: 1, y: 66, z: 1 },
-      direction: { x: 0, y: 0, z: 1 },
-      speed: 1,
-      explosivePower: 1,
-      destroysResistantBlocks: true,
-    },
-    position: { x: 1, y: 66, z: 1 },
-    ageSecs: 0,
-  }],
+  withers: [witherEntry],
+  skulls: [skullEntry],
 }
 
 describe('decodeWitherWireMessage', () => {
@@ -173,6 +177,22 @@ describe('decodeWitherWireMessage', () => {
     ['a non-record skull entry', { ...snapshot, skulls: [null] }],
     ['a negative skull age', { ...snapshot, skulls: [{ ...snapshot.skulls[0]!, ageSecs: -1 }] }],
     ['a non-array skull collection', { ...snapshot, skulls: null }],
+    ['a negative wither health', {
+      ...snapshot,
+      withers: [{ ...witherEntry, snapshot: { ...witherEntry.snapshot, state: { ...witherEntry.snapshot.state, healthPoints: -1 } } }],
+    }],
+    ['a negative wither charge time', {
+      ...snapshot,
+      withers: [{ ...witherEntry, snapshot: { ...witherEntry.snapshot, state: { ...witherEntry.snapshot.state, chargeRemainingSecs: -1 } } }],
+    }],
+    ['a non-numeric skull speed', {
+      ...snapshot,
+      skulls: [{ ...skullEntry, descriptor: { ...skullEntry.descriptor, speed: 'fast' } }],
+    }],
+    ['a non-numeric skull explosive power', {
+      ...snapshot,
+      skulls: [{ ...skullEntry, descriptor: { ...skullEntry.descriptor, explosivePower: null } }],
+    }],
   ])('rejects snapshots containing %s', (_case, invalidSnapshot) => {
     expect(decodeWitherWireMessage(wire({ _tag: 'WitherSnapshot', revision: 2, snapshot: invalidSnapshot }))).toBeUndefined()
   })

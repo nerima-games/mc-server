@@ -1,5 +1,5 @@
 import {
-  createHungerAuthority,
+  HungerAuthority,
   decodeFrame,
   encodeFrame,
   type AuthoritativeCommand,
@@ -8,6 +8,7 @@ import {
   type AuthoritativeEntityState,
   type AuthoritativeSnapshot,
   type BlockMutationRejected,
+  BlockPlace,
   type BlockPos,
   type CommandId,
   type CommandRejectionReason,
@@ -21,14 +22,14 @@ import {
   type WorldId,
   type WorldSnapshot,
   type ContainerKind,
-  type HungerActor,
-  type HungerCommand,
-  type HungerEvent,
+  type HungerActivity,
+  SurvivalAuthority,
+  type SurvivalEvent,
 } from '@nerima-games/mx-multiplayer'
-import { blockIdOf, blockTypeOfId, DeltaTimeSecs, isBlockType, isItemType, maxStackCountOfItem, propertyOfBlockId, StackCount, type ItemType } from '@nerima-games/mc-kernel'
-import { pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { END_PORTAL_BLOCK, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, nearestStrongholdSite, type Dimension } from '@nerima-games/mc-worldgen'
-import { EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, forwardVector, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, targetBlockFromPlayerPose, totalExperienceAtLevel, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
+import { AIR_BLOCK_ID, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
+import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -59,7 +60,6 @@ import {
   ZOMBIE_KIND,
   ZOMBIE_XP_REWARD,
   ZOMBIFIED_PIGLIN_KIND,
-  applyFurnaceAdvance,
   applyStatusEffect,
   acceptBrewingBottle,
   acceptBrewingFuel,
@@ -90,12 +90,10 @@ import {
   ENDERMAN_TELEPORT_ATTEMPTS,
   endermanTeleportCandidateCells,
   endermanTeleportUrge,
-  furnaceAdvanceChanged,
   FALLING_BLOCK_MOVES_PER_TICK,
   miningLootContextForItem,
   nextRoll,
   normaliseSeed,
-  planFurnaceAdvance,
   planFallingBlockMoves,
   PRIMED_TNT_FUSE_SECS,
   rollDropsOfKind,
@@ -106,6 +104,12 @@ import {
   resolveSafeEndermanTeleport,
   stepCreeperFuse,
   stepEcosystemMob,
+  chunkCoordsAround,
+  mobMovementWorldFromChunkWindow,
+  planMobMovementRoster,
+  type ChunkWindow,
+  type MobMovementRosterFault,
+  type MobRoster,
   TNT_EXPLOSION_POWER,
   weatherExpires,
   type CreeperFuse,
@@ -128,11 +132,23 @@ import {
   initialEnderDragonEncounter,
   type EnderDragonEncounterSnapshot,
   type EnchantedItem,
+  DEFAULT_BLOCK_REACH,
+  DEFAULT_SURVIVAL_DIFFICULTY,
+  resolveFoodUse,
+  type InvalidFoodItemId,
+  type SurvivalActivityInput,
+  type SurvivalHungerError,
+  type SurvivalDifficulty,
+  type SurvivalHungerState,
+  type StatusEffectApplication,
 } from '@nerima-games/mx-gameplay'
-import { Option } from 'effect'
+import { Brand, Effect, Option, Result, Schema } from 'effect'
 import {
   SleepAuthority,
   decodeSleepWireMessage,
+  sleepRatio,
+  type SleepIntentContext,
+  type SleepRatio,
   type SleepWireMessage,
 } from '../multiplayer-shared/sleep-network.js'
 import {
@@ -143,6 +159,9 @@ import {
   snapshotWitherRuntime,
   summonRuntimeWither,
   type WitherRuntimeSnapshot,
+  type RuntimeWither,
+  type RuntimeWitherSkull,
+  type WitherRuntimeAdvance,
   type WitherRuntimeState,
 } from '../multiplayer-shared/wither-runtime.js'
 import {
@@ -204,6 +223,119 @@ import {
 export type ClientId = string
 export type SendFrame = (frame: WireText) => void
 
+type ResultFailure<Value> = Value extends Result.Result<unknown, infer Failure> ? Failure : never
+type ResultSuccess<Value> = Value extends Result.Result<infer Success, unknown> ? Success : never
+type PistonHeadOffsetResult = Result.Result<Schema.Schema.Type<typeof PistonBlockOffsetSchema>, Schema.SchemaError>
+const pistonHeadOffsetResult: PistonHeadOffsetResult = Schema.decodeUnknownResult(PistonBlockOffsetSchema)(1)
+type PistonHeadOffsetFailure = ResultFailure<PistonHeadOffsetResult>
+type WitherOperation = 'match-summon' | 'summon' | 'damage' | 'advance'
+type WitherRuntimeFailure = ResultFailure<
+  | ReturnType<typeof matchRuntimeWitherSummon>
+  | ReturnType<typeof summonRuntimeWither>
+  | ReturnType<typeof damageRuntimeWither>
+  | ReturnType<typeof advanceWitherRuntime>
+>
+type FurnaceStackFailure = ResultFailure<ReturnType<typeof itemStack>>
+type FurnaceStateConstructionFailure = FurnaceStackFailure | Schema.SchemaError | Readonly<{
+  readonly _tag: 'UnknownFurnaceItemType'
+  readonly slot: 'input' | 'fuel' | 'output'
+  readonly item: string
+}>
+type FurnaceAdvanceFailure = SimFurnaceFailure | FurnaceStateConstructionFailure
+type ExplosionPlanFailure = ResultFailure<ReturnType<typeof planExplosion>>
+type BlockRegistryFailure = ResultFailure<ReturnType<typeof propertyOfBlockId> | ReturnType<typeof blockTypeOfId>>
+type BlockIdFailure = ResultFailure<ReturnType<typeof BlockId.result>>
+type StackCountFailure = ResultFailure<ReturnType<typeof StackCount.result>>
+type GeneratedBlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
+type GeneratedNoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result>>
+type CameraPoseFailure = ResultFailure<ReturnType<typeof targetBlockFromPlayerPose> | ReturnType<typeof forwardVector>>
+type PositionFailure = ResultFailure<ReturnType<typeof PositionAxis.result>>
+type CameraOperationFailure = CameraPoseFailure | PositionFailure
+type NoiseSeedFailure = ResultFailure<ReturnType<typeof WorldgenNoiseSeed.result>>
+type BlockAxisFailure = ResultFailure<ReturnType<typeof BlockAxis.result>>
+type FishingEquipmentFailure = ResultFailure<ReturnType<typeof itemStack> | ReturnType<typeof equipmentItem>>
+type FishingLootFailure = Extract<ReturnType<typeof reelFishing>, { readonly _tag: 'InvalidLoot' }>
+type CraftingFailure = ResultFailure<typeof STARTER_RECIPES | ReturnType<typeof itemStack> | ReturnType<typeof craftGrid> | ReturnType<typeof craftFromGrid>>
+type CanonicalItemStackFailure = ResultFailure<ReturnType<typeof itemStack>>
+type ExperienceFailure = ResultFailure<ReturnType<typeof TotalExperience.result> | ReturnType<typeof ExperienceLevel.result>>
+type ProjectileFailure = ResultFailure<ReturnType<typeof raycastArrowBlock>>
+type AnvilPlanFailure = ResultFailure<ReturnType<typeof planAnvilOperation>>
+type AnvilExperienceSpendFailure = ResultFailure<ReturnType<typeof spendExperienceLevels>>
+type MobStateRepairFailure = ResultFailure<ReturnType<typeof repairEcosystemMobState>>
+type StatusEffectTick = ResultSuccess<ReturnType<typeof tickStatusEffects>>
+type EnvironmentalContactDamageStep = ResultSuccess<ReturnType<typeof resolveEnvironmentalContactDamage>>
+
+export type GeneratedBlockReadFailure =
+  | Readonly<{ _tag: 'GeneratedNoiseSeedFailure'; failure: GeneratedNoiseSeedFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockAxisFailure'; axis: 'x' | 'y' | 'z'; failure: GeneratedBlockAxisFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockIdFailure'; failure: BlockIdFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockRegistryFailure'; failure: BlockRegistryFailure }>
+
+export type MultiplayerServerCoreFailure =
+  | Readonly<{ _tag: 'WitherRuntimeFailure'; operation: WitherOperation; failure: WitherRuntimeFailure }>
+  | Readonly<{ _tag: 'FurnaceAdvanceFailure'; failure: FurnaceAdvanceFailure }>
+  | Readonly<{ _tag: 'ExplosionPlanFailure'; failure: ExplosionPlanFailure }>
+  | Readonly<{ _tag: 'BlockRegistryFailure'; failure: BlockRegistryFailure }>
+  | Readonly<{ _tag: 'BlockRegistryLookupFailure'; operation: 'environmental-contact' | 'falling-block' | 'block-break'; block: string }>
+  | Readonly<{ _tag: 'BlockIdFailure'; failure: BlockIdFailure }>
+  | Readonly<{ _tag: 'UnresolvedBlockId'; blockId: number }>
+  | Readonly<{ _tag: 'CameraPoseFailure'; operation: 'target' | 'forward'; failure: CameraOperationFailure }>
+  | Readonly<{ _tag: 'BlockAxisBrandFailure'; axis: 'x' | 'z'; failure: BlockAxisFailure }>
+  | Readonly<{ _tag: 'PositionBrandFailure'; failure: PositionFailure }>
+  | Readonly<{ _tag: 'NoiseSeedBrandFailure'; failure: NoiseSeedFailure }>
+  | Readonly<{ _tag: 'FishingEquipmentFailure'; failure: FishingEquipmentFailure }>
+  | Readonly<{ _tag: 'FishingLootFailure'; failure: FishingLootFailure }>
+  | Readonly<{ _tag: 'ItemStackFailure'; failure: CanonicalItemStackFailure }>
+  | Readonly<{ _tag: 'StackCountFailure'; failure: StackCountFailure }>
+  | Readonly<{ _tag: 'BlockPlaceSchemaFailure'; failure: Schema.SchemaError }>
+  | Readonly<{ _tag: 'CraftingFailure'; failure: CraftingFailure }>
+  | Readonly<{ _tag: 'ExperienceFailure'; failure: ExperienceFailure }>
+  | Readonly<{ _tag: 'ArrowRaycastFailure'; failure: ProjectileFailure }>
+  | Readonly<{ _tag: 'AnvilPlanFailure'; failure: AnvilPlanFailure }>
+  | Readonly<{ _tag: 'AnvilExperienceSpendFailure'; failure: AnvilExperienceSpendFailure }>
+  | Readonly<{ _tag: 'MobStateRepairFailure'; entityId: string; failure: MobStateRepairFailure }>
+  | Readonly<{ _tag: 'PositionOutsideAddressableCells'; subject: 'entity' | 'player' | 'wither' | 'wither-skull' | 'eye-of-ender-recovery'; id: string; at: Readonly<{ x: number; y: number; z: number }> }>
+  | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
+  | Readonly<{ _tag: 'GeneratedBlockReadFailure'; failure: GeneratedBlockReadFailure }>
+  | Readonly<{ _tag: 'InvalidServerTickDuration'; elapsedMs: number }>
+  | Readonly<{ _tag: 'SurvivalHungerFailure'; failure: SurvivalHungerError }>
+  | Readonly<{ _tag: 'FoodUseFailure'; failure: InvalidFoodItemId }>
+  | Readonly<{ _tag: 'ChunkCoordinateFailure'; failure: Brand.BrandError }>
+  | Readonly<{ _tag: 'ChunkStoreLoadFailure'; failure: ChunkStoreError }>
+  | Readonly<{ _tag: 'ChunkStoreUnloadFailure'; failure: ChunkPersistenceError }>
+  | Readonly<{ _tag: 'BlockOverrideNotInRegistry'; at: BlockPos; block: string }>
+  | Readonly<{ _tag: 'SavedFurnaceInvalid'; furnaceId: string; failure: FurnaceAdvanceFailure }>
+  | Readonly<{ _tag: 'WitherSkullOutsideProjectileRules'; id: string }>
+  | Readonly<{ _tag: 'MobMovementFailure'; fault: MobMovementRosterFault }>
+  | Readonly<{ _tag: 'InvalidServerBounds'; bounds: ServerBounds }>
+  | Readonly<{ _tag: 'RevisionExhausted'; counter: RevisionCounter; revision: number }>
+  | Readonly<{ _tag: 'SimulationTickExhausted'; simulationTick: number; elapsedTicks: number }>
+
+const positionFromNumbers = (x: number, y: number, z: number): Result.Result<Position, PositionFailure> => {
+  const brandedX = PositionAxis.result(x)
+  if (Result.isFailure(brandedX)) return Result.fail(brandedX.failure)
+  const brandedY = PositionAxis.result(y)
+  if (Result.isFailure(brandedY)) return Result.fail(brandedY.failure)
+  const brandedZ = PositionAxis.result(z)
+  if (Result.isFailure(brandedZ)) return Result.fail(brandedZ.failure)
+  return Result.succeed({ x: brandedX.success, y: brandedY.success, z: brandedZ.success })
+}
+
+const targetBlockFromNumbers = (
+  at: Readonly<{ x: number; y: number; z: number }>,
+  facing: Orientation,
+  maxDistance: number,
+  isTargetable: (x: number, y: number, z: number) => boolean,
+): Result.Result<Option.Option<BlockTarget>, CameraOperationFailure> => {
+  const position = positionFromNumbers(at.x, at.y, at.z)
+  if (Result.isFailure(position)) return Result.fail(position.failure)
+  return targetBlockFromPlayerPose({
+    feetPosition: position.success,
+    yawRadians: facing.yawRadians,
+    pitchRadians: facing.pitchRadians,
+  }, maxDistance, isTargetable)
+}
+
 export const playerDamageResultKey = (player: PlayerId, commandId: string): string =>
   JSON.stringify([player, commandId])
 
@@ -226,27 +358,66 @@ const anvilFingerprint = (command: AnvilCommand): string => JSON.stringify(comma
 export const enchantingResultKey = (player: PlayerId, commandId: string): string => JSON.stringify([player, commandId])
 const enchantingFingerprint = (command: EnchantingCommand): string => JSON.stringify(command)
 
+/** mx-gameplay survival-hunger operations, made synchronous by the server entrypoint. */
+export interface SurvivalHungerPart {
+  readonly create: (
+    vitals: Readonly<{ healthPoints: EntityHealthPoints; hungerPoints: HungerPoints }>,
+    difficulty: SurvivalDifficulty,
+  ) => SurvivalHungerState
+  /** Applies one activity through mx-gameplay's submit-then-tick path, which owns the difficulty rule for activity exhaustion. */
+  readonly activity: (state: SurvivalHungerState, input: SurvivalActivityInput) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+  readonly eat: (state: SurvivalHungerState, foodPoints: number, saturationModifier: number) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+  readonly respawn: (state: SurvivalHungerState) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+  readonly tick: (
+    state: SurvivalHungerState,
+    elapsed: DeltaTimeSecs,
+  ) => Result.Result<Readonly<{ state: SurvivalHungerState; died: boolean }>, SurvivalHungerError>
+}
+
+/** The read operations of an mc-worldgen ChunkStore, made synchronous by the server entrypoint. */
+export interface ChunkStorePart {
+  readonly peek: (coord: ChunkCoord) => ReadonlyChunkWithBlockStates | undefined
+  readonly load: (coord: ChunkCoord) => Result.Result<ReadonlyChunkWithBlockStates, ChunkStoreError>
+  readonly unload: (coord: ChunkCoord) => Result.Result<boolean, ChunkPersistenceError>
+  /**
+   * A ChunkWindow over exactly `chunks`, by value: it reads no store, so a later load that evicts these chunks from
+   * the store does not change it.
+   */
+  readonly openWindow: (chunks: ReadonlyArray<ReadonlyChunkWithBlockStates>) => ChunkWindow
+}
+
+/** Effect-backed services the core uses synchronously; `entrypoints/core-parts.ts` builds them. */
+export interface MultiplayerServerCoreParts {
+  readonly survivalHunger: SurvivalHungerPart
+  readonly openChunkStore: (source: ChunkSource) => ChunkStorePart
+}
+
+/** The block box a core simulates; every bound must be finite and each minimum at most its maximum. */
+export type ServerBounds = Readonly<{
+  minX: number
+  maxX: number
+  minY: number
+  maxY: number
+  minZ: number
+  maxZ: number
+}>
+
 export interface MultiplayerServerOptions {
   readonly worldId: string
   readonly dimension?: Dimension
   readonly seed: number
   readonly allowedBlocks: ReadonlySet<string>
-  readonly bounds?: Readonly<{
-    minX: number
-    maxX: number
-    minY: number
-    maxY: number
-    minZ: number
-    maxZ: number
-  }>
-  readonly generatedBlockAt?: (position: BlockPos) => string | null
+  readonly bounds?: ServerBounds
+  /** Terrain under the server's block edits; the core's ChunkStore generates chunks from it. */
+  readonly chunkSource: ChunkSource
+  readonly parts: MultiplayerServerCoreParts
   readonly staticBlocks?: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null }>>
   readonly spawnAt: BlockPos
   readonly initialState?: MultiplayerServerState
   readonly onStateChanged?: (state: MultiplayerServerState) => void
   readonly maxMoveDistance?: number
   readonly passableBlocks?: ReadonlySet<string>
-  readonly sleepPercentage?: number
+  readonly sleepRatio?: SleepRatio
   readonly now?: () => number
   readonly difficulty?: 'peaceful' | 'easy' | 'normal' | 'hard'
   readonly onEndPortalUse?: (clientId: ClientId, command: EndPortalUseCommand) => void
@@ -302,7 +473,7 @@ export interface MultiplayerServerState {
 
 export type ReceiveResult =
   | Readonly<{ accepted: true; message: NetworkMessage | SleepWireMessage | WitherWireMessage | EnderDragonWireMessage | PlayerDamageWireMessage | CraftingCommand | BrewingCommand | AnvilCommand | EnchantingCommand }>
-  | Readonly<{ accepted: false; reason: 'unknown-client' | 'malformed-frame' | 'join-required' | 'duplicate-player' | 'identity-spoof' | 'wrong-world' | 'invalid-movement' | 'invalid-mutation' | 'invalid-command' }>
+  | Readonly<{ accepted: false; reason: 'unknown-client' | 'malformed-frame' | 'join-required' | 'duplicate-player' | 'identity-spoof' | 'wrong-world' | 'invalid-movement' | 'invalid-mutation' | 'invalid-command'; failure?: MultiplayerServerCoreFailure }>
 
 type RejectedReceiveReason = Extract<ReceiveResult, { accepted: false }>['reason']
 
@@ -325,6 +496,56 @@ interface MutablePlayer {
   facing: Orientation
 }
 
+type PositionWrite =
+  | Readonly<{ _tag: 'player'; presence: MutablePlayer; at: PlayerSnapshot['at']; facing: Orientation }>
+  | Readonly<{ _tag: 'entity'; entity: AuthoritativeEntityState }>
+  | Readonly<{ _tag: 'wither'; state: WitherRuntimeState }>
+  | Readonly<{ _tag: 'eye-of-ender-recovery'; recovery: EyeOfEnderRecoveryState }>
+
+type PositionOutsideAddressableCells = Extract<MultiplayerServerCoreFailure, { readonly _tag: 'PositionOutsideAddressableCells' }>
+
+type SavedPosition = Omit<PositionOutsideAddressableCells, '_tag'>
+
+/** A tick step whose position writePositions refused; the tick applies everything else. */
+export type PositionWriteRefused = Readonly<{
+  _tag: 'PositionWriteRefused'
+  subject: SavedPosition['subject']
+  id: string
+  kind: string
+  at: Readonly<{ x: number; y: number; z: number }>
+  /** `kept`: the entity stays as it was. `removed`: an in-flight projectile is despawned. `skipped`: a drop is not spawned. */
+  action: 'kept' | 'removed' | 'skipped'
+}>
+
+export type TickReport = Readonly<{ refusals: ReadonlyArray<PositionWriteRefused> }>
+
+const witherPositions = (wither: RuntimeWither): ReadonlyArray<SavedPosition> =>
+  [{ subject: 'wither', id: wither.id, at: wither.state.feetPosition }]
+
+const witherSkullPositions = (skull: RuntimeWitherSkull): ReadonlyArray<SavedPosition> => [
+  { subject: 'wither-skull', id: skull.id, at: skull.position },
+  { subject: 'wither-skull', id: skull.id, at: skull.descriptor.origin },
+]
+
+const positionsOfWrite = (write: PositionWrite): ReadonlyArray<SavedPosition> => {
+  switch (write._tag) {
+    case 'player':
+      return [{ subject: 'player', id: String(write.presence.player), at: write.at }]
+    case 'entity':
+      return [{ subject: 'entity', id: String(write.entity.entityId), at: write.entity.at }]
+    case 'wither':
+      return [...write.state.withers.flatMap(witherPositions), ...write.state.skulls.flatMap(witherSkullPositions)]
+    case 'eye-of-ender-recovery':
+      return [{ subject: 'eye-of-ender-recovery', id: String(write.recovery.entityId), at: write.recovery.at }]
+  }
+}
+
+/** The first position outside addressable cells; writePositions refuses a write that has one. */
+const firstOutsideAddressableCells = (positions: ReadonlyArray<SavedPosition>): PositionOutsideAddressableCells | undefined => {
+  const outside = positions.find(({ at }) => !isInAddressableCell(at))
+  return outside === undefined ? undefined : { _tag: 'PositionOutsideAddressableCells', ...outside }
+}
+
 interface MovementBudget {
   readonly updatedAtMs: number
   readonly availableDistance: number
@@ -335,6 +556,20 @@ type TimeWeatherState = AuthoritativeSnapshot['timeWeather']
 type ContainerState = AuthoritativeSnapshot['containers'][number]
 type FurnaceState = AuthoritativeSnapshot['furnaces'][number]
 type MobWireState = NonNullable<Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>['mobState']>
+
+/**
+ * An ecosystem mob between the game ticks of one tick: its stored entity and wire state, its AI state, its planned feet,
+ * its nearest living player, and the attacks its AI made so far.
+ */
+type MovingMob = Readonly<{
+  entity: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
+  kind: NonNullable<ReturnType<typeof supportedPassiveMobKind> | ReturnType<typeof supportedHostileEcosystemMobKind>>
+  mobState: MobWireState
+  ecosystem: EcosystemMobState
+  feet: Position
+  target: Readonly<{ player: PlayerId; at: Position }> | undefined
+  attackDamages: ReadonlyArray<number>
+}>
 const containerKindForBlock = (block: string): ContainerKind | undefined => {
   switch (block) {
     case 'chest':
@@ -353,13 +588,16 @@ const emptyContainerSlots = (kind: ContainerKind): Array<ItemStack | null> =>
 
 export const isWeatherClockState = (value: unknown): value is WeatherClockState => {
   const record = unknownRecord(value)
-  return record !== undefined
-    && typeof record['remainingSecs'] === 'number'
-    && Number.isFinite(record['remainingSecs'])
-    && record['remainingSecs'] > 0
-    && typeof record['seed'] === 'number'
-    && Number.isSafeInteger(record['seed'])
-    && normaliseSeed(record['seed']) === record['seed']
+  if (
+    record === undefined
+    || typeof record['remainingSecs'] !== 'number'
+    || !Number.isFinite(record['remainingSecs'])
+    || record['remainingSecs'] <= 0
+    || typeof record['seed'] !== 'number'
+    || !Number.isSafeInteger(record['seed'])
+  ) return false
+  const seed = normaliseSeed(record['seed'])
+  return Result.isSuccess(seed) && seed.success === record['seed']
 }
 
 const supportedMobKind = (entityType: string) => {
@@ -411,9 +649,114 @@ const mobWireState = (value: unknown): MobWireState => {
   }
 }
 
-const ecosystemMobStateForSimulation = (value: unknown): EcosystemMobState | undefined => {
+type SupportedMobKind = NonNullable<ReturnType<typeof supportedMobKind>>
+
+/** Rolls a slain mob's drops; supportedMobKind only names kinds that mx-gameplay's drop tables define. */
+const mobLoot = (kind: SupportedMobKind, rollKey: (index: number) => string): ReadonlyArray<ItemStack> => {
+  const rollCount = Result.getOrThrow(dropRollsNeeded(kind))
+  return Result.getOrThrow(rollDropsOfKind(
+    kind,
+    { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
+    Array.from({ length: rollCount }, (_, index) => deterministicRoll(rollKey(index))),
+  ))
+}
+
+const ecosystemMobStateForSimulation = (value: unknown): Result.Result<EcosystemMobState | undefined, MobStateRepairFailure> => {
   const state = unknownRecord(value)
-  return state === undefined ? undefined : repairEcosystemMobState({ ...state, _tag: 'EcosystemMob' })
+  return state === undefined
+    ? Result.succeed(undefined)
+    : repairEcosystemMobState({ ...state, _tag: 'EcosystemMob' })
+}
+
+type RevisionCounter = 'core' | 'wither' | 'ender-dragon'
+
+/** A revision counter after `steps` more advances, or RevisionExhausted when that is not a safe integer. */
+const revisionAfterSteps = (
+  counter: RevisionCounter,
+  current: number,
+  steps: number,
+): Result.Result<number, MultiplayerServerCoreFailure> => {
+  const next = current + steps
+  return Number.isSafeInteger(next) ? Result.succeed(next) : Result.fail({ _tag: 'RevisionExhausted', counter, revision: current })
+}
+
+/**
+ * True when every floored axis is a BlockAxis, so the position lies in a cell C2 can address. Coordinate
+ * differences between such positions, and their hypot, stay finite.
+ */
+const isInAddressableCell = (at: Readonly<{ x: number; y: number; z: number }>): boolean =>
+  [at.x, at.y, at.z].every((axis) => Result.isSuccess(BlockAxis.result(Math.floor(axis))))
+
+/**
+ * Checks a loaded state before a core uses it: every saved position must lie in an addressable cell, and every
+ * mob the tick steps through mx-gameplay's ecosystem rules must have a state mx-gameplay can repair. A corrupt
+ * save then fails at load instead of stopping each tick.
+ */
+export const validateLoadedServerState = (state: MultiplayerServerState): Result.Result<void, MultiplayerServerCoreFailure> => {
+  const positioned = [
+    ...(state.entities ?? []).map((entity) => ({ subject: 'entity' as const, id: String(entity.entityId), at: entity.at })),
+    ...(state.playerPositions ?? []).map(({ player, at }) => ({ subject: 'player' as const, id: String(player), at })),
+    ...(state.wither?.withers ?? []).map((wither) => ({ subject: 'wither' as const, id: wither.id, at: wither.snapshot.state.feetPosition })),
+    ...(state.wither?.skulls ?? []).flatMap((skull) => [
+      { subject: 'wither-skull' as const, id: skull.id, at: skull.position },
+      { subject: 'wither-skull' as const, id: skull.id, at: skull.descriptor.origin },
+    ]),
+    ...(state.eyeOfEnderRecoveries ?? []).map((recovery) => ({ subject: 'eye-of-ender-recovery' as const, id: String(recovery.entityId), at: recovery.at })),
+  ]
+  for (const { subject, id, at } of positioned) {
+    if (!isInAddressableCell(at)) return Result.fail({ _tag: 'PositionOutsideAddressableCells', subject, id, at: { x: at.x, y: at.y, z: at.z } })
+  }
+  // A block name the registry lacks makes every read of its chunk fail, and the tick reads chunks every step.
+  for (const { at, block } of state.blocks) {
+    if (Option.isNone(overrideBlockId(block))) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { ...at }, block: String(block) })
+  }
+  // The tick advances every furnace; a saved state the furnace rules reject would fail that step on every tick.
+  for (const furnace of state.furnaces) {
+    const current = furnaceSimulationState(furnaceFromSnapshot(furnace))
+    if (Result.isFailure(current)) return Result.fail({ _tag: 'SavedFurnaceInvalid', furnaceId: furnace.furnaceId, failure: current.failure })
+    // A zero-length advance runs the state checks the tick's advance runs before it moves the furnace.
+    const advanced = advanceFurnace(current.success, 0)
+    if (Result.isFailure(advanced)) return Result.fail({ _tag: 'SavedFurnaceInvalid', furnaceId: furnace.furnaceId, failure: advanced.failure })
+  }
+  for (const skull of state.wither?.skulls ?? []) {
+    if (!followsSkullProjectileRules(skull.descriptor)) return Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: skull.id })
+  }
+  return validateEcosystemMobStates(state.entities ?? [])
+}
+
+/**
+ * Whether a saved skull keeps mc-sim's projectile rules, so each tick's step stays finite and the per-skull refusal
+ * can act on it. witherSkullProjectile scales the direction to magnitude 1, so no component exceeds 1, and fixes the
+ * speed, power, and block resistance by variant.
+ */
+const followsSkullProjectileRules = (descriptor: WitherSkullProjectileDescriptor): boolean => {
+  const rules = witherSkullProjectile(descriptor.origin, descriptor.origin, descriptor.variant)
+  const { x, y, z } = descriptor.direction
+  return [x, y, z].every((axis) => Number.isFinite(axis) && Math.abs(axis) <= 1)
+    && descriptor.speed === rules.speed
+    && descriptor.explosivePower === rules.explosivePower
+    && descriptor.destroysResistantBlocks === rules.destroysResistantBlocks
+}
+
+/** Checks the caller's bounds before a core uses them: every bound finite, and each minimum at most its maximum. */
+export const validateServerBounds = (bounds: ServerBounds): Result.Result<ServerBounds, MultiplayerServerCoreFailure> => {
+  const axes: ReadonlyArray<readonly [number, number]> = [[bounds.minX, bounds.maxX], [bounds.minY, bounds.maxY], [bounds.minZ, bounds.maxZ]]
+  return axes.every(([minimum, maximum]) => Number.isFinite(minimum) && Number.isFinite(maximum) && minimum <= maximum)
+    ? Result.succeed(bounds)
+    : Result.fail({ _tag: 'InvalidServerBounds', bounds })
+}
+
+const validateEcosystemMobStates = (
+  entities: ReadonlyArray<AuthoritativeEntityState>,
+): Result.Result<void, MultiplayerServerCoreFailure> => {
+  for (const entity of entities) {
+    if (entity._tag !== 'living') continue
+    if (entity.entityType === CREEPER_KIND || entity.entityType === ENDERMAN_KIND) continue
+    if (supportedPassiveMobKind(entity.entityType) === undefined && supportedHostileEcosystemMobKind(entity.entityType) === undefined) continue
+    const repaired = ecosystemMobStateForSimulation(entity.mobState)
+    if (Result.isFailure(repaired)) return Result.fail({ _tag: 'MobStateRepairFailure', entityId: entity.entityId, failure: repaired.failure })
+  }
+  return Result.succeed(undefined)
 }
 
 const creeperFuseForSimulation = (value: unknown): CreeperFuse => {
@@ -484,15 +827,17 @@ interface MutableFurnaceState {
   fuel: ItemStack | null
   output: ItemStack | null
   burnTicksRemaining: number
+  burnTicksTotal: number
   cookTicks: number
 }
 
 type CommandDecision =
-  | Readonly<{ accepted: false; reason: CommandRejectionReason }>
+  | Readonly<{ accepted: false; reason: CommandRejectionReason; failure?: MultiplayerServerCoreFailure }>
   | Readonly<{
       accepted: true
       deltas: (revision: number) => ReadonlyArray<AuthoritativeDelta>
       messages?: (revision: number) => ReadonlyArray<NetworkMessage>
+      statusEffectDeltas?: (revision: number) => ReadonlyArray<BrewingWireMessage>
       worldSnapshotRequired?: boolean
       snapshotBroadcastRequired?: boolean
     }>
@@ -513,14 +858,108 @@ const VEHICLE_MOVE_DISTANCE = 1
 const PLAYER_MOVE_SPEED_BLOCKS_PER_SECOND = 8
 const MOVEMENT_COLLISION_SAMPLE_DISTANCE = 0.25
 const DEFAULT_INVENTORY_SLOTS = 36
+// Zero is the fixed no-Looting value; the brand constructor documents and enforces that invariant.
+const NO_LOOTING_LEVEL = Result.getOrThrow(EnchantmentLevel.result(0))
 const DEFAULT_VITALS: VitalsState = { health: 20, hunger: 20, experience: 0 }
+// mx-gameplay treats a missing players-sleeping percentage as "every player"; parsing null cannot fail.
+const DEFAULT_SLEEP_RATIO = Result.getOrThrow(sleepRatio(null))
+
+/** A chunk source that reads each cell from `blockAt`, for terrain the worldgen generators do not produce. */
+export const chunkSourceFromBlocks = (
+  biome: ChunkBiomeType,
+  blockAt: (position: BlockPos) => BlockId,
+): ChunkSource => (coord) => Effect.sync(() => {
+  const chunkBlocks = new Uint16Array(CHUNK_VOLUME)
+  for (let lx = 0; lx < CHUNK_SIZE_XZ; lx += 1) {
+    for (let lz = 0; lz < CHUNK_SIZE_XZ; lz += 1) {
+      for (let y = 0; y < CHUNK_HEIGHT; y += 1) {
+        chunkBlocks[blockIndex(lx, y, lz)] = blockAt({ x: coord.cx * CHUNK_SIZE_XZ + lx, y, z: coord.cz * CHUNK_SIZE_XZ + lz })
+      }
+    }
+  }
+  return { coord, blocks: chunkBlocks, biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => biome) }
+})
+
+const chunkKeyOf = (cx: number, cz: number): string => `${String(cx)},${String(cz)}`
+
+type BlockOverride = Readonly<{ at: BlockPos; block: string | null }>
+
+/** The registry id of a block edit, where null is air; none when the registry lacks the name. */
+const overrideBlockId = (block: string | null): Option.Option<BlockId> =>
+  block === null ? Option.some(AIR_BLOCK_ID) : isBlockType(block) ? blockIdOf(block) : Option.none()
+
+/** The server's block edits, recording which chunks each write makes stale in the ChunkStore view. */
+class BlockOverrides extends Map<string, BlockOverride> {
+  readonly #changedChunks = new Set<string>()
+
+  override set(key: string, value: BlockOverride): this {
+    this.#changedChunks.add(chunkKeyOf(Math.floor(value.at.x / CHUNK_SIZE_XZ), Math.floor(value.at.z / CHUNK_SIZE_XZ)))
+    return super.set(key, value)
+  }
+
+  override delete(key: string): boolean {
+    const value = this.get(key)
+    if (value !== undefined) this.#changedChunks.add(chunkKeyOf(Math.floor(value.at.x / CHUNK_SIZE_XZ), Math.floor(value.at.z / CHUNK_SIZE_XZ)))
+    return super.delete(key)
+  }
+
+  takeChanged(key: string): boolean {
+    return this.#changedChunks.delete(key)
+  }
+}
+
+const survivalActivityInput = (activity: HungerActivity, amount: number): SurvivalActivityInput => {
+  switch (activity) {
+    case 'walk':
+      return { _tag: 'walk', distance: amount }
+    case 'swim':
+      return { _tag: 'swim', distance: amount }
+    case 'jump':
+      return { _tag: 'jump', count: amount }
+    case 'attack':
+      return { _tag: 'attack', count: amount }
+    case 'mine':
+      return { _tag: 'mine', blocks: amount }
+  }
+}
+
+const placeBlockPayload = (intent: Intent): Result.Result<Extract<Intent['payload'], { readonly _tag: 'PlaceBlock' }>, Intent> =>
+  intent.payload._tag === 'PlaceBlock' ? Result.succeed(intent.payload) : Result.fail(intent)
+
+const breakBlockPayload = (intent: Intent): Result.Result<Extract<Intent['payload'], { readonly _tag: 'BreakBlock' }>, Intent> =>
+  intent.payload._tag === 'BreakBlock' ? Result.succeed(intent.payload) : Result.fail(intent)
+
+const acceptedIntent = <Reason>(
+  result: Readonly<{ accepted: true; intent: Intent }> | Readonly<{ accepted: false; reason: Reason }>,
+): Result.Result<Intent, Reason> => result.accepted ? Result.succeed(result.intent) : Result.fail(result.reason)
+
+const usedItem = (intent: Intent): Result.Result<ItemId, Intent> =>
+  intent.payload._tag === 'UseItem' ? Result.succeed(intent.payload.item) : Result.fail(intent)
+
+// The fields a hunger change reports to clients; the food timer advances on every tick and is not one of them.
+const hungerChanged = (before: SurvivalHungerState, after: SurvivalHungerState): boolean =>
+  before.vitals.hungerPoints !== after.vitals.hungerPoints
+  || before.vitals.saturation !== after.vitals.saturation
+  || before.vitals.exhaustion !== after.vitals.exhaustion
+  || before.vitals.healthPoints !== after.vitals.healthPoints
+
+type HungerPlan =
+  | Readonly<{ accepted: false; reason: CommandRejectionReason; failure?: MultiplayerServerCoreFailure }>
+  | Readonly<{
+      accepted: true
+      operation: (hunger: SurvivalHungerPart, state: SurvivalHungerState) => Result.Result<SurvivalHungerState, SurvivalHungerError>
+      consumedSlot: number | undefined
+      effects: ReadonlyArray<StatusEffectApplication>
+    }>
 const DEFAULT_TIME_WEATHER: TimeWeatherState = { timeOfDay: 6_000, weather: 'clear' }
 const DEFAULT_WEATHER_CLOCK: WeatherClockState = {
   remainingSecs: INITIAL_WEATHER.remainingSecs,
   seed: DEFAULT_ROLL_SEED,
 }
 const MINECRAFT_DAY_TICKS = 24_000
-const MINECRAFT_TICK_MS = 50
+const MINECRAFT_TICK_MS = Number(DEFAULT_TICK_DURATION) * 1_000
+// DEFAULT_TICK_DURATION is a finite positive duration, so it is a valid delta time.
+const GAME_TICK_SECS = Result.getOrThrow(DeltaTimeSecs.result(Number(DEFAULT_TICK_DURATION)))
 const THUNDER_STRIKE_INTERVAL_TICKS = 160
 const ITEM_DROP_LIFESPAN_TICKS = 6_000
 const ARROW_LIFESPAN_TICKS = 1_200
@@ -536,9 +975,9 @@ const WITHER_TARGET_RANGE = 64
 const ENDER_DRAGON_INTERACTION_RANGE = 8
 const ENDER_DRAGON_ATTACK_DAMAGE = 4
 const ENDER_DRAGON_ATTACK_COOLDOWN_MS = 500
-const END_EXIT_PORTAL_BLOCK = blockTypeOfId(END_PORTAL_BLOCK.PORTAL) ?? 'end_portal'
-const END_PORTAL_FRAME_EMPTY_BLOCK = blockTypeOfId(END_PORTAL_BLOCK.FRAME_EMPTY) ?? 'end_portal_frame'
-const END_PORTAL_FRAME_FILLED_BLOCK = blockTypeOfId(END_PORTAL_BLOCK.FRAME_FILLED) ?? 'end_portal_frame_filled'
+const END_EXIT_PORTAL_BLOCK = 'end_portal'
+const END_PORTAL_FRAME_EMPTY_BLOCK = 'end_portal_frame'
+const END_PORTAL_FRAME_FILLED_BLOCK = 'end_portal_frame_filled'
 const positionKey = ({ x, y, z }: BlockPos): string => `${String(x)},${String(y)},${String(z)}`
 
 const vitalsSnapshot = (state: MutableVitalsState): VitalsState => ({ ...state })
@@ -548,44 +987,77 @@ const containerSnapshot = (state: MutableContainerState): ContainerState => ({
   slots: state.slots.map(cloneStack),
 })
 const furnaceSnapshot = (state: MutableFurnaceState): FurnaceState => ({
-  ...state,
+  furnaceId: state.furnaceId,
   input: cloneStack(state.input),
   fuel: cloneStack(state.fuel),
   output: cloneStack(state.output),
+  burnTicksRemaining: state.burnTicksRemaining,
+  cookTicks: state.cookTicks,
 })
 
 type SimItemStack = NonNullable<SimFurnaceState['input']>
 
-const toSimulationStack = (stack: ItemStack | null): SimItemStack | null | undefined => {
-  if (stack === null) return null
-  if (!isItemType(stack.item)) return undefined
-  return { item: stack.item, count: StackCount(stack.count) }
+const toSimulationStack = (
+  stack: ItemStack | null,
+  slot: 'input' | 'fuel' | 'output',
+): Result.Result<SimItemStack | undefined, FurnaceStateConstructionFailure> => {
+  if (stack === null) return Result.succeed(undefined)
+  if (!isItemType(stack.item)) return Result.fail({ _tag: 'UnknownFurnaceItemType', slot, item: stack.item })
+  return itemStack(stack.item, stack.count)
 }
 
-const fromSimulationStack = (stack: SimItemStack | null): ItemStack | null =>
-  stack === null ? null : { item: stack.item, count: stack.count }
+const fromSimulationStack = (stack: SimItemStack | undefined): ItemStack | null =>
+  stack === undefined ? null : { item: stack.item, count: stack.count }
 
-const furnaceSimulationState = (state: MutableFurnaceState): SimFurnaceState | null => {
-  const input = toSimulationStack(state.input)
-  const fuel = toSimulationStack(state.fuel)
-  const output = toSimulationStack(state.output)
-  if (input === undefined || fuel === undefined || output === undefined) return null
-  return {
-    input,
-    fuel,
-    output,
-    burnRemainingSecs: state.burnTicksRemaining / 20,
-    cookElapsedSecs: state.cookTicks / 20,
-  }
+/** A saved furnace as the core holds it; the wire snapshot stores remaining burn time only. */
+const furnaceFromSnapshot = (state: MultiplayerServerState['furnaces'][number]): MutableFurnaceState => ({
+  ...state,
+  input: cloneStack(state.input),
+  fuel: cloneStack(state.fuel),
+  output: cloneStack(state.output),
+  // Continue from that exact interval length.
+  burnTicksTotal: state.burnTicksRemaining,
+})
+
+const furnaceSimulationState = (
+  state: MutableFurnaceState,
+): Result.Result<SimFurnaceState, FurnaceStateConstructionFailure> => {
+  const input = toSimulationStack(state.input, 'input')
+  if (Result.isFailure(input)) return Result.fail(input.failure)
+  const fuel = toSimulationStack(state.fuel, 'fuel')
+  if (Result.isFailure(fuel)) return Result.fail(fuel.failure)
+  const output = toSimulationStack(state.output, 'output')
+  if (Result.isFailure(output)) return Result.fail(output.failure)
+  return Schema.decodeUnknownResult(SimFurnaceStateSchema)({
+    station: 'furnace',
+    input: input.success,
+    fuel: fuel.success,
+    output: output.success,
+    fuelTimeRemainingSecs: state.burnTicksRemaining / 20,
+    fuelTimeTotalSecs: state.burnTicksTotal / 20,
+    cookProgressSecs: state.cookTicks / 20,
+  })
 }
 
 const applyFurnaceSimulationState = (target: MutableFurnaceState, state: SimFurnaceState): void => {
   target.input = fromSimulationStack(state.input)
   target.fuel = fromSimulationStack(state.fuel)
   target.output = fromSimulationStack(state.output)
-  target.burnTicksRemaining = Math.round(state.burnRemainingSecs * 20)
-  target.cookTicks = Math.round(state.cookElapsedSecs * 20)
+  target.burnTicksRemaining = Math.round(state.fuelTimeRemainingSecs * 20)
+  target.burnTicksTotal = Math.round(state.fuelTimeTotalSecs * 20)
+  target.cookTicks = Math.round(state.cookProgressSecs * 20)
 }
+
+const furnaceSimulationStateChanged = (before: SimFurnaceState, after: SimFurnaceState): boolean =>
+  before.input?.item !== after.input?.item
+  || before.input?.count !== after.input?.count
+  || before.fuel?.item !== after.fuel?.item
+  || before.fuel?.count !== after.fuel?.count
+  || before.output?.item !== after.output?.item
+  || before.output?.count !== after.output?.count
+  || before.fuelTimeRemainingSecs !== after.fuelTimeRemainingSecs
+  || before.fuelTimeTotalSecs !== after.fuelTimeTotalSecs
+  || before.cookProgressSecs !== after.cookProgressSecs
 
 const isAuthoritativeCommand = (message: NetworkMessage): message is AuthoritativeCommand =>
   message._tag === 'PlayerInventoryCommand' ||
@@ -629,26 +1101,26 @@ export interface ContainerSlotSnapshot {
 export interface MultiplayerServerCore {
   readonly connect: (clientId: ClientId, send: SendFrame) => boolean
   readonly receive: (clientId: ClientId, frame: WireText) => ReceiveResult
-  readonly disconnect: (clientId: ClientId) => void
-  readonly detachPlayer: (clientId: ClientId) => RealmTransferPlayer | undefined
+  readonly disconnect: (clientId: ClientId) => Result.Result<void, MultiplayerServerCoreFailure>
+  readonly detachPlayer: (clientId: ClientId) => Result.Result<RealmTransferPlayer | undefined, MultiplayerServerCoreFailure>
   readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival) => boolean
   readonly snapshot: () => WorldSnapshot
-  readonly applyHopperTransfer: (at: BlockPos) => boolean
-  readonly applyDispenserTrigger: (at: BlockPos) => boolean
-  readonly applyDropperTrigger: (at: BlockPos) => boolean
+  readonly applyHopperTransfer: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyDispenserTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyDropperTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
   readonly applyRedstoneBlockState: (
     at: BlockPos,
     expectedBlocks: ReadonlySet<RedstoneStatefulBlock>,
     nextBlock: RedstoneStatefulBlock,
-  ) => boolean
-  readonly isPoweredRailPowered: (at: BlockPos) => boolean
-  readonly applyPoweredRailState: (at: BlockPos, powered: boolean) => boolean
-  readonly isLeverActive: (at: BlockPos) => boolean
-  readonly readContainerSlots: (at: BlockPos) => ReadonlyArray<ContainerSlotSnapshot> | undefined
-  readonly readPistonCell: (at: BlockPos) => PistonCellRead
-  readonly applyPistonPlan: (plan: PistonMovementPlan) => boolean
-  readonly tick: (elapsedMs: number) => void
-  readonly spawnEntity: (entity: AuthoritativeEntityState) => boolean
+  ) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly isPoweredRailPowered: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly applyPoweredRailState: (at: BlockPos, powered: boolean) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly isLeverActive: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly readContainerSlots: (at: BlockPos) => Result.Result<ReadonlyArray<ContainerSlotSnapshot> | undefined, MultiplayerServerCoreFailure>
+  readonly readPistonCell: (at: BlockPos) => Result.Result<PistonCellRead, MultiplayerServerCoreFailure>
+  readonly applyPistonPlan: (plan: PistonMovementPlan) => Result.Result<boolean, MultiplayerServerCoreFailure>
+  readonly tick: (elapsedMs: number) => Result.Result<TickReport, MultiplayerServerCoreFailure>
+  readonly spawnEntity: (entity: AuthoritativeEntityState) => Result.Result<boolean, MultiplayerServerCoreFailure>
 }
 
 export interface RealmTransferPlayer {
@@ -672,10 +1144,113 @@ export interface RealmTransferArrival {
   readonly facing: Orientation
 }
 
-export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): MultiplayerServerCore => {
+
+type ChunkOverlay = ReadonlyArray<Readonly<{ index: number; block: BlockId }>>
+
+/** Reads the world through one path: the chunk column is loaded and its edits validated before any cell is answered. */
+export interface WorldBlockReader {
+  readonly blockAt: (at: BlockPos) => Result.Result<string | null, MultiplayerServerCoreFailure>
+  /**
+   * A ChunkWindow over the named chunks, each loaded or regenerated with the current edits like blockAt's. The window
+   * holds the loaded values, so it does not depend on which chunks the LRU store still keeps resident.
+   */
+  readonly openWindow: (coords: ReadonlyArray<ChunkCoord>) => Result.Result<ChunkWindow, MultiplayerServerCoreFailure>
+}
+
+const generatedReadFailure = (failure: GeneratedBlockReadFailure): MultiplayerServerCoreFailure => ({ _tag: 'GeneratedBlockReadFailure', failure })
+
+const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts, blocks: BlockOverrides): WorldBlockReader => {
+  // Block ids of the edits inside the chunk being loaded; loadChunk validates them before generation.
+  const pendingOverlays = new Map<string, ChunkOverlay>()
+  const overlaySource: ChunkSource = (coord) => Effect.map(source(coord), (chunk) => {
+    // loadChunk records this chunk's validated overlay before it asks the store to generate the chunk.
+    const overlay = Option.getOrThrow(Option.fromNullishOr(pendingOverlays.get(chunkKeyOf(coord.cx, coord.cz))))
+    if (overlay.length === 0) return chunk
+    const chunkBlocks = Uint16Array.from(chunk.blocks)
+    for (const { index, block } of overlay) chunkBlocks[index] = block
+    return { coord: chunk.coord, blocks: chunkBlocks, biomes: chunk.biomes }
+  })
+  // The store is the read side of the world only; edits stay in `blocks` until block writes move to the commit path.
+  const chunkStore = parts.openChunkStore(overlaySource)
+
+  const overlayFor = (coord: ChunkCoord): Result.Result<ChunkOverlay, MultiplayerServerCoreFailure> => {
+    const overlay: Array<Readonly<{ index: number; block: BlockId }>> = []
+    for (const { at, block } of blocks.values()) {
+      if (Math.floor(at.x / CHUNK_SIZE_XZ) !== coord.cx || Math.floor(at.z / CHUNK_SIZE_XZ) !== coord.cz) continue
+      const id = overrideBlockId(block)
+      if (Option.isNone(id)) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at, block: String(block) })
+      if (at.y < 0 || at.y >= CHUNK_HEIGHT) continue
+      const local = { x: at.x - coord.cx * CHUNK_SIZE_XZ, z: at.z - coord.cz * CHUNK_SIZE_XZ }
+      overlay.push({ index: blockIndex(local.x, at.y, local.z), block: id.value })
+    }
+    return Result.succeed(overlay)
+  }
+
+  /** The resident chunk, regenerated with the current edits when a write has made it stale. */
+  const loadChunk = (coord: ChunkCoord): Result.Result<ReadonlyChunkWithBlockStates, MultiplayerServerCoreFailure> => {
+    const key = chunkKeyOf(coord.cx, coord.cz)
+    const stale = blocks.takeChanged(key)
+    const resident = chunkStore.peek(coord)
+    if (resident !== undefined && !stale) return Result.succeed(resident)
+    if (resident !== undefined) {
+      const unloaded = chunkStore.unload(coord)
+      if (Result.isFailure(unloaded)) return Result.fail({ _tag: 'ChunkStoreUnloadFailure', failure: unloaded.failure })
+    }
+    const overlay = overlayFor(coord)
+    if (Result.isFailure(overlay)) return Result.fail(overlay.failure)
+    pendingOverlays.set(key, overlay.success)
+    const loaded = chunkStore.load(coord)
+    pendingOverlays.delete(key)
+    return Result.isFailure(loaded) ? Result.fail({ _tag: 'ChunkStoreLoadFailure', failure: loaded.failure }) : Result.succeed(loaded.success)
+  }
+
+  const blockAt = (at: BlockPos): Result.Result<string | null, MultiplayerServerCoreFailure> => {
+    const x = BlockAxis.result(at.x)
+    if (Result.isFailure(x)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockAxisFailure', axis: 'x', failure: x.failure }))
+    const y = BlockAxis.result(at.y)
+    if (Result.isFailure(y)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockAxisFailure', axis: 'y', failure: y.failure }))
+    const z = BlockAxis.result(at.z)
+    if (Result.isFailure(z)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockAxisFailure', axis: 'z', failure: z.failure }))
+    const position = blockPosition(x.success, y.success, z.success)
+    const chunk = loadChunk(chunkCoordOfBlock(position))
+    if (Result.isFailure(chunk)) return Result.fail(chunk.failure)
+    // loadChunk validated every edit in this column, so an edited cell answers from the same checked state.
+    const override = blocks.get(positionKey(at))
+    if (override !== undefined) return Result.succeed(override.block)
+    if (y.success < 0 || y.success >= CHUNK_HEIGHT) return Result.succeed(null)
+    const local = localCoordOfBlock(position)
+    const blockId = BlockId.result(getBlockAt(chunk.success, local.lx, local.ly, local.lz))
+    if (Result.isFailure(blockId)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockIdFailure', failure: blockId.failure }))
+    const block = blockTypeOfId(blockId.success)
+    if (Result.isFailure(block)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockRegistryFailure', failure: block.failure }))
+    return Result.succeed(block.success === undefined || block.success === 'air' ? null : block.success)
+  }
+
+  const openWindow = (coords: ReadonlyArray<ChunkCoord>): Result.Result<ChunkWindow, MultiplayerServerCoreFailure> => {
+    // A later load in this loop may evict an earlier chunk from the LRU store; the value already collected stays.
+    const chunks: ReadonlyChunkWithBlockStates[] = []
+    for (const coord of coords) {
+      const loaded = loadChunk(coord)
+      if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
+      chunks.push(loaded.success)
+    }
+    return Result.succeed(chunkStore.openWindow(chunks))
+  }
+
+  return { blockAt, openWindow }
+}
+
+/** The generated terrain alone, read through the same path the core uses; the entrypoint finds spawn with it. */
+export const makeTerrainReader = (source: ChunkSource, parts: MultiplayerServerCoreParts): WorldBlockReader =>
+  makeWorldReader(source, parts, new BlockOverrides())
+
+export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Result.Result<MultiplayerServerCore, MultiplayerServerCoreFailure> => {
   const worldId = options.worldId as WorldId
   const dimension = options.dimension ?? 'overworld'
-  const bounds = options.bounds ?? DEFAULT_BOUNDS
+  // Bounds come from the caller's configuration; a non-finite bound would fail every lightning strike and bounds test.
+  const validBounds = validateServerBounds(options.bounds ?? DEFAULT_BOUNDS)
+  if (Result.isFailure(validBounds)) return Result.fail(validBounds.failure)
+  const bounds = validBounds.success
   const clients = new Map<ClientId, ConnectedClient>()
   const players = new Map<PlayerId, MutablePlayer>()
   const playerPositions = new Map<PlayerId, Readonly<{ at: BlockPos; facing: Orientation }>>(
@@ -686,10 +1261,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   )
   const playerClients = new Map<PlayerId, ClientId>()
   const movementBudgets = new Map<PlayerId, MovementBudget>()
-  const blocks = new Map<string, Readonly<{ at: BlockPos; block: string | null }>>(
-    [...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])]
-      .map((mutation) => [positionKey(mutation.at), mutation]),
-  )
+  const blocks = new BlockOverrides()
+  for (const mutation of [...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])]) {
+    blocks.set(positionKey(mutation.at), mutation)
+  }
+  const world = makeWorldReader(options.chunkSource, options.parts, blocks)
+  const blockAt = world.blockAt
   const poweredRails = new Map<string, Readonly<{ at: BlockPos; powered: boolean }>>(
     (options.initialState?.poweredRails ?? []).map(({ at, powered }) => [positionKey(at), {
       at: { ...at },
@@ -713,6 +1290,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const entities = new Map<string, AuthoritativeEntityState>(
     (options.initialState?.entities ?? []).map((entity) => [entity.entityId, entity]),
   )
+  // A passive mob's body and path between ticks. The wire mob state has no field for it, so it is not persisted, and
+  // a mob loaded from a save starts its movement at rest.
+  const mobMovements = new Map<string, NonNullable<EcosystemMobState['movement']>>()
   const eyeOfEnderRecoveries = new Map<string, EyeOfEnderRecoveryState>(
     (options.initialState?.eyeOfEnderRecoveries ?? []).map((recovery) => [
       recovery.entityId,
@@ -741,12 +1321,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }]),
   )
   const furnaces = new Map<string, MutableFurnaceState>(
-    (options.initialState?.furnaces ?? []).map((state) => [state.furnaceId, {
-      ...state,
-      input: cloneStack(state.input),
-      fuel: cloneStack(state.fuel),
-      output: cloneStack(state.output),
-    }]),
+    (options.initialState?.furnaces ?? []).map((state) => [state.furnaceId, furnaceFromSnapshot(state)]),
   )
   const brewingStands = new Map<string, Readonly<{ at: BlockPos; state: BrewingStandState }>>(
     (options.initialState?.brewingStands ?? [])
@@ -809,6 +1384,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   }
   let revision = options.initialState?.revision ?? 0
   let timeTickRemainderMs = 0
+  // Game ticks this core has simulated since it started; intents target the tick they are applied on.
+  let simulationTick = 0
   let simulationElapsedSecs = 0
   const environmentalContactDamageStates = new Map<PlayerId, EnvironmentalContactDamageState>()
   let witherRevision = options.initialState?.witherRevision ?? 0
@@ -861,21 +1438,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   }
   const lastWitherAttackMs = new Map<PlayerId, number>()
   const lastEnderDragonAttackMs = new Map<PlayerId, number>()
-  const hungerActors = new Map<PlayerId, HungerActor>()
-  let hungerTickRemainderMs = 0
-  const sleepAuthority = new SleepAuthority({
+  const hungerAuthority = new HungerAuthority()
+  const survivalAuthority = new SurvivalAuthority()
+  const hungerPlayers = new Set<PlayerId>()
+  const hungerStates = new Map<PlayerId, SurvivalHungerState>()
+  let sleepBlockReadFailure: MultiplayerServerCoreFailure | undefined
+  /** Whether validateSleep reads this bed cell: only in the overworld, and only within reach of the live position. */
+  const sleepValidationReadsBed = (player: PlayerId, bed: Readonly<{ x: number; y: number; z: number }>): boolean => {
+    const at = players.get(player)?.at
+    return dimension === 'overworld' && at !== undefined
+      && (at.x - bed.x) ** 2 + (at.y - bed.y) ** 2 + (at.z - bed.z) ** 2 <= DEFAULT_BLOCK_REACH ** 2
+  }
+  // An empty roster has no bed position to convert, so construction cannot fail.
+  const sleepAuthority = Result.getOrThrow(SleepAuthority.make({
     world: worldId,
     revision: 0,
     actors: [],
     blocks: {},
     drops: [],
   }, {
-    reach: Number.MAX_SAFE_INTEGER,
-    sleepPercentage: options.sleepPercentage ?? 100,
+    sleepRatio: options.sleepRatio ?? DEFAULT_SLEEP_RATIO,
+    // Sleep snapshot positions are join positions, so validateSleep checks reach against the live player position instead.
+    reach: Number.POSITIVE_INFINITY,
     validateSleep: ({ actor, bed }) => {
-      const at = players.get(actor.player)?.at
-      const withinReach = at !== undefined
-        && (at.x - bed.x) ** 2 + (at.y - bed.y) ** 2 + (at.z - bed.z) ** 2 <= 5 ** 2
       const hostileNearby = [...entities.values()].some((entity) => entity._tag === 'living'
         && entity.health > 0
         && (supportedMobKind(entity.entityType) !== undefined
@@ -885,16 +1470,24 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         && Math.abs(entity.at.z - bed.z) <= 8)
       return {
         dimension: worldId,
-        bedValid: dimension === 'overworld' && withinReach && blockAt(bed) === 'bed',
+        bedValid: (() => {
+          if (!sleepValidationReadsBed(actor.player, bed)) return false
+          const block = blockAt(bed)
+          if (Result.isFailure(block)) {
+            sleepBlockReadFailure ??= block.failure
+            return false
+          }
+          return block.success === 'bed'
+        })(),
         nightOrThunder: timeWeather.weather === 'thunder' || timeWeather.timeOfDay >= 12_542,
         safe: !hostileNearby,
       }
     },
-  })
+  }))
 
   const sendMessage = (client: ConnectedClient, message: NetworkMessage): void => {
     const encoded = encodeFrame(message)
-    if (encoded._tag === 'Right') client.send(encoded.right)
+    if (Result.isSuccess(encoded)) client.send(encoded.success)
   }
 
   const broadcast = (message: NetworkMessage, except?: ClientId): void => {
@@ -909,6 +1502,19 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
   const broadcastSleep = (message: SleepWireMessage): void => {
     for (const client of clients.values()) if (client.playerId !== null) sendSleep(client, message)
+  }
+
+  /** Every sleep decision publishes here, so a skipped night always advances the world to morning. */
+  const publishSleepEvents = (sleepRevision: number, events: ReadonlyArray<SurvivalEvent>): Result.Result<void, MultiplayerServerCoreFailure> => {
+    if (events.length === 0) return Result.succeed(undefined)
+    broadcastSleep({ _tag: 'SleepEvents', revision: sleepRevision, events })
+    if (!events.some((event) => event._tag === 'NightSkipped')) return Result.succeed(undefined)
+    const advanced = advanceRevision()
+    if (Result.isFailure(advanced)) return Result.fail(advanced.failure)
+    timeWeather = { timeOfDay: 6_000, weather: 'clear' }
+    notifyStateChanged()
+    broadcast({ _tag: 'WorldTimeWeatherDelta', world: worldId, revision, state: { ...timeWeather } })
+    return Result.succeed(undefined)
   }
 
   const sendWither = (client: ConnectedClient, message: WitherWireMessage): void => {
@@ -1110,12 +1716,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return Number.isFinite(distance) && distance <= BLOCK_INTERACTION_RANGE
   }
 
-  const blockAt = (at: BlockPos): string | null => {
-    const override = blocks.get(positionKey(at))
-    return override === undefined ? (options.generatedBlockAt?.(at) ?? null) : override.block
-  }
 
-  const environmentalContactsAt = (at: PlayerSnapshot['at']): ReadonlyArray<EnvironmentalContact> => {
+
+  const environmentalContactsAt = (at: PlayerSnapshot['at']): Result.Result<ReadonlyArray<EnvironmentalContact>, MultiplayerServerCoreFailure> => {
     const minX = at.x - PLAYER_HALF_WIDTH
     const maxX = at.x + PLAYER_HALF_WIDTH
     const minY = at.y
@@ -1134,10 +1737,19 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     for (let x = Math.floor(minX); x < Math.ceil(maxX); x += 1) {
       for (let y = Math.floor(minY); y < Math.ceil(maxY); y += 1) {
         for (let z = Math.floor(minZ); z < Math.ceil(maxZ); z += 1) {
-          const block = blockAt({ x, y, z })
+          const blockResult = blockAt({ x, y, z })
+          if (Result.isFailure(blockResult)) return Result.fail(blockResult.failure)
+          const block = blockResult.success
           if (block !== 'lava' && block !== 'cactus') continue
-          const contactDamage = propertyOfBlockId(blockIdOf(block), 'contactDamage')
-          if (contactDamage === undefined) continue
+          const blockId = blockIdOf(block)
+          if (Option.isNone(blockId)) {
+            return Result.fail({ _tag: 'BlockRegistryLookupFailure', operation: 'environmental-contact', block })
+          }
+          const contactDamageResult = propertyOfBlockId(blockId.value, 'contactDamage')
+          if (Result.isFailure(contactDamageResult)) {
+            return Result.fail({ _tag: 'BlockRegistryFailure', failure: contactDamageResult.failure })
+          }
+          const contactDamage = contactDamageResult.success
           const touches = block === 'lava'
             ? overlaps(minX, maxX, x) && overlaps(minY, maxY, y) && overlaps(minZ, maxZ, z)
             : overlaps(minY, maxY, y)
@@ -1147,29 +1759,34 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         }
       }
     }
-    return [...contacts.values()]
+    return Result.succeed([...contacts.values()])
   }
 
-  const readPistonCell = (at: BlockPos): PistonCellRead => {
-    if (!isInBounds(at)) return { kind: 'out-of-world' }
+  const readPistonCell = (at: BlockPos): Result.Result<PistonCellRead, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed({ kind: 'out-of-world' })
     const block = blockAt(at)
-    return block === null ? { kind: 'empty' } : { kind: 'block', block }
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === null ? { kind: 'empty' } : { kind: 'block', block: block.success })
   }
 
-  const fishingEnvironmentAt = (water: BlockPos) => {
+  const fishingEnvironmentAt = (water: BlockPos): Result.Result<Readonly<{ hasWater: boolean; hasSkyAccess: boolean; isRaining: boolean; isOpenWater: boolean }>, MultiplayerServerCoreFailure> => {
     let hasSkyAccess = true
     for (let y = water.y + 1; y <= bounds.maxY; y += 1) {
-      if (blockAt({ x: water.x, y, z: water.z }) !== null) {
+      const block = blockAt({ x: water.x, y, z: water.z })
+      if (Result.isFailure(block)) return Result.fail(block.failure)
+      if (block.success !== null) {
         hasSkyAccess = false
         break
       }
     }
-    return {
-      hasWater: blockAt(water) === 'water',
+    const block = blockAt(water)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed({
+      hasWater: block.success === 'water',
       hasSkyAccess,
       isRaining: timeWeather.weather === 'rain' || timeWeather.weather === 'thunder',
       isOpenWater: false,
-    }
+    })
   }
 
   const disturbFallingBlocks = (positions: Iterable<BlockPos>): void => {
@@ -1180,25 +1797,67 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
   }
 
-  const applyPendingFallingBlocks = (): boolean => {
+  /** The next falling-block moves, planned from current blocks; `commit` applies them and clears their pending cells. */
+  const planPendingFallingBlocks = (): Result.Result<Readonly<{ moved: boolean; commit: () => void }>, MultiplayerServerCoreFailure> => {
     const targets = Array.from(fallingPending.values()).slice(0, FALLING_BLOCK_MOVES_PER_TICK)
-    for (const target of targets) fallingPending.delete(positionKey(target))
+    let registryLookupFailure: string | undefined
+    let blockReadFailure: MultiplayerServerCoreFailure | undefined
     const moves = planFallingBlockMoves(targets, (at) => {
       if (!isInBounds(at)) return undefined
-      const block = blockAt(at)
-      return block === null ? blockIdOf('air') : isBlockType(block) ? blockIdOf(block) : undefined
+      const blockResult = blockAt(at)
+      if (Result.isFailure(blockResult)) {
+        blockReadFailure ??= blockResult.failure
+        return undefined
+      }
+      const block = blockResult.success
+      if (block !== null && !isBlockType(block)) {
+        registryLookupFailure ??= block
+        return undefined
+      }
+      const blockId = blockIdOf(block ?? 'air')
+      if (Option.isNone(blockId)) {
+        registryLookupFailure ??= block ?? 'air'
+        return undefined
+      }
+      return blockId.value
     })
-    for (const move of moves) {
-      const block = blockTypeOfId(move.blockId)
-      if (block === undefined) continue
-      blocks.set(positionKey(move.source), { at: move.source, block: null })
-      blocks.set(positionKey(move.target), { at: move.target, block })
-      disturbFallingBlocks([
-        { x: move.target.x, y: move.target.y - 1, z: move.target.z },
-        move.source,
-      ])
+    if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
+    if (registryLookupFailure !== undefined) {
+      return Result.fail({
+        _tag: 'BlockRegistryLookupFailure',
+        operation: 'falling-block',
+        block: registryLookupFailure,
+      })
     }
-    return moves.length > 0
+    const resolvedMoves: Array<Readonly<{ source: BlockPos; target: BlockPos; block: string }>> = []
+    for (const move of moves) {
+      const blockId = BlockId.result(move.blockId)
+      if (Result.isFailure(blockId)) {
+        return Result.fail({ _tag: 'BlockIdFailure', failure: blockId.failure })
+      }
+      const blockResult = blockTypeOfId(blockId.success)
+      if (Result.isFailure(blockResult)) {
+        return Result.fail({ _tag: 'BlockRegistryFailure', failure: blockResult.failure })
+      }
+      if (blockResult.success === undefined) {
+        return Result.fail({ _tag: 'UnresolvedBlockId', blockId: move.blockId })
+      }
+      resolvedMoves.push({ source: move.source, target: move.target, block: blockResult.success })
+    }
+    return Result.succeed({
+      moved: resolvedMoves.length > 0,
+      commit: () => {
+        for (const target of targets) fallingPending.delete(positionKey(target))
+        for (const move of resolvedMoves) {
+          blocks.set(positionKey(move.source), { at: move.source, block: null })
+          blocks.set(positionKey(move.target), { at: move.target, block: move.block })
+          disturbFallingBlocks([
+            { x: move.target.x, y: move.target.y - 1, z: move.target.z },
+            move.source,
+          ])
+        }
+      },
+    })
   }
 
   const containerIdAt = (at: BlockPos): string =>
@@ -1238,11 +1897,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     player: PlayerId,
     at: BlockPos,
     expectedBlock: ContainerKind | 'furnace' | 'brewing_stand',
-  ): CommandRejectionReason | null => {
+  ): Result.Result<CommandRejectionReason | null, MultiplayerServerCoreFailure> => {
     const actor = players.get(player)
-    if (actor === undefined) return 'resource-not-found'
-    if (actor.world !== worldId || blockAt(at) !== expectedBlock) return 'invalid-command'
-    return isBlockWithinReach(actor, at) ? null : 'out-of-range'
+    if (actor === undefined) return Result.succeed('resource-not-found')
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    if (actor.world !== worldId || block.success !== expectedBlock) return Result.succeed('invalid-command')
+    return Result.succeed(isBlockWithinReach(actor, at) ? null : 'out-of-range')
   }
 
   const brewingBottleFromItem = (item: string): BrewingBottle | undefined => {
@@ -1304,118 +1965,172 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
   const notifyStateChanged = (): void => options.onStateChanged?.(persistentState())
 
-  const containerAt = (position: BlockPos): MutableContainerState | undefined => {
-    if (!isInBounds(position)) return undefined
-    const expectedKind = containerKindForBlock(blockAt(position) ?? '')
+  const containerAt = (position: BlockPos): Result.Result<MutableContainerState | undefined, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(position)) return Result.succeed(undefined)
+    const block = blockAt(position)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    const expectedKind = containerKindForBlock(block.success ?? '')
     const container = containers.get(containerIdAt(position))
-    return expectedKind === undefined || container?.kind !== expectedKind ? undefined : container
+    return Result.succeed(expectedKind === undefined || container?.kind !== expectedKind ? undefined : container)
   }
 
-  const readContainerSlots = (at: BlockPos): ReadonlyArray<ContainerSlotSnapshot> | undefined => {
+  const readContainerSlots = (at: BlockPos): Result.Result<ReadonlyArray<ContainerSlotSnapshot> | undefined, MultiplayerServerCoreFailure> => {
     const container = containerAt(at)
-    return container?.slots.map((stack) => stack === null || stack === undefined
+    if (Result.isFailure(container)) return Result.fail(container.failure)
+    return Result.succeed(container.success?.slots.map((stack) => stack === null || stack === undefined
       ? { count: 0, maxStack: 64 }
-      : { count: stack.count, maxStack: isItemType(stack.item) ? maxStackCountOfItem(stack.item) : 64 })
+      : { count: stack.count, maxStack: isItemType(stack.item) ? maxStackCountOfItem(stack.item) : 64 }))
   }
 
-  const applyHopperTransfer = (at: BlockPos): boolean => {
-    const moveFirstStack = (source: MutableContainerState, destination: MutableContainerState): boolean => {
+  const applyHopperTransfer = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    const moveFirstStack = (source: MutableContainerState, destination: MutableContainerState): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+      // moveStack changes the slots as it succeeds, so the advance is checked before any attempt.
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
       for (let sourceIndex = 0; sourceIndex < source.slots.length; sourceIndex += 1) {
         if (source.slots[sourceIndex] === null || source.slots[sourceIndex] === undefined) continue
         for (let destinationIndex = 0; destinationIndex < destination.slots.length; destinationIndex += 1) {
           if (moveStack(source.slots, sourceIndex, destination.slots, destinationIndex, 1) !== null) continue
-          revision += 1
+          // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
+          Result.getOrThrow(advanceRevision())
           notifyStateChanged()
           broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(source) })
           broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(destination) })
-          return true
+          return Result.succeed(true)
         }
       }
-      return false
+      return Result.succeed(false)
     }
 
-    const hopper = containerAt(at)
-    if (hopper?.kind !== 'hopper') return false
-    const below = containerAt({ x: at.x, y: at.y - 1, z: at.z })
-    if (below !== undefined && hopper.slots.some((stack) => stack !== null && stack !== undefined)) return moveFirstStack(hopper, below)
-    const above = containerAt({ x: at.x, y: at.y + 1, z: at.z })
-    return above === undefined ? false : moveFirstStack(above, hopper)
+    const hopperResult = containerAt(at)
+    if (Result.isFailure(hopperResult)) return Result.fail(hopperResult.failure)
+    const hopper = hopperResult.success
+    if (hopper?.kind !== 'hopper') return Result.succeed(false)
+    const belowResult = containerAt({ x: at.x, y: at.y - 1, z: at.z })
+    if (Result.isFailure(belowResult)) return Result.fail(belowResult.failure)
+    const below = belowResult.success
+    if (below !== undefined && hopper.slots.some((stack) => stack !== null && stack !== undefined)) {
+      return moveFirstStack(hopper, below)
+    }
+    const aboveResult = containerAt({ x: at.x, y: at.y + 1, z: at.z })
+    if (Result.isFailure(aboveResult)) return Result.fail(aboveResult.failure)
+    const above = aboveResult.success
+    return above === undefined ? Result.succeed(false) : moveFirstStack(above, hopper)
   }
 
-  const applyItemDropperTrigger = (at: BlockPos, kind: 'dispenser' | 'dropper'): boolean => {
-    if (!isInBounds(at) || blockAt(at) !== kind) return false
+  const applyItemDropperTrigger = (at: BlockPos, kind: 'dispenser' | 'dropper'): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed(false)
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    if (block.success !== kind) return Result.succeed(false)
     const container = containers.get(containerIdAt(at))
-    if (container?.kind !== kind) return false
+    if (container?.kind !== kind) return Result.succeed(false)
     const slot = container.slots.findIndex((stack) => stack !== null && stack !== undefined)
-    if (slot < 0) return false
+    if (slot < 0) return Result.succeed(false)
 
     const source = container.slots[slot]
-    if (source === null || source === undefined) return false
+    if (source === null || source === undefined) return Result.succeed(false)
+    const reserved = revisionAfter(1)
+    if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
     const entity: AuthoritativeEntityState = {
       _tag: 'item-drop',
-      entityId: `${kind}:${positionKey(at)}:drop:${String(revision + 1)}:${String(slot)}` as AuthoritativeEntityState['entityId'],
+      entityId: `${kind}:${positionKey(at)}:drop:${String(reserved.success)}:${String(slot)}` as AuthoritativeEntityState['entityId'],
       at: { x: at.x + 0.5, y: at.y + 0.5, z: at.z - 0.25 },
       stack: { ...source, count: 1 },
     }
+    const dropped = writePositions([{ _tag: 'entity', entity }])
+    if (Result.isFailure(dropped)) return Result.fail(dropped.failure)
     container.slots[slot] = source.count === 1 ? null : { ...source, count: source.count - 1 }
-    entities.set(entity.entityId, entity)
-    revision += 1
+    // revisionAfter(1) succeeded above, and writing the drop does not advance the revision.
+    Result.getOrThrow(advanceRevision())
     notifyStateChanged()
     broadcast({ _tag: 'ContainerDelta', world: worldId, revision, state: containerSnapshot(container) })
     broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity })
-    return true
+    return Result.succeed(true)
   }
 
-  const applyDispenserTrigger = (at: BlockPos): boolean => applyItemDropperTrigger(at, 'dispenser')
+  const applyDispenserTrigger = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => applyItemDropperTrigger(at, 'dispenser')
 
-  const applyDropperTrigger = (at: BlockPos): boolean => applyItemDropperTrigger(at, 'dropper')
+  const applyDropperTrigger = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => applyItemDropperTrigger(at, 'dropper')
 
   const applyRedstoneBlockState = (
     at: BlockPos,
     expectedBlocks: ReadonlySet<RedstoneStatefulBlock>,
     nextBlock: RedstoneStatefulBlock,
-  ): boolean => {
-    if (!isInBounds(at)) return false
+  ): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed(false)
     const currentBlock = blockAt(at)
-    if (!isRedstoneStatefulBlock(currentBlock) || !expectedBlocks.has(currentBlock) || currentBlock === nextBlock) return false
+    if (Result.isFailure(currentBlock)) return Result.fail(currentBlock.failure)
+    if (!isRedstoneStatefulBlock(currentBlock.success) || !expectedBlocks.has(currentBlock.success) || currentBlock.success === nextBlock) return Result.succeed(false)
 
+    const advanced = advanceRevision()
+    if (Result.isFailure(advanced)) return Result.fail(advanced.failure)
     blocks.set(positionKey(at), { at: { ...at }, block: nextBlock })
-    revision += 1
     notifyStateChanged()
     broadcast(snapshot())
-    return true
+    return Result.succeed(true)
   }
 
-  const isPoweredRailPowered = (at: BlockPos): boolean =>
-    blockAt(at) === 'powered_rail' && (poweredRails.get(positionKey(at))?.powered ?? false)
+  const isPoweredRailPowered = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === 'powered_rail' && (poweredRails.get(positionKey(at))?.powered ?? false))
+  }
 
-  const isLeverActive = (at: BlockPos): boolean =>
-    blockAt(at) === 'lever' && (levers.get(positionKey(at))?.active ?? false)
+  const isLeverActive = (at: BlockPos): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === 'lever' && (levers.get(positionKey(at))?.active ?? false))
+  }
 
-  const applyPoweredRailState = (at: BlockPos, powered: boolean): boolean => {
-    if (!isInBounds(at) || blockAt(at) !== 'powered_rail') return false
+  const applyPoweredRailState = (at: BlockPos, powered: boolean): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (!isInBounds(at)) return Result.succeed(false)
+    const block = blockAt(at)
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    if (block.success !== 'powered_rail') return Result.succeed(false)
     const key = positionKey(at)
-    if ((poweredRails.get(key)?.powered ?? false) === powered) return false
+    if ((poweredRails.get(key)?.powered ?? false) === powered) return Result.succeed(false)
+    const advanced = advanceRevision()
+    if (Result.isFailure(advanced)) return Result.fail(advanced.failure)
     poweredRails.set(key, { at: { ...at }, powered })
-    revision += 1
     notifyStateChanged()
     broadcast(snapshot())
-    return true
+    return Result.succeed(true)
   }
 
   /** Commits a validated piston plan as one authoritative world revision. */
-  const applyPistonPlan = (plan: PistonMovementPlan): boolean => {
-    if (validatePistonPlan(plan) !== undefined || !isInBounds(plan.piston) || blockAt(plan.piston) !== 'piston') return false
+  const applyPistonPlan = (plan: PistonMovementPlan): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (validatePistonPlan(plan) !== undefined || !isInBounds(plan.piston)) return Result.succeed(false)
+    const piston = blockAt(plan.piston)
+    if (Result.isFailure(piston)) return Result.fail(piston.failure)
+    if (piston.success !== 'piston') return Result.succeed(false)
 
-    const head = pistonPositionAt(plan.piston, plan.facing, 1)
-    if (!isInBounds(head) || (plan.fromState === 'extended' && blockAt(head) !== 'piston_head')) return false
-    if (plan.moves.some((move) => !isInBounds(move.from) || !isInBounds(move.to) || blockAt(move.from) !== move.block)) return false
+    if (Result.isFailure(pistonHeadOffsetResult)) {
+      return Result.fail({ _tag: 'PistonHeadOffsetFailure', failure: pistonHeadOffsetResult.failure })
+    }
+    const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffsetResult.success)
+    if (!isInBounds(head)) return Result.succeed(false)
+    if (plan.fromState === 'extended') {
+      const headBlock = blockAt(head)
+      if (Result.isFailure(headBlock)) return Result.fail(headBlock.failure)
+      if (headBlock.success !== 'piston_head') return Result.succeed(false)
+    }
+    for (const move of plan.moves) {
+      if (!isInBounds(move.from) || !isInBounds(move.to)) return Result.succeed(false)
+      const block = blockAt(move.from)
+      if (Result.isFailure(block)) return Result.fail(block.failure)
+      if (block.success !== move.block) return Result.succeed(false)
+    }
 
     if (plan.toState === 'extended') {
       const finalTarget = plan.moves[0]?.to ?? head
-      if (blockAt(finalTarget) !== null) return false
+      const block = blockAt(finalTarget)
+      if (Result.isFailure(block)) return Result.fail(block.failure)
+      if (block.success !== null) return Result.succeed(false)
     }
 
+    const advanced = advanceRevision()
+    if (Result.isFailure(advanced)) return Result.fail(advanced.failure)
     for (const move of plan.moves) {
       blocks.set(positionKey(move.to), { at: { ...move.to }, block: move.block })
     }
@@ -1428,10 +2143,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       blocks.set(positionKey(head), { at: { ...head }, block: null })
     }
 
-    revision += 1
     notifyStateChanged()
     broadcast(snapshot())
-    return true
+    return Result.succeed(true)
   }
 
   const ensurePlayerState = (player: PlayerId): void => {
@@ -1442,40 +2156,76 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (!enchantments.has(player)) enchantments.set(player, { seed: options.seed >>> 0, items: new Map() })
     if (!vitals.has(player)) vitals.set(player, { ...DEFAULT_VITALS })
     if (!statusEffects.has(player)) statusEffects.set(player, emptyStatusEffectState())
-    const playerVitals = vitals.get(player) as MutableVitalsState
-    const inventory = inventories.get(player) as MutableInventoryState
-    const food: Record<string, number> = {}
-    for (const stack of inventory.slots) {
-      if (stack !== null) food[stack.item] = (food[stack.item] ?? 0) + stack.count
-    }
-    const previous = hungerActors.get(player)
-    hungerActors.set(player, {
-      player,
-      session: String(player),
-      state: previous?.state ?? { food: playerVitals.hunger, saturation: 5, exhaustion: 0, health: playerVitals.health },
-      food,
-    })
+    hungerPlayers.add(player)
   }
 
-  const applyHungerEvents = (events: ReadonlyArray<HungerEvent>): Readonly<{
-    changed: ReadonlyArray<PlayerId>
-    deaths: ReadonlyArray<PlayerId>
-  }> => {
-    const changed = new Set<PlayerId>()
-    const deaths = new Set<PlayerId>()
-    for (const event of events) {
-      if (event._tag !== 'HungerChanged') continue
-      const playerVitals = vitals.get(event.player)
-      const actor = hungerActors.get(event.player)
-      if (playerVitals === undefined || actor === undefined) continue
-      const wasAlive = playerVitals.health > 0
-      playerVitals.health = event.state.health
-      playerVitals.hunger = event.state.food
-      hungerActors.set(event.player, { ...actor, state: event.state })
-      changed.add(event.player)
-      if (wasAlive && playerVitals.health <= 0) deaths.add(event.player)
+  const hungerFailure = (failure: SurvivalHungerError): MultiplayerServerCoreFailure => ({ _tag: 'SurvivalHungerFailure', failure })
+
+  /** The core revision after `steps` more advances, or RevisionExhausted when that is not a safe integer. */
+  const revisionAfter = (steps: number): Result.Result<number, MultiplayerServerCoreFailure> =>
+    revisionAfterSteps('core', revision, steps)
+
+  /** The only writer of `revision` after construction; a failed advance leaves the revision unchanged. */
+  const advanceRevision = (): Result.Result<number, MultiplayerServerCoreFailure> => {
+    const next = revisionAfter(1)
+    if (Result.isSuccess(next)) revision = next.success
+    return next
+  }
+
+  /**
+   * The only writer of player and entity positions after load. Every write must land in an addressable cell; the
+   * writes are all checked before any is applied, so a rejected batch leaves state unchanged.
+   */
+  const writePositions = (writes: ReadonlyArray<PositionWrite>): Result.Result<void, PositionOutsideAddressableCells> => {
+    const outside = firstOutsideAddressableCells(writes.flatMap(positionsOfWrite))
+    if (outside !== undefined) return Result.fail(outside)
+    for (const write of writes) {
+      if (write._tag === 'entity') {
+        entities.set(write.entity.entityId, write.entity)
+        continue
+      }
+      if (write._tag === 'wither') {
+        witherState = write.state
+        continue
+      }
+      if (write._tag === 'eye-of-ender-recovery') {
+        eyeOfEnderRecoveries.set(String(write.recovery.entityId), write.recovery)
+        continue
+      }
+      write.presence.at = { ...write.at }
+      write.presence.facing = { ...write.facing }
+      players.set(write.presence.player, write.presence)
+      playerPositions.set(write.presence.player, { at: { ...write.at }, facing: { ...write.facing } })
     }
-    return { changed: [...changed], deaths: [...deaths] }
+    return Result.succeed(undefined)
+  }
+
+  // Each core simulates one dimension, so its revision is the dimension revision an intent expects.
+  // simulationTick only grows from zero through tick's safe-integer check, and advanceRevision keeps the core
+  // revision a safe integer, so both brands accept them.
+  const intentContext = (): SleepIntentContext => ({
+    targetTick: Result.getOrThrow(SimulationTick.result(simulationTick)),
+    expectedDimensionRevision: Result.getOrThrow(Schema.decodeUnknownResult(DimensionRevisionSchema)(revision)),
+  })
+
+  // Every damage source writes health to the wire vitals, so each hunger step starts from that health.
+  const readHunger = (player: PlayerId, playerVitals: MutableVitalsState): Result.Result<SurvivalHungerState, MultiplayerServerCoreFailure> => {
+    const healthPoints = EntityHealthPoints.result(playerVitals.health)
+    if (Result.isFailure(healthPoints)) return Result.fail(hungerFailure(healthPoints.failure))
+    const stored = hungerStates.get(player)
+    if (stored !== undefined) return Result.succeed({ ...stored, vitals: { ...stored.vitals, healthPoints: healthPoints.success } })
+    const hungerPoints = HungerPoints.result(playerVitals.hunger)
+    if (Result.isFailure(hungerPoints)) return Result.fail(hungerFailure(hungerPoints.failure))
+    return Result.succeed(options.parts.survivalHunger.create(
+      { healthPoints: healthPoints.success, hungerPoints: hungerPoints.success },
+      options.difficulty ?? DEFAULT_SURVIVAL_DIFFICULTY,
+    ))
+  }
+
+  const commitHunger = (player: PlayerId, playerVitals: MutableVitalsState, after: SurvivalHungerState): void => {
+    hungerStates.set(player, after)
+    playerVitals.health = after.vitals.healthPoints
+    playerVitals.hunger = after.vitals.hungerPoints
   }
 
   const applyPlayerDeaths = (
@@ -1496,7 +2246,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           at: { ...presence.at },
           stack: { ...stack },
         }
-        entities.set(entity.entityId, entity)
+        // A death drop copies the stored player position, which writePositions or load validation admitted.
+        Result.getOrThrow(writePositions([{ _tag: 'entity', entity }]))
         if (hasInventorySlotMetadata(player, slot)) {
           droppedItemMetadata.set(entity.entityId, inventorySlotMetadata(player, slot))
           setInventorySlotMetadata(player, slot, { name: null, enchantment: null })
@@ -1512,7 +2263,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           at: { ...presence.at },
           stack: { ...stack },
         }
-        entities.set(entity.entityId, entity)
+        // A death drop copies the stored player position, which writePositions or load validation admitted.
+        Result.getOrThrow(writePositions([{ _tag: 'entity', entity }]))
         const metadata = equipmentSlotMetadata(player, slot)
         if (metadata.name !== null || metadata.enchantment !== null) {
           droppedItemMetadata.set(entity.entityId, metadata)
@@ -1535,59 +2287,108 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return deltas
   }
 
-  const executeHungerCommand = (message: Extract<AuthoritativeCommand, { readonly _tag: 'PlayerVitalsCommand' }>): CommandDecision => {
-    ensurePlayerState(message.player)
-    const authority = createHungerAuthority({
-      world: worldId,
-      revision,
-      difficulty: options.difficulty ?? 'normal',
-      actors: [...hungerActors.values()],
-      tickRemainderMs: hungerTickRemainderMs,
+  const planEat = (
+    message: Extract<AuthoritativeCommand, { readonly _tag: 'PlayerVitalsCommand' }>,
+    item: string,
+    inventory: MutableInventoryState,
+    before: SurvivalHungerState,
+  ): HungerPlan => {
+    if (!isItemType(item)) return { accepted: false, reason: 'insufficient-items' }
+    // handleCommand already rejected a stale expectedRevision, and the intent is consumed in this same step.
+    const context = intentContext()
+    const result = hungerAuthority.execute({
+      _tag: 'Eat',
+      player: message.player,
+      session: String(message.player),
+      commandId: message.commandId,
+      expectedRevision: message.expectedRevision,
+      expectedDimensionRevision: context.expectedDimensionRevision,
+      item: itemIdOf(item),
+    }, context.targetTick)
+    // The header is server-built from current state and itemIdOf named a registered item, so HungerAuthority accepts it.
+    const intent = Result.getOrThrow(acceptedIntent(result))
+    // HungerAuthority maps an Eat command only to a UseItem intent.
+    const held = itemTypeOfId(Result.getOrThrow(usedItem(intent)))
+    const food = resolveFoodUse({
+      held,
+      vitals: before.vitals,
+      effectRoll: deterministicRoll(`${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:food-effects`),
     })
-    const action: HungerCommand = message.action === 'respawn'
-      ? { _tag: 'Respawn', player: message.player, session: String(message.player), commandId: message.commandId, expectedRevision: revision }
-      : message.action._tag === 'eat'
-        ? { _tag: 'Eat', player: message.player, session: String(message.player), commandId: message.commandId, expectedRevision: revision, item: message.action.item }
-        : { _tag: 'Activity', player: message.player, session: String(message.player), commandId: message.commandId, expectedRevision: revision, activity: message.action.activity, amount: message.action.amount }
-    const result = authority.execute(action)
-    if (!result.accepted) {
-      const reason: CommandRejectionReason = result.reason === 'insufficient-items' || result.reason === 'stale-revision'
-        ? result.reason
-        : result.reason === 'unauthorized-player' ? 'unauthorized-player' : 'invalid-command'
-      return { accepted: false, reason }
-    }
-    hungerActors.clear()
-    const nextSnapshot = authority.snapshot()
-    hungerTickRemainderMs = nextSnapshot.tickRemainderMs
-    for (const actor of nextSnapshot.actors) hungerActors.set(actor.player, actor)
-    const { changed, deaths } = applyHungerEvents(result.events)
-    const respawnedPlayer = message.action === 'respawn' ? players.get(message.player) : undefined
-    if (message.action === 'respawn') {
-      const playerVitals = vitals.get(message.player)
-      if (playerVitals !== undefined) playerVitals.experience = 0
-      if (respawnedPlayer !== undefined) {
-        respawnedPlayer.at = { ...options.spawnAt }
-        playerPositions.set(message.player, {
-          at: { ...respawnedPlayer.at },
-          facing: { ...respawnedPlayer.facing },
-        })
+    if (Result.isFailure(food)) return { accepted: false, reason: 'invalid-command', failure: { _tag: 'FoodUseFailure', failure: food.failure } }
+    switch (food.success._tag) {
+      case 'notFood':
+        return { accepted: false, reason: 'insufficient-items' }
+      case 'full':
+      case 'dead':
+        return { accepted: false, reason: 'invalid-command' }
+      case 'consume': {
+        const slot = inventory.slots.findIndex((stack) => stack?.item === held)
+        if (slot < 0) return { accepted: false, reason: 'insufficient-items' }
+        const { foodPoints, saturationModifier } = food.success
+        return {
+          accepted: true,
+          operation: (hunger, state) => hunger.eat(state, foodPoints, saturationModifier),
+          consumedSlot: slot,
+          effects: food.success.effects,
+        }
       }
     }
-    const consumed = result.events.find((event) => event._tag === 'FoodConsumed')
-    if (consumed !== undefined) {
-      const inventory = inventories.get(consumed.player)
-      const slot = inventory?.slots.findIndex((stack) => stack?.item === consumed.item) ?? -1
-      const stack = slot >= 0 ? inventory?.slots[slot] : undefined
-      if (inventory !== undefined && stack != null) inventory.slots[slot] = stack.count === 1 ? null : { ...stack, count: stack.count - 1 }
+  }
+
+  const planActivity = (activity: HungerActivity, amount: number, before: SurvivalHungerState): HungerPlan => {
+    if (before.vitals.healthPoints <= 0) return { accepted: false, reason: 'invalid-command' }
+    const input = survivalActivityInput(activity, amount)
+    return { accepted: true, operation: (hunger, state) => hunger.activity(state, input), consumedSlot: undefined, effects: [] }
+  }
+
+  const executeHungerCommand = (message: Extract<AuthoritativeCommand, { readonly _tag: 'PlayerVitalsCommand' }>): CommandDecision => {
+    ensurePlayerState(message.player)
+    // ensurePlayerState created the vitals and inventory entries for this player.
+    const playerVitals = Option.getOrThrow(Option.fromNullishOr(vitals.get(message.player)))
+    const inventory = Option.getOrThrow(Option.fromNullishOr(inventories.get(message.player)))
+    const before = readHunger(message.player, playerVitals)
+    if (Result.isFailure(before)) return { accepted: false, reason: 'invalid-command', failure: before.failure }
+    const plan: HungerPlan = message.action === 'respawn'
+      ? { accepted: true, operation: (hunger, state) => hunger.respawn(state), consumedSlot: undefined, effects: [] }
+      : message.action._tag === 'eat'
+        ? planEat(message, message.action.item, inventory, before.success)
+        : planActivity(message.action.activity, message.action.amount, before.success)
+    if (!plan.accepted) return plan
+    const stepped = plan.operation(options.parts.survivalHunger, before.success)
+    if (Result.isFailure(stepped)) return { accepted: false, reason: 'invalid-command', failure: hungerFailure(stepped.failure) }
+    let nextEffects = statusEffects.get(message.player) ?? emptyStatusEffectState()
+    for (const effect of plan.effects) {
+      // Status-effect state is load-validated or an mx-gameplay result, and resolveFoodUse validated the application.
+      nextEffects = Result.getOrThrow(applyStatusEffect(nextEffects, effect)).state
     }
-    return { accepted: true, deltas: (nextRevision) => [
-      ...applyPlayerDeaths(deaths, nextRevision),
-      ...changed.flatMap((player) => {
-        const presence = players.get(player)
-        return presence === undefined ? [] : [{ _tag: 'PlayerVitalsDelta' as const, world: presence.world, revision: nextRevision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) }]
-      }),
-      ...(consumed === undefined || players.get(consumed.player) === undefined ? [] : [{ _tag: 'PlayerInventoryDelta' as const, world: (players.get(consumed.player) as MutablePlayer).world, revision: nextRevision, player: consumed.player, state: inventorySnapshot(inventories.get(consumed.player) as MutableInventoryState) }]),
+    const respawnedPlayer = message.action === 'respawn' ? players.get(message.player) : undefined
+    if (respawnedPlayer !== undefined) {
+      const placed = writePositions([{ _tag: 'player', presence: respawnedPlayer, at: options.spawnAt, facing: respawnedPlayer.facing }])
+      if (Result.isFailure(placed)) return { accepted: false, reason: 'invalid-command', failure: placed.failure }
+    }
+    commitHunger(message.player, playerVitals, stepped.success)
+    if (plan.effects.length > 0) statusEffects.set(message.player, nextEffects)
+    if (message.action === 'respawn') playerVitals.experience = 0
+    const consumedSlot = plan.consumedSlot
+    if (consumedSlot !== undefined) {
+      // planEat located a stack in this slot before the step ran.
+      const stack = Option.getOrThrow(Option.fromNullishOr(inventory.slots[consumedSlot]))
+      inventory.slots[consumedSlot] = stack.count === 1 ? null : { ...stack, count: stack.count - 1 }
+    }
+    const presence = players.get(message.player)
+    return { accepted: true, deltas: (nextRevision) => presence === undefined ? [] : [
+      { _tag: 'PlayerVitalsDelta' as const, world: presence.world, revision: nextRevision, player: message.player, state: vitalsSnapshot(playerVitals) },
+      ...(consumedSlot === undefined ? [] : [{ _tag: 'PlayerInventoryDelta' as const, world: presence.world, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) }]),
     ],
+    ...(plan.effects.length === 0 ? {} : {
+      statusEffectDeltas: (nextRevision: number) => [{
+        _tag: 'PlayerStatusEffectsDelta' as const,
+        world: worldId,
+        revision: nextRevision,
+        player: message.player,
+        state: copyStatusEffectState(nextEffects),
+      }],
+    }),
     ...(respawnedPlayer === undefined ? {} : {
       messages: () => [{
         _tag: 'PlayerMove' as const,
@@ -1603,6 +2404,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const decideCommand = (message: AuthoritativeCommand): CommandDecision => {
     const inventory = inventories.get(message.player)
     if (inventory === undefined) return { accepted: false, reason: 'resource-not-found' }
+    const rejectBlockRead = (failure: MultiplayerServerCoreFailure): CommandDecision => ({
+      accepted: false,
+      reason: 'invalid-command',
+      failure,
+    })
 
     switch (message._tag) {
       case 'ToggleLeverCommand': {
@@ -1611,9 +2417,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.lever) || !isBlockWithinReach(actor, message.lever)) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        if (blockAt(message.lever) !== 'lever') return { accepted: false, reason: 'invalid-command' }
+        const block = blockAt(message.lever)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'lever') return { accepted: false, reason: 'invalid-command' }
         const key = positionKey(message.lever)
-        levers.set(key, { at: { ...message.lever }, active: !isLeverActive(message.lever) })
+        levers.set(key, { at: { ...message.lever }, active: !(levers.get(key)?.active ?? false) })
         return { accepted: true, deltas: () => [], snapshotBroadcastRequired: true }
       }
       case 'ThrowEyeOfEnderCommand': {
@@ -1628,18 +2436,34 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'insufficient-items' }
         }
 
-        const site = nearestStrongholdSite(options.seed, actor.at.x, actor.at.z)
+        const seedResult = WorldgenNoiseSeed.result(options.seed)
+        if (Result.isFailure(seedResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'NoiseSeedBrandFailure', failure: seedResult.failure },
+          }
+        }
+        const x = BlockAxis.result(actor.at.x)
+        if (Result.isFailure(x)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'x', failure: x.failure } }
+        }
+        const z = BlockAxis.result(actor.at.z)
+        if (Result.isFailure(z)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'z', failure: z.failure } }
+        }
+        const site = nearestStrongholdSite(seedResult.success, x.success, z.success)
         if (Option.isNone(site)) return { accepted: false, reason: 'invalid-command' }
         const origin = { x: actor.at.x, y: actor.at.y + EYE_LEVEL_OFFSET, z: actor.at.z }
         const target = endPortalCenterForStronghold(site.value)
         const breaks = deterministicRoll(`${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:eye-break`) < 0.2
         const recoveryEntityId = `${String(message.player)}:eye:${String(message.commandId)}:recovery` as AuthoritativeEntityState['entityId']
         if (!breaks) {
-          eyeOfEnderRecoveries.set(String(recoveryEntityId), {
-            entityId: recoveryEntityId,
-            at: eyeOfEnderDestination(origin, target),
-            remainingSecs: EYE_OF_ENDER_FLIGHT_SECS,
-          })
+          const thrown = writePositions([{
+            _tag: 'eye-of-ender-recovery',
+            recovery: { entityId: recoveryEntityId, at: eyeOfEnderDestination(origin, target), remainingSecs: EYE_OF_ENDER_FLIGHT_SECS },
+          }])
+          if (Result.isFailure(thrown)) return { accepted: false, reason: 'invalid-command', failure: thrown.failure }
         }
 
         inventory.slots[inventory.selectedSlot] = selected.count === 1
@@ -1676,7 +2500,23 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         ) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        const site = nearestStrongholdSite(options.seed, message.frame.x, message.frame.z)
+        const seedResult = WorldgenNoiseSeed.result(options.seed)
+        if (Result.isFailure(seedResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'NoiseSeedBrandFailure', failure: seedResult.failure },
+          }
+        }
+        const x = BlockAxis.result(message.frame.x)
+        if (Result.isFailure(x)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'x', failure: x.failure } }
+        }
+        const z = BlockAxis.result(message.frame.z)
+        if (Result.isFailure(z)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockAxisBrandFailure', axis: 'z', failure: z.failure } }
+        }
+        const site = nearestStrongholdSite(seedResult.success, x.success, z.success)
         if (Option.isNone(site)) return { accepted: false, reason: 'invalid-command' }
         const center = endPortalCenterForStronghold(site.value)
         const isPortalFrame = END_PORTAL_FRAME_OFFSETS.some(
@@ -1685,7 +2525,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             message.frame.y === center.y &&
             message.frame.z === center.z + dz,
         )
-        if (!isPortalFrame || blockAt(message.frame) !== END_PORTAL_FRAME_EMPTY_BLOCK) {
+        const frameBlock = blockAt(message.frame)
+        if (Result.isFailure(frameBlock)) return rejectBlockRead(frameBlock.failure)
+        if (!isPortalFrame || frameBlock.success !== END_PORTAL_FRAME_EMPTY_BLOCK) {
           return { accepted: false, reason: 'invalid-command' }
         }
 
@@ -1695,6 +2537,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (selected?.item !== 'eye_of_ender') {
           return { accepted: false, reason: 'insufficient-items' }
         }
+        const portalFrameBlocks: Array<Readonly<{ at: BlockPos; block: string | null }>> = []
+        for (const { dx, dz } of END_PORTAL_FRAME_OFFSETS) {
+          const at = { x: center.x + dx, y: center.y, z: center.z + dz }
+          const block = blockAt(at)
+          if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+          portalFrameBlocks.push({ at, block: block.success })
+        }
+        const framePositionKey = positionKey(message.frame)
+        const completed = portalFrameBlocks.every(({ at, block }) =>
+          positionKey(at) === framePositionKey || block === END_PORTAL_FRAME_FILLED_BLOCK,
+        )
         inventory.slots[inventory.selectedSlot] = selected.count === 1
           ? null
           : { ...selected, count: selected.count - 1 }
@@ -1704,10 +2557,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           block: END_PORTAL_FRAME_FILLED_BLOCK,
         })
 
-        const completed = END_PORTAL_FRAME_OFFSETS.every(({ dx, dz }) =>
-          blockAt({ x: center.x + dx, y: center.y, z: center.z + dz }) ===
-          END_PORTAL_FRAME_FILLED_BLOCK,
-        )
         if (completed) {
           for (let x = -1; x <= 1; x += 1) {
             for (let z = -1; z <= 1; z += 1) {
@@ -1734,7 +2583,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.portal) || !isBlockWithinReach(actor, message.portal)) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        if (blockAt(message.portal) !== 'end_portal' || options.onEndPortalUse === undefined) {
+        const block = blockAt(message.portal)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'end_portal' || options.onEndPortalUse === undefined) {
           return { accepted: false, reason: 'invalid-command' }
         }
         return { accepted: true, deltas: () => [] }
@@ -1745,7 +2596,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (!isInBounds(message.portal) || !isBlockWithinReach(actor, message.portal)) {
           return { accepted: false, reason: 'out-of-range' }
         }
-        if (blockAt(message.portal) !== 'nether_portal' || options.onNetherPortalUse === undefined) {
+        const block = blockAt(message.portal)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'nether_portal' || options.onNetherPortalUse === undefined) {
           return { accepted: false, reason: 'invalid-command' }
         }
         return { accepted: true, deltas: () => [] }
@@ -1774,20 +2627,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const selectedMetadata = inventorySlotMetadata(message.player, selectedSlot)
         const bowDurability = inventory.durability[selectedSlot]
         if (!isValidDurabilityForItem('bow', bowDurability)) return { accepted: false, reason: 'invalid-command' }
-        inventory.slots[arrowSlot] = arrowStack.count === 1 ? null : { ...arrowStack, count: arrowStack.count - 1 }
-        const nextBowDurability = bowDurability.current === 1
-          ? null
-          : { ...bowDurability, current: bowDurability.current - 1 }
-        if (nextBowDurability === null) inventory.slots[selectedSlot] = null
-        inventory.durability[selectedSlot] = nextBowDurability
-        if (selectedMetadata.enchantment !== null) {
-          setInventorySlotMetadata(message.player, selectedSlot, {
-            ...selectedMetadata,
-            enchantment: nextBowDurability === null
-              ? null
-              : { ...selectedMetadata.enchantment, durability: { ...nextBowDurability } },
-          })
-        }
         const horizontal = Math.cos(actor.facing.pitchRadians)
         const speed = 8 + 24 * charge
         const powerLevel = selectedMetadata.enchantment?.enchantments.find((enchantment) => enchantment.id === 'power')?.level
@@ -1804,7 +2643,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           owner: message.player,
           ageTicks: 0,
         }
-        entities.set(arrow.entityId, arrow)
+        const shot = writePositions([{ _tag: 'entity', entity: arrow }])
+        if (Result.isFailure(shot)) return { accepted: false, reason: 'invalid-command', failure: shot.failure }
+        inventory.slots[arrowSlot] = arrowStack.count === 1 ? null : { ...arrowStack, count: arrowStack.count - 1 }
+        const nextBowDurability = bowDurability.current === 1
+          ? null
+          : { ...bowDurability, current: bowDurability.current - 1 }
+        if (nextBowDurability === null) inventory.slots[selectedSlot] = null
+        inventory.durability[selectedSlot] = nextBowDurability
+        if (selectedMetadata.enchantment !== null) {
+          setInventorySlotMetadata(message.player, selectedSlot, {
+            ...selectedMetadata,
+            enchantment: nextBowDurability === null
+              ? null
+              : { ...selectedMetadata.enchantment, durability: { ...nextBowDurability } },
+          })
+        }
         return { accepted: true, deltas: (nextRevision) => [
           { _tag: 'PlayerInventoryDelta', world: actor.world, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) },
           { _tag: 'EntitySpawnDelta', world: worldId, revision: nextRevision, entity: arrow },
@@ -1820,14 +2674,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (selected?.item !== 'flint_and_steel' && selected?.item !== 'fire_charge') {
           return { accepted: false, reason: 'invalid-command' }
         }
-        if (blockAt(message.at) !== 'tnt') return { accepted: false, reason: 'invalid-command' }
-        if (selected.item === 'fire_charge') {
-          inventory.slots[inventory.selectedSlot] = selected.count === 1
-            ? null
-            : { ...selected, count: selected.count - 1 }
-        }
-        blocks.set(positionKey(message.at), { at: message.at, block: null })
-        disturbFallingBlocks([message.at])
+        const block = blockAt(message.at)
+        if (Result.isFailure(block)) return rejectBlockRead(block.failure)
+        if (block.success !== 'tnt') return { accepted: false, reason: 'invalid-command' }
         const tnt: AuthoritativeEntityState = {
           _tag: 'primed-tnt',
           entityId: `${message.commandId}:tnt` as AuthoritativeEntityState['entityId'],
@@ -1835,7 +2684,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           burnedSecs: 0,
           owner: message.player,
         }
-        entities.set(tnt.entityId, tnt)
+        const primed = writePositions([{ _tag: 'entity', entity: tnt }])
+        if (Result.isFailure(primed)) return { accepted: false, reason: 'invalid-command', failure: primed.failure }
+        if (selected.item === 'fire_charge') {
+          inventory.slots[inventory.selectedSlot] = selected.count === 1
+            ? null
+            : { ...selected, count: selected.count - 1 }
+        }
+        blocks.set(positionKey(message.at), { at: message.at, block: null })
+        disturbFallingBlocks([message.at])
         return {
           accepted: true,
           worldSnapshotRequired: true,
@@ -1855,11 +2712,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const selected = inventory.slots[inventory.selectedSlot]
         if (selected?.item !== 'ender_pearl') return { accepted: false, reason: 'invalid-command' }
 
-        const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-          feetPosition: actor.at,
-          yawRadians: actor.facing.yawRadians,
-          pitchRadians: actor.facing.pitchRadians,
-        }, ENDER_PEARL_MAX_DISTANCE, (x, y, z) => blockAt({ x, y, z }) !== null))
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const targetResult = targetBlockFromNumbers(
+          actor.at,
+          actor.facing,
+          ENDER_PEARL_MAX_DISTANCE,
+          (x, y, z) => {
+            const block = blockAt({ x, y, z })
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return false
+            }
+            return block.success !== null
+          },
+        )
+        if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+        if (Result.isFailure(targetResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+          }
+        }
+        const target = Option.getOrUndefined(targetResult.success)
         const origin = { x: actor.at.x, y: actor.at.y + EYE_LEVEL_OFFSET, z: actor.at.z }
         const hitDistance = target === undefined
           ? undefined
@@ -1868,25 +2743,30 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               target.position.y + 0.5 - origin.y,
               target.position.z + 0.5 - origin.z,
             )
-        const direction = forwardVector(actor.facing)
+        const directionResult = forwardVector(actor.facing)
+        if (Result.isFailure(directionResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'forward', failure: directionResult.failure },
+          }
+        }
+        const direction = directionResult.success
         const displacement = enderPearlDisplacement(direction.x, direction.y, direction.z, hitDistance)
         if (displacement === undefined) return { accepted: false, reason: 'invalid-command' }
 
+        const landed = writePositions([{
+          _tag: 'player',
+          presence: actor,
+          at: { x: actor.at.x + displacement.x, y: actor.at.y + displacement.y, z: actor.at.z + displacement.z },
+          facing: actor.facing,
+        }])
+        if (Result.isFailure(landed)) return { accepted: false, reason: 'invalid-command', failure: landed.failure }
         inventory.slots[inventory.selectedSlot] = selected.count === 1
           ? null
           : { ...selected, count: selected.count - 1 }
-        actor.at = {
-          x: actor.at.x + displacement.x,
-          y: actor.at.y + displacement.y,
-          z: actor.at.z + displacement.z,
-        }
-        playerPositions.set(message.player, { at: { ...actor.at }, facing: { ...actor.facing } })
         const wasAlive = playerVitals.health > 0
         playerVitals.health = Math.max(0, playerVitals.health - ENDER_PEARL_DAMAGE)
-        const hungerActor = hungerActors.get(message.player)
-        if (hungerActor !== undefined) {
-          hungerActors.set(message.player, { ...hungerActor, state: { ...hungerActor.state, health: playerVitals.health } })
-        }
         const died = wasAlive && playerVitals.health <= 0
 
         return {
@@ -1925,16 +2805,26 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'invalid-command' }
         }
 
-        const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-          feetPosition: actor.at,
-          yawRadians: actor.facing.yawRadians,
-          pitchRadians: actor.facing.pitchRadians,
-        }, BLOCK_INTERACTION_RANGE, (x, y, z) => {
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const targetResult = targetBlockFromNumbers(actor.at, actor.facing, BLOCK_INTERACTION_RANGE, (x, y, z) => {
           const block = blockAt({ x, y, z })
+          if (Result.isFailure(block)) {
+            blockReadFailure ??= block.failure
+            return false
+          }
           return selected.item === 'bucket'
-            ? block === 'water' || block === 'lava'
-            : block !== null
-        }))
+            ? block.success === 'water' || block.success === 'lava'
+            : block.success !== null
+        })
+        if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+        if (Result.isFailure(targetResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+          }
+        }
+        const target = Option.getOrUndefined(targetResult.success)
         if (target === undefined) return { accepted: false, reason: 'invalid-command' }
 
         let at: BlockPos
@@ -1942,17 +2832,43 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         let replacement: BucketItemType
         if (selected.item === 'bucket') {
           const source = blockAt(target.position)
-          if (source !== 'water' && source !== 'lava') return { accepted: false, reason: 'invalid-command' }
+          if (Result.isFailure(source)) return rejectBlockRead(source.failure)
+          if (source.success !== 'water' && source.success !== 'lava') return { accepted: false, reason: 'invalid-command' }
           at = target.position
           block = null
-          replacement = source === 'water' ? 'water_bucket' : 'lava_bucket'
+          replacement = source.success === 'water' ? 'water_bucket' : 'lava_bucket'
         } else {
-          if (!isInBounds(target.adjacentPosition) || blockAt(target.adjacentPosition) !== null) {
+          if (!isInBounds(target.adjacentPosition)) {
             return { accepted: false, reason: 'invalid-command' }
           }
+          const adjacent = blockAt(target.adjacentPosition)
+          if (Result.isFailure(adjacent)) return rejectBlockRead(adjacent.failure)
+          if (adjacent.success !== null) return { accepted: false, reason: 'invalid-command' }
           at = target.adjacentPosition
           block = selected.item === 'water_bucket' ? 'water' : 'lava'
           replacement = 'bucket'
+        }
+
+        let blockMessage: NetworkMessage
+        if (block === null) {
+          blockMessage = { _tag: 'BlockBreak', player: message.player, world: actor.world, at }
+        } else {
+          const placed = Schema.decodeUnknownResult(BlockPlace)({
+            _tag: 'BlockPlace',
+            player: message.player,
+            world: actor.world,
+            at,
+            block,
+            state: 0,
+          })
+          if (Result.isFailure(placed)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'BlockPlaceSchemaFailure', failure: placed.failure },
+            }
+          }
+          blockMessage = placed.success
         }
 
         const nextSlots = inventory.slots.map((stack) => stack === null ? null : { ...stack })
@@ -1980,9 +2896,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             player: message.player,
             state: inventorySnapshot(inventory),
           }],
-          messages: () => [block === null
-            ? { _tag: 'BlockBreak' as const, player: message.player, world: actor.world, at }
-            : { _tag: 'BlockPlace' as const, player: message.player, world: actor.world, at, block }],
+          messages: () => [blockMessage],
         }
       }
       case 'FishingCommand': {
@@ -1996,16 +2910,51 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if (selected?.item !== 'fishing_rod' || selected.count !== 1 || durability === null || !isValidDurabilityForItem('fishing_rod', durability)) {
             return { accepted: true, deltas: (nextRevision) => [{ _tag: 'PlayerFishingDelta', world: actor.world, revision: nextRevision, player: message.player, state: { phase: 'idle', result: 'invalid-rod' } }] }
           }
-          const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-            feetPosition: actor.at,
-            yawRadians: actor.facing.yawRadians,
-            pitchRadians: actor.facing.pitchRadians,
-          }, BLOCK_INTERACTION_RANGE, (x, y, z) => blockAt({ x, y, z }) === 'water'))
+          let blockReadFailure: MultiplayerServerCoreFailure | undefined
+          const targetResult = targetBlockFromNumbers(
+            actor.at,
+            actor.facing,
+            BLOCK_INTERACTION_RANGE,
+            (x, y, z) => {
+              const block = blockAt({ x, y, z })
+              if (Result.isFailure(block)) {
+                blockReadFailure ??= block.failure
+                return false
+              }
+              return block.success === 'water'
+            },
+          )
+          if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+          if (Result.isFailure(targetResult)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+            }
+          }
+          const target = Option.getOrUndefined(targetResult.success)
           if (target === undefined) {
             return { accepted: true, deltas: (nextRevision) => [{ _tag: 'PlayerFishingDelta', world: actor.world, revision: nextRevision, player: message.player, state: { phase: 'idle', result: 'no-water' } }] }
           }
-          const rod = equipmentItem(itemStack('fishing_rod', selected.count), durability)
-          const cast = castFishing(rod, fishingEnvironmentAt(target.position), {
+          const rodStack = itemStack('fishing_rod', selected.count)
+          if (Result.isFailure(rodStack)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'FishingEquipmentFailure', failure: rodStack.failure },
+            }
+          }
+          const rodResult = equipmentItem(rodStack.success, durability)
+          if (Result.isFailure(rodResult)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'FishingEquipmentFailure', failure: rodResult.failure },
+            }
+          }
+          const environment = fishingEnvironmentAt(target.position)
+          if (Result.isFailure(environment)) return rejectBlockRead(environment.failure)
+          const cast = castFishing(rodResult.success, environment.success, {
             wait: deterministicRoll(`${String(message.player)}:${String(message.commandId)}:wait`),
             category: deterministicRoll(`${String(message.player)}:${String(message.commandId)}:category`),
             item: deterministicRoll(`${String(message.player)}:${String(message.commandId)}:item`),
@@ -2024,6 +2973,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (current?.item !== 'fishing_rod') {
           return { accepted: true, deltas: (nextRevision) => [{ _tag: 'PlayerFishingDelta', world: actor.world, revision: nextRevision, player: message.player, state: { phase: 'idle', result: 'cancelled' } }] }
         }
+        if (result._tag === 'InvalidLoot') {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'FishingLootFailure', failure: result },
+          }
+        }
         if (result.rod === null) {
           inventory.slots[active.slot] = null
           inventory.durability[active.slot] = null
@@ -2039,7 +2995,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               at: { ...actor.at },
               stack: overflow,
             }
-        if (overflowDrop !== null) entities.set(overflowDrop.entityId, overflowDrop)
+        // The drop copies the stored player position, which writePositions or load validation admitted.
+        if (overflowDrop !== null) Result.getOrThrow(writePositions([{ _tag: 'entity', entity: overflowDrop }]))
         const fishingResult = result._tag === 'Caught' ? 'caught' : result._tag === 'ReeledTooEarly' ? 'too-early' : 'too-late'
         return { accepted: true, deltas: (nextRevision) => [
           { _tag: 'PlayerInventoryDelta', world: actor.world, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) },
@@ -2064,31 +3021,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               ? { mobState: { ...mobWireState(entity.mobState), provoked: true } }
               : {}),
           }
-          entities.set(entity.entityId, updated)
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
           return { accepted: true, deltas: (nextRevision) => [{ _tag: 'EntityUpdateDelta', world: worldId, revision: nextRevision, entity: updated }] }
         }
-        entities.delete(entity.entityId)
         const kind = supportedMobKind(entity.entityType)
         const experienceReward = kind === undefined
           ? 0
-          : mobXpReward({ _tag: 'Slain', lootingLevel: 0 }, mobExperienceReward(kind))
+          : mobXpReward({ _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL }, mobExperienceReward(kind))
+        const drops: ReadonlyArray<AuthoritativeEntityState> = kind === undefined
+          ? []
+          : mobLoot(kind, (index) => `${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:${String(entity.entityId)}:${String(index)}`)
+            .map((stack, index): AuthoritativeEntityState => ({
+              _tag: 'item-drop',
+              entityId: `${entity.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+              at: entity.at,
+              stack,
+            }))
         const playerVitals = vitals.get(message.player)
         const player = players.get(message.player)
+        entities.delete(entity.entityId)
         if (experienceReward > 0 && playerVitals !== undefined) playerVitals.experience += experienceReward
-        const loot = kind === undefined ? [] : rollDropsOfKind(
-          kind,
-          { _tag: 'Slain', lootingLevel: 0 },
-          Array.from({ length: dropRollsNeeded(kind) }, (_, index) => deterministicRoll(
-            `${String(options.seed)}:${String(message.player)}:${String(message.commandId)}:${String(entity.entityId)}:${String(index)}`,
-          )),
-        )
-        const drops: ReadonlyArray<AuthoritativeEntityState> = loot.map((stack, index) => ({
-          _tag: 'item-drop',
-          entityId: `${entity.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-          at: entity.at,
-          stack,
-        }))
-        for (const drop of drops) entities.set(drop.entityId, drop)
+        // Each drop copies the slain entity's stored position, which writePositions or load validation admitted.
+        Result.getOrThrow(writePositions(drops.map((drop) => ({ _tag: 'entity', entity: drop }))))
         return { accepted: true, deltas: (nextRevision) => [
           { _tag: 'EntityDespawnDelta', world: worldId, revision: nextRevision, entityId: entity.entityId },
           ...drops.map((entity) => ({ _tag: 'EntitySpawnDelta' as const, world: worldId, revision: nextRevision, entity })),
@@ -2167,7 +3122,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           entities.delete(entity.entityId)
           droppedItemMetadata.delete(entity.entityId)
         } else if (entityDelta._tag === 'EntityUpdateDelta') {
-          entities.set(entity.entityId, entityDelta.entity)
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: entityDelta.entity }]))
         }
         return { accepted: true, deltas: (nextRevision) => [
           { ...entityDelta, revision: nextRevision },
@@ -2188,16 +3144,35 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return { accepted: false, reason: 'invalid-command' }
         }
 
-        const target = Option.getOrUndefined(targetBlockFromPlayerPose({
-          feetPosition: actor.at,
-          yawRadians: actor.facing.yawRadians,
-          pitchRadians: actor.facing.pitchRadians,
-        }, BLOCK_INTERACTION_RANGE, (x, y, z) => blockAt({ x, y, z }) !== null))
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const targetResult = targetBlockFromNumbers(
+          actor.at,
+          actor.facing,
+          BLOCK_INTERACTION_RANGE,
+          (x, y, z) => {
+            const block = blockAt({ x, y, z })
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return false
+            }
+            return block.success !== null
+          },
+        )
+        if (blockReadFailure !== undefined) return rejectBlockRead(blockReadFailure)
+        if (Result.isFailure(targetResult)) {
+          return {
+            accepted: false,
+            reason: 'invalid-command',
+            failure: { _tag: 'CameraPoseFailure', operation: 'target', failure: targetResult.failure },
+          }
+        }
+        const target = Option.getOrUndefined(targetResult.success)
         if (target === undefined) return { accepted: false, reason: 'invalid-command' }
 
         const targetBlock = blockAt(target.position)
+        if (Result.isFailure(targetBlock)) return rejectBlockRead(targetBlock.failure)
         const placedOnRail = vehicleType === 'minecart' &&
-          (targetBlock === 'rail' || targetBlock === 'powered_rail')
+          (targetBlock.success === 'rail' || targetBlock.success === 'powered_rail')
         // A boat aimed at open water lands AT the water block's own cell,
         // the same reason a minecart lands at the rail's own cell rather
         // than beside it — see apps/web/main.ts's single-player VehicleUseCommand
@@ -2206,16 +3181,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         // above it, and `target.adjacentPosition` for the common straight-down
         // placement aim is one cell above the water, never detected as
         // in-water).
-        const placedOnWater = vehicleType === 'boat' && targetBlock === 'water'
+        const placedOnWater = vehicleType === 'boat' && targetBlock.success === 'water'
         const at = placedOnRail || placedOnWater ? target.position : target.adjacentPosition
-        if (!isInBounds(at) || (!placedOnRail && !placedOnWater && blockAt(at) !== null)) {
+        if (!isInBounds(at)) {
           return { accepted: false, reason: 'invalid-command' }
         }
-
-        inventory.slots[inventory.selectedSlot] = selected.count === 1
-          ? null
-          : { ...selected, count: selected.count - 1 }
-        if (selected.count === 1) inventory.durability[inventory.selectedSlot] = null
+        if (!placedOnRail && !placedOnWater) {
+          const placement = blockAt(at)
+          if (Result.isFailure(placement)) return rejectBlockRead(placement.failure)
+          if (placement.success !== null) return { accepted: false, reason: 'invalid-command' }
+        }
 
         const entity: AuthoritativeEntityState = {
           _tag: 'vehicle',
@@ -2224,7 +3199,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           at: { x: at.x + 0.5, y: at.y, z: at.z + 0.5 },
           occupant: null,
         }
-        entities.set(entity.entityId, entity)
+        const placed = writePositions([{ _tag: 'entity', entity }])
+        if (Result.isFailure(placed)) return { accepted: false, reason: 'invalid-command', failure: placed.failure }
+        inventory.slots[inventory.selectedSlot] = selected.count === 1
+          ? null
+          : { ...selected, count: selected.count - 1 }
+        if (selected.count === 1) inventory.durability[inventory.selectedSlot] = null
         return {
           accepted: true,
           deltas: (nextRevision) => [
@@ -2255,12 +3235,24 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           if ((actor.at.x - entity.at.x) ** 2 + (actor.at.y - entity.at.y) ** 2 + (actor.at.z - entity.at.z) ** 2 > 25) return { accepted: false, reason: 'out-of-range' }
           if (entity.occupant !== null) return { accepted: false, reason: 'vehicle-occupied' }
           updated = { ...entity, occupant: message.player }
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
         } else if (message.action === 'dismount') {
           if (entity.occupant !== message.player) return { accepted: false, reason: 'not-mounted' }
           updated = { ...entity, occupant: null }
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
         } else {
           if (entity.occupant !== message.player) return { accepted: false, reason: 'not-mounted' }
-          const forward = forwardVector(actor.facing)
+          const forwardResult = forwardVector(actor.facing)
+          if (Result.isFailure(forwardResult)) {
+            return {
+              accepted: false,
+              reason: 'invalid-command',
+              failure: { _tag: 'CameraPoseFailure', operation: 'forward', failure: forwardResult.failure },
+            }
+          }
+          const forward = forwardResult.success
           const horizontalLength = Math.hypot(forward.x, forward.z)
           if (horizontalLength === 0) return { accepted: false, reason: 'invalid-command' }
           const direction = message.action.direction === 'forward' ? 1 : -1
@@ -2269,13 +3261,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             y: entity.at.y,
             z: entity.at.z + direction * VEHICLE_MOVE_DISTANCE * forward.z / horizontalLength,
           }
-          if (!isValidVehicleMovement(entity.at, at)) return { accepted: false, reason: 'out-of-range' }
+          const validMovement = isValidVehicleMovement(entity.at, at)
+          if (Result.isFailure(validMovement)) return rejectBlockRead(validMovement.failure)
+          if (!validMovement.success) return { accepted: false, reason: 'out-of-range' }
           if (!tryConsumeMovementBudget(message.player, movementDistance(entity.at, at))) return { accepted: false, reason: 'out-of-range' }
           updated = { ...entity, at }
-          actor.at = at
-          playerPositions.set(message.player, { at: { ...at }, facing: { ...actor.facing } })
+          const moved = writePositions([
+            { _tag: 'entity', entity: updated },
+            { _tag: 'player', presence: actor, at, facing: actor.facing },
+          ])
+          if (Result.isFailure(moved)) return { accepted: false, reason: 'invalid-command', failure: moved.failure }
         }
-        entities.set(entity.entityId, updated)
         return { accepted: true, deltas: (nextRevision) => [{ _tag: 'EntityUpdateDelta', world: worldId, revision: nextRevision, entity: updated }] }
       }
       case 'PlayerInventoryCommand': {
@@ -2305,7 +3301,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               ? { ...source, count: message.action.count }
               : { ...source, count: message.action.count, durability: { ...durability } },
           }
-          entities.set(entity.entityId, entity)
+          // The drop copies the stored player position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity }]))
           if (source.count === message.action.count && hasInventorySlotMetadata(message.player, message.action.source)) {
             droppedItemMetadata.set(entity.entityId, inventorySlotMetadata(message.player, message.action.source))
             setInventorySlotMetadata(message.player, message.action.source, { name: null, enchantment: null })
@@ -2392,8 +3389,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (at === null) return { accepted: false, reason: 'invalid-command' }
         const container = containers.get(message.containerId)
         if (container === undefined) return { accepted: false, reason: 'resource-not-found' }
-        const inaccessibleReason = facilityIsAccessible(message.player, at, container.kind)
-        if (inaccessibleReason !== null) return { accepted: false, reason: inaccessibleReason }
+        const access = facilityIsAccessible(message.player, at, container.kind)
+        if (Result.isFailure(access)) return rejectBlockRead(access.failure)
+        if (access.success !== null) return { accepted: false, reason: access.success }
         if (message.action._tag === 'move-item') {
           const playerIsSource = message.action.source._tag === 'player-slot'
           const playerSlot = playerIsSource ? message.action.source.slot : message.action.destination.slot
@@ -2428,8 +3426,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       case 'FurnaceCommand': {
         const at = parseFurnaceId(message.furnaceId)
         if (at === null) return { accepted: false, reason: 'invalid-command' }
-        const inaccessibleReason = facilityIsAccessible(message.player, at, 'furnace')
-        if (inaccessibleReason !== null) return { accepted: false, reason: inaccessibleReason }
+        const access = facilityIsAccessible(message.player, at, 'furnace')
+        if (Result.isFailure(access)) return rejectBlockRead(access.failure)
+        if (access.success !== null) return { accepted: false, reason: access.success }
         const furnace = furnaces.get(message.furnaceId)
         if (furnace === undefined) return { accepted: false, reason: 'resource-not-found' }
         const source = message.action.source
@@ -2480,30 +3479,53 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (input === undefined || offer.input.length !== 1 || !isItemType(input.item) || !isItemType(offer.output.item)) {
           return { accepted: false, reason: 'invalid-command' }
         }
-        const output = { ...offer.output, item: offer.output.item as ItemStack['item'] }
+        const inputStack = itemStack(input.item, input.count)
+        if (Result.isFailure(inputStack)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'ItemStackFailure', failure: inputStack.failure } }
+        }
+        const outputStack = itemStack(offer.output.item, offer.output.count)
+        if (Result.isFailure(outputStack)) {
+          return { accepted: false, reason: 'invalid-command', failure: { _tag: 'ItemStackFailure', failure: outputStack.failure } }
+        }
         const nextSlots = inventory.slots.map(cloneStack)
-        let remainingInput = input.count
+        let remainingInput: number = inputStack.success.count
         for (let slot = 0; slot < nextSlots.length && remainingInput > 0; slot += 1) {
           const current = nextSlots[slot]
-          if (current == null || current.item !== input.item) continue
+          if (current == null || current.item !== inputStack.success.item) continue
           const moved = Math.min(current.count, remainingInput)
-          nextSlots[slot] = current.count === moved ? null : { ...current, count: current.count - moved }
+          if (current.count === moved) {
+            nextSlots[slot] = null
+          } else {
+            const count = StackCount.result(current.count - moved)
+            if (Result.isFailure(count)) {
+              return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StackCountFailure', failure: count.failure } }
+            }
+            nextSlots[slot] = { ...current, count: count.success }
+          }
           remainingInput -= moved
         }
         if (remainingInput > 0) return { accepted: false, reason: 'insufficient-items' }
-        let remainingOutput = output.count
-        const maxStackCount = maxStackCountOfItem(output.item as Parameters<typeof maxStackCountOfItem>[0])
+        let remainingOutput: number = outputStack.success.count
+        const maxStackCount = maxStackCountOfItem(outputStack.success.item)
         for (let slot = 0; slot < nextSlots.length && remainingOutput > 0; slot += 1) {
           const current = nextSlots[slot]
-          if (current == null || current.item !== output.item || current.count >= maxStackCount) continue
+          if (current == null || current.item !== outputStack.success.item || current.count >= maxStackCount) continue
           const moved = Math.min(maxStackCount - current.count, remainingOutput)
-          nextSlots[slot] = { ...current, count: current.count + moved }
+          const count = StackCount.result(current.count + moved)
+          if (Result.isFailure(count)) {
+            return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StackCountFailure', failure: count.failure } }
+          }
+          nextSlots[slot] = { ...current, count: count.success }
           remainingOutput -= moved
         }
         for (let slot = 0; slot < nextSlots.length && remainingOutput > 0; slot += 1) {
           if (nextSlots[slot] != null) continue
           const moved = Math.min(maxStackCount, remainingOutput)
-          nextSlots[slot] = { item: output.item, count: moved }
+          const count = StackCount.result(moved)
+          if (Result.isFailure(count)) {
+            return { accepted: false, reason: 'invalid-command', failure: { _tag: 'StackCountFailure', failure: count.failure } }
+          }
+          nextSlots[slot] = { item: outputStack.success.item, count: count.success }
           remainingOutput -= moved
         }
         if (remainingOutput > 0) return { accepted: false, reason: 'invalid-command' }
@@ -2543,6 +3565,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     reason: CommandRejectionReason,
     cache = true,
     receiveReason: RejectedReceiveReason = reason === 'unauthorized-player' ? 'identity-spoof' : 'invalid-command',
+    failure?: MultiplayerServerCoreFailure,
   ): ReceiveResult => {
     const result: AuthoritativeCommandResult = {
       _tag: 'AuthoritativeCommandRejected',
@@ -2552,9 +3575,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       reason,
       resyncRequired: reason === 'stale-revision' || reason === 'snapshot-required',
     }
-    if (cache) cacheCommandResult(message, result)
+    if (cache && failure === undefined) cacheCommandResult(message, result)
     sendMessage(client, result)
-    return { accepted: false, reason: receiveReason }
+    return failure === undefined
+      ? { accepted: false, reason: receiveReason }
+      : { accepted: false, reason: receiveReason, failure }
   }
 
   const handleCommand = (clientId: ClientId, client: ConnectedClient, message: AuthoritativeCommand): ReceiveResult => {
@@ -2575,13 +3600,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       return rejectCommand(client, message, 'unauthorized-player', false, 'wrong-world')
     }
     if (message.expectedRevision !== revision) return rejectCommand(client, message, 'stale-revision')
+    // decideCommand changes state as it accepts, so the advance it may need is checked before it runs.
+    const reserved = revisionAfter(1)
+    if (Result.isFailure(reserved)) return rejectCommand(client, message, 'invalid-command', false, 'invalid-command', reserved.failure)
 
     const decision = decideCommand(message)
-    if (!decision.accepted) return rejectCommand(client, message, decision.reason)
-    const nextRevision = revision + 1
-    const deltas = decision.deltas(nextRevision)
-    const outboundMessages = decision.messages?.(nextRevision) ?? []
-    if (deltas.length > 0 || outboundMessages.length > 0 || decision.snapshotBroadcastRequired === true) revision += 1
+    if (!decision.accepted) return rejectCommand(client, message, decision.reason, true, undefined, decision.failure)
+    const deltas = decision.deltas(reserved.success)
+    const outboundMessages = decision.messages?.(reserved.success) ?? []
+    // revisionAfter(1) succeeded above, and decideCommand does not advance the revision.
+    if (deltas.length > 0 || outboundMessages.length > 0 || decision.snapshotBroadcastRequired === true) Result.getOrThrow(advanceRevision())
     const result: AuthoritativeCommandResult = {
       _tag: 'AuthoritativeCommandAccepted',
       commandId: message.commandId,
@@ -2605,6 +3633,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       sendEnchanting(client, enchantmentsDelta(message.player))
     }
     for (const outboundMessage of outboundMessages) broadcast(outboundMessage)
+    for (const statusEffectDelta of decision.statusEffectDeltas?.(revision) ?? []) broadcastBrewing(statusEffectDelta)
     if (decision.worldSnapshotRequired === true) broadcast(authoritativeSnapshot())
     if (decision.snapshotBroadcastRequired === true) broadcast(snapshot())
     return { accepted: true, message }
@@ -2613,7 +3642,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const movementDistance = (from: PlayerSnapshot['at'], at: PlayerSnapshot['at']): number =>
     Math.hypot(at.x - from.x, at.y - from.y, at.z - from.z)
 
-  const isPlayerPositionPassable = (at: PlayerSnapshot['at']): boolean => {
+  const isPlayerPositionPassable = (at: PlayerSnapshot['at']): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const minX = Math.floor(at.x - PLAYER_HALF_WIDTH)
     const maxX = Math.floor(at.x + PLAYER_HALF_WIDTH - COLLISION_EPSILON)
     const minY = Math.floor(at.y)
@@ -2624,53 +3653,57 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       for (let y = minY; y <= maxY; y += 1) {
         for (let z = minZ; z <= maxZ; z += 1) {
           const position = { x, y, z }
-          if (!isInBounds(position)) return false
+          if (!isInBounds(position)) return Result.succeed(false)
           const block = blockAt(position)
-          if (block !== null && !options.passableBlocks?.has(block)) return false
+          if (Result.isFailure(block)) return Result.fail(block.failure)
+          if (block.success !== null && !options.passableBlocks?.has(block.success)) return Result.succeed(false)
         }
       }
     }
-    return true
+    return Result.succeed(true)
   }
 
-  const isVehiclePositionPassable = (at: PlayerSnapshot['at']): boolean => {
+  const isVehiclePositionPassable = (at: PlayerSnapshot['at']): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const position = { x: Math.floor(at.x), y: Math.floor(at.y), z: Math.floor(at.z) }
-    if (!isInBounds(position)) return false
+    if (!isInBounds(position)) return Result.succeed(false)
     const block = blockAt(position)
-    return block === null || options.passableBlocks?.has(block) === true
+    if (Result.isFailure(block)) return Result.fail(block.failure)
+    return Result.succeed(block.success === null || options.passableBlocks?.has(block.success) === true)
   }
 
   const isMovementPathPassable = (
     from: PlayerSnapshot['at'],
     at: PlayerSnapshot['at'],
-    isPositionPassable: (position: PlayerSnapshot['at']) => boolean,
-  ): boolean => {
+    isPositionPassable: (position: PlayerSnapshot['at']) => Result.Result<boolean, MultiplayerServerCoreFailure>,
+  ): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const samples = Math.max(1, Math.ceil(movementDistance(from, at) / MOVEMENT_COLLISION_SAMPLE_DISTANCE))
     for (let sample = 1; sample <= samples; sample += 1) {
       const ratio = sample / samples
-      if (!isPositionPassable({
+      const passable = isPositionPassable({
         x: from.x + (at.x - from.x) * ratio,
         y: from.y + (at.y - from.y) * ratio,
         z: from.z + (at.z - from.z) * ratio,
-      })) return false
+      })
+      if (Result.isFailure(passable)) return Result.fail(passable.failure)
+      if (!passable.success) return Result.succeed(false)
     }
-    return true
+    return Result.succeed(true)
   }
 
-  const isValidMovement = (player: MutablePlayer, at: PlayerSnapshot['at']): boolean => {
-    if (![at.x, at.y, at.z].every(Number.isFinite)) return false
+  const isValidMovement = (player: MutablePlayer, at: PlayerSnapshot['at']): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (![at.x, at.y, at.z].every(Number.isFinite)) return Result.succeed(false)
     const maximum = options.maxMoveDistance ?? DEFAULT_MAX_MOVE_DISTANCE
-    if (movementDistance(player.at, at) > maximum) return false
+    if (movementDistance(player.at, at) > maximum) return Result.succeed(false)
     return isMovementPathPassable(player.at, at, isPlayerPositionPassable)
   }
 
   const isValidVehicleMovement = (
     from: PlayerSnapshot['at'],
     at: PlayerSnapshot['at'],
-  ): boolean => {
-    if (![at.x, at.y, at.z].every(Number.isFinite)) return false
+  ): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (![at.x, at.y, at.z].every(Number.isFinite)) return Result.succeed(false)
     const maximum = Math.min(options.maxMoveDistance ?? DEFAULT_MAX_MOVE_DISTANCE, DEFAULT_MAX_VEHICLE_MOVE_DISTANCE)
-    if (movementDistance(from, at) > maximum) return false
+    if (movementDistance(from, at) > maximum) return Result.succeed(false)
     return isMovementPathPassable(from, at, isVehiclePositionPassable)
   }
 
@@ -2680,7 +3713,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     const previous = movementBudgets.get(player) ?? { updatedAtMs: nowMs, availableDistance: maximum }
     const elapsedSeconds = Math.max(0, nowMs - previous.updatedAtMs) / 1_000
     const effects = statusEffects.get(player) ?? emptyStatusEffectState()
-    const speedMultiplier = tickStatusEffects(effects, DeltaTimeSecs(0)).movementSpeedMultiplier
+    // Status-effect state is load-validated or an mx-gameplay result, and a zero delta is a valid duration.
+    const speedMultiplier = Result.getOrThrow(tickStatusEffects(effects, DeltaTimeSecs(0))).movementSpeedMultiplier
     const availableDistance = Math.min(maximum, previous.availableDistance + elapsedSeconds * PLAYER_MOVE_SPEED_BLOCKS_PER_SECOND * speedMultiplier)
     movementBudgets.set(player, { updatedAtMs: nowMs, availableDistance })
     if (distance > availableDistance + COLLISION_EPSILON) return false
@@ -2688,11 +3722,48 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return true
   }
 
+  /**
+   * The header SurvivalAuthority needs for a player's block mutation. The wire carries no command id or revision,
+   * so the server names the request and expects the revision it holds when the frame arrives.
+   */
+  const blockCommandHeader = (message: Extract<NetworkMessage, { _tag: 'BlockPlace' | 'BlockBreak' }>, context: SleepIntentContext) => ({
+    actor: message.player,
+    session: String(message.player),
+    requestId: `${String(message.player)}:${message._tag}:${String(revision)}:${positionKey(message.at)}`,
+    expectedRevision: revision,
+    expectedDimensionRevision: context.expectedDimensionRevision,
+    // The core's dimension is one of the three dimension ids C2 names.
+    dimension: Result.getOrThrow(Schema.decodeUnknownResult(DimensionIdSchema)(dimension)),
+    at: message.at,
+  })
+
+  const intentCell = (address: Readonly<{ position: Readonly<{ x: number; y: number; z: number }> }>): BlockPos =>
+    ({ x: address.position.x, y: address.position.y, z: address.position.z })
+
+  // For both commands: the wire decoder admits only safe-integer cells, the header is server-built, and a placed
+  // block id comes from blockIdOf, so SurvivalAuthority's header, payload, and C2 checks all pass.
+  const placeBlockIntent = (message: Extract<NetworkMessage, { _tag: 'BlockPlace' }>, block: BlockId): Readonly<{ at: BlockPos; block: string }> => {
+    const context = intentContext()
+    const intent = Result.getOrThrow(acceptedIntent(survivalAuthority.execute({ ...blockCommandHeader(message, context), _tag: 'PlaceBlock', block }, context.targetTick)))
+    // SurvivalAuthority maps a PlaceBlock command only to a PlaceBlock intent.
+    const payload = Result.getOrThrow(placeBlockPayload(intent))
+    // The intent carries the id blockIdOf produced for a registered block type, so the registry names it.
+    return { at: intentCell(payload.address), block: Option.getOrThrow(Option.fromNullishOr(Result.getOrThrow(blockTypeOfId(payload.block)))) }
+  }
+
+  const breakBlockIntent = (message: Extract<NetworkMessage, { _tag: 'BlockBreak' }>): BlockPos => {
+    const context = intentContext()
+    const intent = Result.getOrThrow(acceptedIntent(survivalAuthority.execute({ ...blockCommandHeader(message, context), _tag: 'BreakBlock' }, context.targetTick)))
+    // SurvivalAuthority maps a BreakBlock command only to a BreakBlock intent.
+    return intentCell(Result.getOrThrow(breakBlockPayload(intent)).address)
+  }
+
   const rejectMutation = (
     client: ConnectedClient,
     message: Extract<NetworkMessage, { _tag: 'BlockPlace' | 'BlockBreak' }>,
     reason: BlockMutationRejected['reason'],
     receiveReason: RejectedReceiveReason = reason === 'unauthorized-player' ? 'identity-spoof' : 'invalid-mutation',
+    failure?: MultiplayerServerCoreFailure,
   ): ReceiveResult => {
     sendMessage(client, {
       _tag: 'BlockMutationRejected',
@@ -2703,7 +3774,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       reason,
       revision,
     })
-    return { accepted: false, reason: receiveReason }
+    return failure === undefined
+      ? { accepted: false, reason: receiveReason }
+      : { accepted: false, reason: receiveReason, failure }
   }
 
   const removePlayer = (clientId: ClientId, client: ConnectedClient): void => {
@@ -2744,11 +3817,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendCrafting(client, cached.result)
         return cached.result.accepted ? { accepted: true, message: craftingMessage } : { accepted: false, reason: receiveReasonForRejection(cached.result.reason) }
       }
-      const rejectCrafting = (reason: NonNullable<CraftingCommandResult['reason']>, receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command'): ReceiveResult => {
+      const rejectCrafting = (
+        reason: NonNullable<CraftingCommandResult['reason']>,
+        receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
+      ): ReceiveResult => {
         const result: CraftingCommandResult = { _tag: 'CraftingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheCraftingResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheCraftingResult(resultKey, fingerprint, result)
         sendCrafting(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== client.playerId) return rejectCrafting('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectCrafting('wrong-world', 'wrong-world')
@@ -2767,17 +3846,46 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           || !Number.isSafeInteger(slot.count)
           || slot.count <= 0
           || slot.count > maxStackCountOfItem(slot.item)) return rejectCrafting('invalid-command')
-        craftingSlots.push({ item: slot.item, count: StackCount(slot.count) })
+        const stack = itemStack(slot.item, slot.count)
+        if (Result.isFailure(stack)) {
+          return rejectCrafting('invalid-command', 'invalid-command', {
+            _tag: 'CraftingFailure',
+            failure: stack.failure,
+          })
+        }
+        craftingSlots.push(stack.success)
       }
-      const outcome = craftFromGrid({
+      const recipes = STARTER_RECIPES
+      if (Result.isFailure(recipes)) {
+        return rejectCrafting('invalid-command', 'invalid-command', {
+          _tag: 'CraftingFailure',
+          failure: recipes.failure,
+        })
+      }
+      const grid = craftGrid(command.grid.width, command.grid.height, command.grid.cells.map((cell) => cell ?? undefined))
+      if (Result.isFailure(grid)) {
+        return rejectCrafting('invalid-command', 'invalid-command', {
+          _tag: 'CraftingFailure',
+          failure: grid.failure,
+        })
+      }
+      const outcomeResult = craftFromGrid({
         slots: craftingSlots,
-      }, STARTER_RECIPES, craftGrid(command.grid.width, command.grid.height, command.grid.cells.map((cell) => cell ?? undefined)))
+      }, recipes.success, grid.success)
+      if (Result.isFailure(outcomeResult)) {
+        return rejectCrafting('invalid-command', 'invalid-command', {
+          _tag: 'CraftingFailure',
+          failure: outcomeResult.failure,
+        })
+      }
+      const outcome = outcomeResult.success
       if (outcome.result._tag !== 'Crafted') return rejectCrafting(outcome.result._tag === 'NoMatch' ? 'no-match' : outcome.result._tag === 'MissingIngredients' ? 'missing-ingredients' : 'no-room')
+      const advanced = advanceRevision()
+      if (Result.isFailure(advanced)) return rejectCrafting('invalid-command', 'invalid-command', advanced.failure)
       const oldSlots = [...inventory.slots]
       const oldDurability = [...inventory.durability]
       inventory.slots.splice(0, inventory.slots.length, ...outcome.inventory.slots.map((slot) => slot === undefined ? null : { item: slot.item, count: slot.count }))
       inventory.durability.splice(0, inventory.durability.length, ...outcome.inventory.slots.map((slot, index) => slot !== undefined && oldSlots[index]?.item === slot.item ? oldDurability[index] ?? null : null))
-      revision += 1
       const result: CraftingCommandResult = { _tag: 'CraftingCommandResult', commandId: command.commandId, accepted: true, revision }
       cacheCraftingResult(resultKey, fingerprint, result)
       notifyStateChanged()
@@ -2803,11 +3911,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const rejectAnvil = (
         reason: Extract<AnvilCommandResult, { accepted: false }>['reason'],
         receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
       ): ReceiveResult => {
         const result: AnvilCommandResult = { _tag: 'AnvilCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheAnvilResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheAnvilResult(resultKey, fingerprint, result)
         sendAnvil(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== playerId) return rejectAnvil('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectAnvil('wrong-world', 'wrong-world')
@@ -2846,7 +3957,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           ? {}
           : { material }),
       }
-      const plan = planAnvilOperation(operationInput)
+      const planResult = planAnvilOperation(operationInput)
+      if (Result.isFailure(planResult)) {
+        return rejectAnvil('invalid-command', 'invalid-command', {
+          _tag: 'AnvilPlanFailure',
+          failure: planResult.failure,
+        })
+      }
+      const plan = planResult.success
       if (!plan.ok) {
         const reason = plan.reason === 'nothing-to-do'
           ? 'no-change'
@@ -2858,10 +3976,19 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       if (plan.materialCost > 0 && (usableIron === undefined || usableIron.count < plan.materialCost)) {
         return rejectAnvil('missing-iron')
       }
-      const remainingExperience = spendExperienceLevels(playerVitals.experience, plan.levelCost)
+      const remainingExperienceResult = spendExperienceLevels(playerVitals.experience, plan.levelCost)
+      if (Result.isFailure(remainingExperienceResult)) {
+        return rejectAnvil('invalid-command', 'invalid-command', {
+          _tag: 'AnvilExperienceSpendFailure',
+          failure: remainingExperienceResult.failure,
+        })
+      }
+      const remainingExperience = remainingExperienceResult.success
       if (remainingExperience === undefined) return rejectAnvil('insufficient-experience')
       const outputEnchantment = enchantedItemFromAnvilOutput(plan.output)
       if (plan.output.enchantments.length > 0 && outputEnchantment === undefined) return rejectAnvil('invalid-command')
+      const advanced = advanceRevision()
+      if (Result.isFailure(advanced)) return rejectAnvil('invalid-command', 'invalid-command', advanced.failure)
       if (plan.materialCost > 0 && usableIron !== undefined) {
         inventory.slots[ironSlot] = usableIron.count === plan.materialCost
           ? null
@@ -2874,7 +4001,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         name: plan.output.customName === null ? null : String(plan.output.customName),
         enchantment: outputEnchantment ?? null,
       })
-      revision += 1
       const result: AnvilCommandResult = { _tag: 'AnvilCommandResult', commandId: command.commandId, accepted: true, revision }
       cacheAnvilResult(resultKey, fingerprint, result)
       notifyStateChanged()
@@ -2903,11 +4029,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const rejectEnchanting = (
         reason: Extract<EnchantingCommandResult, { accepted: false }>['reason'],
         receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
       ): ReceiveResult => {
         const result: EnchantingCommandResult = { _tag: 'EnchantingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheEnchantingResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheEnchantingResult(resultKey, fingerprint, result)
         sendEnchanting(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== playerId) return rejectEnchanting('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectEnchanting('wrong-world', 'wrong-world')
@@ -2926,17 +4055,26 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         enchantments: current.items.get(command.slot)?.enchantments ?? [],
       })
       if (!item.ok) return rejectEnchanting('invalid-item')
+      const totalExperienceResult = TotalExperience.result(playerVitals.experience)
+      if (Result.isFailure(totalExperienceResult)) {
+        return rejectEnchanting('invalid-command', 'invalid-command', {
+          _tag: 'ExperienceFailure',
+          failure: totalExperienceResult.failure,
+        })
+      }
       const lapis = inventory.slots.reduce(
         (total, candidate) => total + (candidate?.item === 'lapis_lazuli' ? candidate.count : 0),
         0,
       )
+      // The seed is a load-validated 32-bit integer or an offer result, and the bookshelf count is a literal.
+      const offers = Result.getOrThrow(enchantmentOffers(current.seed, 15))
       const outcome = applyEnchantmentOffer({
         seed: current.seed,
         bookshelfCount: 15,
-        playerLevel: levelForTotalExperience(playerVitals.experience),
+        playerLevel: levelForTotalExperience(totalExperienceResult.success),
         lapis,
         item: item.value,
-      }, enchantmentOffers(current.seed, 15)[command.offer])
+      }, offers[command.offer])
       if (!outcome.ok) {
         const reason: Extract<EnchantingCommandResult, { accepted: false }>['reason'] =
           outcome.reason === 'invalid_state' || outcome.reason === 'invalid_offer'
@@ -2955,6 +4093,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         return rejectEnchanting(reason)
       }
       if (outcome.state.item === null) return rejectEnchanting('no-item')
+      const experienceLevelResult = ExperienceLevel.result(outcome.state.playerLevel)
+      if (Result.isFailure(experienceLevelResult)) {
+        return rejectEnchanting('invalid-command', 'invalid-command', {
+          _tag: 'ExperienceFailure',
+          failure: experienceLevelResult.failure,
+        })
+      }
+      const updatedTotalExperience = totalExperienceAtLevel(experienceLevelResult.success)
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return rejectEnchanting('invalid-command', 'invalid-command', reserved.failure)
       let remainingLapis = lapis - outcome.state.lapis
       for (let slot = 0; slot < inventory.slots.length && remainingLapis > 0; slot += 1) {
         const candidate = inventory.slots[slot]
@@ -2968,8 +4116,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       current.seed = outcome.state.seed
       current.items.set(command.slot, outcome.state.item)
       enchantments.set(playerId, current)
-      playerVitals.experience = totalExperienceAtLevel(outcome.state.playerLevel)
-      revision += 1
+      playerVitals.experience = updatedTotalExperience
+      // revisionAfter(1) succeeded before the lapis was consumed, and nothing has advanced the revision since.
+      Result.getOrThrow(advanceRevision())
       const result: EnchantingCommandResult = { _tag: 'EnchantingCommandResult', commandId: command.commandId, accepted: true, revision }
       cacheEnchantingResult(resultKey, fingerprint, result)
       notifyStateChanged()
@@ -2991,11 +4140,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendBrewing(client, cached.result)
         return cached.result.accepted ? { accepted: true, message: brewingMessage } : { accepted: false, reason: receiveReasonForRejection(cached.result.reason) }
       }
-      const rejectBrewing = (reason: Extract<BrewingCommandResult, { accepted: false }>['reason'], receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command'): ReceiveResult => {
+      const rejectBrewing = (
+        reason: Extract<BrewingCommandResult, { accepted: false }>['reason'],
+        receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
+      ): ReceiveResult => {
         const result: BrewingCommandResult = { _tag: 'BrewingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        cacheBrewingResult(resultKey, fingerprint, result)
+        if (failure === undefined) cacheBrewingResult(resultKey, fingerprint, result)
         sendBrewing(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== client.playerId) return rejectBrewing('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectBrewing('wrong-world', 'wrong-world')
@@ -3006,8 +4161,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const playerVitals = vitals.get(playerId)
       if (inventory === undefined || presence === undefined || playerVitals === undefined || playerVitals.health <= 0) return rejectBrewing('invalid-command')
       const at = { ...command.at }
-      const inaccessibleReason = facilityIsAccessible(playerId, at, 'brewing_stand')
-      if (inaccessibleReason !== null) return rejectBrewing('invalid-command')
+      const access = facilityIsAccessible(playerId, at, 'brewing_stand')
+      if (Result.isFailure(access)) return rejectBrewing('invalid-command', 'invalid-command', access.failure)
+      if (access.success !== null) return rejectBrewing('invalid-command')
       const current = brewingStands.get(positionKey(at))?.state
       if (current === undefined) return rejectBrewing('invalid-command')
       if (command.action._tag === 'open') {
@@ -3017,6 +4173,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendBrewing(client, result)
         return { accepted: true, message: brewingMessage }
       }
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return rejectBrewing('invalid-command', 'invalid-command', reserved.failure)
       let next = copyBrewingStandState(current)
       let inventoryChanged = false
       let effectsChanged = false
@@ -3051,11 +4209,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         const outcome = drinkBrewingPotion(next)
         if (outcome[1]._tag !== 'Consumed') return rejectBrewing('invalid-command')
         next = outcome[0]
-        statusEffects.set(playerId, applyStatusEffect(statusEffects.get(playerId) ?? emptyStatusEffectState(), outcome[1].effect))
+        // Status-effect state is load-validated or an mx-gameplay result, and the potion effect comes from mx-gameplay.
+        const applied = Result.getOrThrow(applyStatusEffect(statusEffects.get(playerId) ?? emptyStatusEffectState(), outcome[1].effect))
+        statusEffects.set(playerId, applied.state)
         effectsChanged = true
       }
       brewingStands.set(positionKey(at), { at, state: next })
-      revision += 1
+      // revisionAfter(1) succeeded before the action changed any state, and nothing has advanced the revision since.
+      Result.getOrThrow(advanceRevision())
       const result: BrewingCommandResult = { _tag: 'BrewingCommandResult', commandId: command.commandId, accepted: true, revision }
       cacheBrewingResult(resultKey, fingerprint, result)
       notifyStateChanged()
@@ -3082,6 +4243,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const rejectDamage = (
         reason: NonNullable<PlayerDamageCommandResult['reason']>,
         receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
       ): ReceiveResult => {
         const result: PlayerDamageCommandResult = {
           _tag: 'PlayerDamageCommandResult',
@@ -3090,9 +4252,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           revision,
           reason,
         }
-        cachePlayerDamageResult(resultKey, fingerprint, result)
+        if (failure === undefined) cachePlayerDamageResult(resultKey, fingerprint, result)
         sendPlayerDamage(client, result)
-        return { accepted: false, reason: receiveReason }
+        return failure === undefined
+          ? { accepted: false, reason: receiveReason }
+          : { accepted: false, reason: receiveReason, failure }
       }
       if (command.player !== client.playerId) return rejectDamage('unauthorized-player', 'identity-spoof')
       if (command.world !== worldId) return rejectDamage('wrong-world', 'wrong-world')
@@ -3103,20 +4267,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         return rejectDamage('invalid-command')
       }
 
+      const advanced = advanceRevision()
+      if (Result.isFailure(advanced)) return rejectDamage('invalid-command', 'invalid-command', advanced.failure)
       const wasAlive = playerVitals.health > 0
       playerVitals.health = Math.max(
         0,
         playerVitals.health - command.amount,
         command.minimumHealthPoints ?? 0,
       )
-      const hungerActor = hungerActors.get(client.playerId)
-      if (hungerActor !== undefined) {
-        hungerActors.set(client.playerId, {
-          ...hungerActor,
-          state: { ...hungerActor.state, health: playerVitals.health },
-        })
-      }
-      revision += 1
       const result: PlayerDamageCommandResult = {
         _tag: 'PlayerDamageCommandResult',
         commandId: command.commandId,
@@ -3158,19 +4316,47 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         sendWither(client, result)
         return { accepted: false, reason: 'invalid-command' }
       }
+      const rejectWitherFailure = (operation: WitherOperation, failure: WitherRuntimeFailure): ReceiveResult => {
+        const result = { _tag: 'WitherCommandResult', requestId: command.requestId, accepted: false, revision: witherRevision, reason: 'invalid-command' } as const
+        sendWither(client, result)
+        return {
+          accepted: false,
+          reason: 'invalid-command',
+          failure: { _tag: 'WitherRuntimeFailure', operation, failure },
+        }
+      }
+      const rejectWitherCoreFailure = (failure: MultiplayerServerCoreFailure): ReceiveResult => {
+        const result = { _tag: 'WitherCommandResult', requestId: command.requestId, accepted: false, revision: witherRevision, reason: 'invalid-command' } as const
+        sendWither(client, result)
+        return { accepted: false, reason: 'invalid-command', failure }
+      }
       if (command.expectedRevision !== witherRevision) {
         return rejectWither('stale-revision')
       }
+      // Every accepted wither command advances witherRevision once, so the advance is checked before any change.
+      const nextWitherRevision = revisionAfterSteps('wither', witherRevision, 1)
+      if (Result.isFailure(nextWitherRevision)) return rejectWitherCoreFailure(nextWitherRevision.failure)
       if (command._tag === 'SummonWither') {
         if (command.dimension !== worldId) return { accepted: false, reason: 'wrong-world' }
         const actor = players.get(command.actor as PlayerId)
         const hasIntegerPosition = Number.isInteger(command.position.x)
           && Number.isInteger(command.position.y)
           && Number.isInteger(command.position.z)
-        const summon = matchRuntimeWitherSummon(
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
+        const summonResult = matchRuntimeWitherSummon(
           { x: Math.floor(command.position.x), y: Math.floor(command.position.y), z: Math.floor(command.position.z) },
-          (position) => blockAt(position) ?? undefined,
+          (position) => {
+            const block = blockAt(position)
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return undefined
+            }
+            return block.success ?? undefined
+          },
         )
+        if (blockReadFailure !== undefined) return rejectWitherCoreFailure(blockReadFailure)
+        if (Result.isFailure(summonResult)) return rejectWitherFailure('match-summon', summonResult.failure)
+        const summon = summonResult.success
         if (!hasIntegerPosition || actor === undefined || summon === undefined || Math.hypot(
           actor.at.x - command.position.x,
           actor.at.y - command.position.y,
@@ -3178,11 +4364,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         ) > WITHER_INTERACTION_RANGE) {
           return rejectWither('invalid-command')
         }
+        const summonState = summonRuntimeWither(witherState, command.dimension, summon.spawnPosition)
+        if (Result.isFailure(summonState)) return rejectWitherFailure('summon', summonState.failure)
+        const reserved = revisionAfter(1)
+        if (Result.isFailure(reserved)) return rejectWitherCoreFailure(reserved.failure)
+        const summoned = writePositions([{ _tag: 'wither', state: summonState.success }])
+        if (Result.isFailure(summoned)) return rejectWitherCoreFailure(summoned.failure)
+        // revisionAfter(1) succeeded above, and writing the wither does not advance the revision.
+        Result.getOrThrow(advanceRevision())
         for (const position of summon.consumedBlocks) blocks.set(positionKey(position), { at: position, block: null })
         disturbFallingBlocks(summon.consumedBlocks)
-        revision += 1
         broadcast(snapshot())
-        witherState = summonRuntimeWither(witherState, command.dimension, summon.spawnPosition)
       } else {
         const actor = players.get(command.actor as PlayerId)
         const actorVitals = vitals.get(command.actor as PlayerId)
@@ -3197,22 +4389,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         ) > WITHER_INTERACTION_RANGE) {
           return rejectWither('invalid-command')
         }
-        lastWitherAttackMs.set(command.actor as PlayerId, options.now?.() ?? Date.now())
-        const damage = damageRuntimeWither(witherState, command.id, WITHER_ATTACK_DAMAGE, 'melee')
-        witherState = damage.state
-        if (damage.death !== undefined) {
-          const drop: AuthoritativeEntityState = {
-            _tag: 'item-drop',
-            entityId: `${command.id}:drop:${String(witherRevision + 1)}` as AuthoritativeEntityState['entityId'],
-            at: damage.death.drop.position,
-            stack: { item: damage.death.drop.item, count: damage.death.drop.count },
-          }
-          entities.set(drop.entityId, drop)
-          revision += 1
+        const damageResult = damageRuntimeWither(witherState, command.id, WITHER_ATTACK_DAMAGE, 'melee')
+        if (Result.isFailure(damageResult)) return rejectWitherFailure('damage', damageResult.failure)
+        const death = damageResult.success.death
+        const drop: AuthoritativeEntityState | undefined = death === undefined ? undefined : {
+          _tag: 'item-drop',
+          entityId: `${command.id}:drop:${String(nextWitherRevision.success)}` as AuthoritativeEntityState['entityId'],
+          at: death.drop.position,
+          stack: { item: death.drop.item, count: death.drop.count },
+        }
+        if (drop !== undefined) {
+          const reserved = revisionAfter(1)
+          if (Result.isFailure(reserved)) return rejectWitherCoreFailure(reserved.failure)
+          // mc-sim drops the nether star at the wither's stored feet, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: drop }]))
+          // revisionAfter(1) succeeded above, and writing the drop does not advance the revision.
+          Result.getOrThrow(advanceRevision())
           broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity: drop })
         }
+        lastWitherAttackMs.set(command.actor as PlayerId, options.now?.() ?? Date.now())
+        // Damage changes health only, so every wither and skull keeps its stored, admitted position.
+        Result.getOrThrow(writePositions([{ _tag: 'wither', state: damageResult.success.state }]))
       }
-      witherRevision += 1
+      witherRevision = nextWitherRevision.success
       notifyStateChanged()
       const acceptedResult = { _tag: 'WitherCommandResult', requestId: command.requestId, accepted: true, revision: witherRevision } as const
       witherCommandResults.set(resultKey, acceptedResult)
@@ -3252,25 +4451,38 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         || Math.hypot(actor.at.x - dragonAt.x, actor.at.y - dragonAt.y, actor.at.z - dragonAt.z) > ENDER_DRAGON_INTERACTION_RANGE) {
         return rejectEnderDragon('invalid-command')
       }
-      lastEnderDragonAttackMs.set(command.actor as PlayerId, options.now?.() ?? Date.now())
       const damage = damageEnderDragonByPlayer(enderDragonState, ENDER_DRAGON_ATTACK_DAMAGE)
       if (damage._tag === 'Rejected') return rejectEnderDragon('invalid-command')
+      const revisionSteps = damage.events.filter((event) => event._tag === 'ExperienceRewarded'
+        || event._tag === 'DragonEggRewarded'
+        || event._tag === 'ExitPortalMaterializationRequested').length
+      const rejectEnderDragonFailure = (failure: MultiplayerServerCoreFailure): ReceiveResult => {
+        sendEnderDragon(client, { _tag: 'EnderDragonCommandResult', requestId: command.requestId, accepted: false, revision: enderDragonRevision, reason: 'invalid-command' })
+        return { accepted: false, reason: 'invalid-command', failure }
+      }
+      const reserved = revisionAfter(revisionSteps)
+      if (Result.isFailure(reserved)) return rejectEnderDragonFailure(reserved.failure)
+      const nextEnderDragonRevision = revisionAfterSteps('ender-dragon', enderDragonRevision, 1)
+      if (Result.isFailure(nextEnderDragonRevision)) return rejectEnderDragonFailure(nextEnderDragonRevision.failure)
+      lastEnderDragonAttackMs.set(command.actor as PlayerId, options.now?.() ?? Date.now())
       enderDragonState = damage.state
+      // revisionAfter(revisionSteps) succeeded above, and each advancing event below advances the revision once.
       for (const event of damage.events) {
         if (event._tag === 'ExperienceRewarded') {
           actorVitals.experience += event.amount
-          revision += 1
+          Result.getOrThrow(advanceRevision())
           broadcast({ _tag: 'PlayerVitalsDelta', world: actor.world, revision, player: command.actor as PlayerId, state: vitalsSnapshot(actorVitals) })
         }
         if (event._tag === 'DragonEggRewarded') {
           const drop: AuthoritativeEntityState = {
             _tag: 'item-drop',
-            entityId: `ender-dragon:egg:${String(enderDragonRevision + 1)}` as AuthoritativeEntityState['entityId'],
+            entityId: `ender-dragon:egg:${String(nextEnderDragonRevision.success)}` as AuthoritativeEntityState['entityId'],
             at: { x: 0, y: 65, z: 0 },
             stack: { item: event.item, count: event.count },
           }
-          entities.set(drop.entityId, drop)
-          revision += 1
+          // The egg lands on a fixed cell near the origin, which is addressable.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: drop }]))
+          Result.getOrThrow(advanceRevision())
           broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity: drop })
         }
         if (event._tag === 'ExitPortalMaterializationRequested') {
@@ -3280,11 +4492,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               blocks.set(positionKey(at), { at, block: END_EXIT_PORTAL_BLOCK })
             }
           }
-          revision += 1
+          Result.getOrThrow(advanceRevision())
           broadcast(snapshot())
         }
       }
-      enderDragonRevision += 1
+      enderDragonRevision = nextEnderDragonRevision.success
       notifyStateChanged()
       const acceptedResult = { _tag: 'EnderDragonCommandResult', requestId: command.requestId, accepted: true, revision: enderDragonRevision } as const
       enderDragonCommandResults.set(resultKey, acceptedResult)
@@ -3296,29 +4508,33 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (sleepMessage?._tag === 'SleepCommand') {
       if (client.playerId === null) return { accepted: false, reason: 'join-required' }
       if (sleepMessage.command.actor !== client.playerId) return { accepted: false, reason: 'identity-spoof' }
-      const result = sleepAuthority.execute(sleepMessage.command)
-      sendSleep(client, { _tag: 'SleepCommandResult', result })
-      if (result.accepted) {
-        broadcastSleep({ _tag: 'SleepEvents', revision: result.revision, events: result.events })
-        if (result.events.some((event) => event._tag === 'NightSkipped')) {
-          timeWeather = { timeOfDay: 6_000, weather: 'clear' }
-          revision += 1
-          notifyStateChanged()
-          broadcast({
-            _tag: 'WorldTimeWeatherDelta',
-            world: worldId,
-            revision,
-            state: { ...timeWeather },
-          })
-        }
+      // An accepted sleep command can skip the night, which advances the revision after the sleep state changed.
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return { accepted: false, reason: 'invalid-command', failure: reserved.failure }
+      // execute records the request and the client receives its result, so a bed cell that cannot be read fails the
+      // command before either happens. A cell read here reads the same way inside execute, since nothing writes between.
+      const command = sleepMessage.command
+      if (command._tag === 'EnterSleep' && [command.bed.x, command.bed.y, command.bed.z].every(Number.isSafeInteger)
+        && sleepValidationReadsBed(client.playerId, command.bed)) {
+        const bed = blockAt(command.bed)
+        if (Result.isFailure(bed)) return { accepted: false, reason: 'invalid-command', failure: bed.failure }
       }
-      return result.accepted
-        ? { accepted: true, message: sleepMessage }
-        : { accepted: false, reason: 'invalid-command' }
+      sleepBlockReadFailure = undefined
+      const result = sleepAuthority.execute(command, intentContext())
+      sendSleep(client, { _tag: 'SleepCommandResult', result })
+      if (sleepBlockReadFailure !== undefined) {
+        const failure = sleepBlockReadFailure
+        sleepBlockReadFailure = undefined
+        return { accepted: false, reason: 'invalid-command', failure }
+      }
+      if (!result.accepted) return { accepted: false, reason: 'invalid-command' }
+      // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
+      Result.getOrThrow(publishSleepEvents(result.revision, result.events))
+      return { accepted: true, message: sleepMessage }
     }
     const decoded = decodeFrame(frame)
-    if (decoded._tag === 'Left') return { accepted: false, reason: 'malformed-frame' }
-    const message = decoded.right
+    if (Result.isFailure(decoded)) return { accepted: false, reason: 'malformed-frame' }
+    const message = decoded.success
 
     if (message._tag === 'PlayerJoin') {
       if (client.playerId !== null) {
@@ -3328,18 +4544,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const persistedPosition = playerPositions.get(message.player)
       const authoritativeAt = persistedPosition?.at ?? options.spawnAt
       const authoritativeFacing = persistedPosition?.facing ?? DEFAULT_FACING
+      const joined = writePositions([{
+        _tag: 'player',
+        presence: { player: message.player, name: message.name, world: worldId, at: authoritativeAt, facing: authoritativeFacing },
+        at: authoritativeAt,
+        facing: authoritativeFacing,
+      }])
+      if (Result.isFailure(joined)) return { accepted: false, reason: 'invalid-command', failure: joined.failure }
       client.playerId = message.player
-      players.set(message.player, {
-        player: message.player,
-        name: message.name,
-        world: worldId,
-        at: { ...authoritativeAt },
-        facing: { ...authoritativeFacing },
-      })
-      playerPositions.set(message.player, {
-        at: { ...authoritativeAt },
-        facing: { ...authoritativeFacing },
-      })
       playerClients.set(message.player, clientId)
       const sleepSnapshot = sleepAuthority.addActor({
         player: message.player,
@@ -3399,18 +4611,32 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
 
     switch (message._tag) {
-      case 'PlayerLeave':
-        {
-          const events = sleepAuthority.disconnect(message.player)
-          if (events.length > 0) broadcastSleep({ _tag: 'SleepEvents', revision: sleepAuthority.snapshot().revision, events })
-        }
+      case 'PlayerLeave': {
+        // Leaving can skip the night, so the player stays unless that advance fits; disconnect still removes them.
+        const reserved = revisionAfter(1)
+        if (Result.isFailure(reserved)) return { accepted: false, reason: 'invalid-command', failure: reserved.failure }
+        const events = sleepAuthority.disconnect(message.player)
+        // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
+        Result.getOrThrow(publishSleepEvents(sleepAuthority.snapshot().revision, events))
         removePlayer(clientId, client)
         return { accepted: true, message }
+      }
       case 'PlayerMove': {
         if (message.world !== undefined && message.world !== worldId) return { accepted: false, reason: 'wrong-world' }
         const player = players.get(message.player)
         if (player === undefined) return { accepted: false, reason: 'join-required' }
-        if (!isValidMovement(player, message.at)) {
+        const validMovement = isValidMovement(player, message.at)
+        if (Result.isFailure(validMovement)) {
+          sendMessage(client, {
+            _tag: 'PlayerMove',
+            player: player.player,
+            world: worldId,
+            at: player.at,
+            facing: player.facing,
+          })
+          return { accepted: false, reason: 'invalid-movement', failure: validMovement.failure }
+        }
+        if (!validMovement.success) {
           sendMessage(client, {
             _tag: 'PlayerMove',
             player: player.player,
@@ -3430,12 +4656,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           })
           return { accepted: false, reason: 'invalid-movement' }
         }
-        player.at = message.at
-        player.facing = message.facing
-        playerPositions.set(message.player, {
-          at: { ...message.at },
-          facing: { ...message.facing },
-        })
+        const moved = writePositions([{ _tag: 'player', presence: player, at: message.at, facing: message.facing }])
+        if (Result.isFailure(moved)) {
+          sendMessage(client, {
+            _tag: 'PlayerMove',
+            player: player.player,
+            world: worldId,
+            at: player.at,
+            facing: player.facing,
+          })
+          return { accepted: false, reason: 'invalid-movement', failure: moved.failure }
+        }
         notifyStateChanged()
         broadcast({ ...message, world: worldId })
         return { accepted: true, message }
@@ -3445,40 +4676,49 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         return { accepted: true, message }
       case 'BlockPlace': {
         if (message.world !== undefined && message.world !== worldId) return rejectMutation(client, message, 'unauthorized-player', 'wrong-world')
-        if (!isInBounds(message.at)) return rejectMutation(client, message, 'out-of-bounds')
+        const blockId = isBlockType(message.block) ? blockIdOf(message.block) : Option.none()
+        if (Option.isNone(blockId)) return rejectMutation(client, message, 'unknown-block')
+        const { at, block: placedBlock } = placeBlockIntent(message, blockId.value)
+        if (!isInBounds(at)) return rejectMutation(client, message, 'out-of-bounds')
         const player = players.get(message.player)
-        if (player === undefined || !isBlockWithinReach(player, message.at)) return rejectMutation(client, message, 'unauthorized-player', 'invalid-mutation')
-        if (message.block === 'air' || !options.allowedBlocks.has(message.block)) return rejectMutation(client, message, 'unknown-block')
-        if (blockAt(message.at) !== null) return rejectMutation(client, message, 'occupied')
+        if (player === undefined || !isBlockWithinReach(player, at)) return rejectMutation(client, message, 'unauthorized-player', 'invalid-mutation')
+        if (placedBlock === 'air' || !options.allowedBlocks.has(placedBlock)) return rejectMutation(client, message, 'unknown-block')
+        const existingBlock = blockAt(at)
+        if (Result.isFailure(existingBlock)) {
+          return rejectMutation(client, message, 'occupied', 'invalid-mutation', existingBlock.failure)
+        }
+        if (existingBlock.success !== null) return rejectMutation(client, message, 'occupied')
         const inventory = inventories.get(message.player)
         const sourceSlot = inventory?.selectedSlot ?? -1
         const sourceStack = sourceSlot >= 0 ? inventory?.slots[sourceSlot] : undefined
-        if (inventory === undefined || sourceStack == null || sourceStack.item !== message.block) {
+        if (inventory === undefined || sourceStack == null || sourceStack.item !== placedBlock) {
           return rejectMutation(client, message, 'unknown-block')
         }
+        const advanced = advanceRevision()
+        if (Result.isFailure(advanced)) return rejectMutation(client, message, 'stale-revision', 'invalid-mutation', advanced.failure)
         inventory.slots[sourceSlot] = sourceStack.count === 1
           ? null
           : { ...sourceStack, count: sourceStack.count - 1 }
-        blocks.set(positionKey(message.at), { at: message.at, block: message.block })
-        disturbFallingBlocks([message.at])
-        const containerKind = containerKindForBlock(message.block)
+        blocks.set(positionKey(at), { at, block: placedBlock })
+        disturbFallingBlocks([at])
+        const containerKind = containerKindForBlock(placedBlock)
         if (containerKind !== undefined) {
-          const containerId = containerIdAt(message.at)
+          const containerId = containerIdAt(at)
           containers.set(containerId, { containerId, kind: containerKind, slots: emptyContainerSlots(containerKind) })
-        } else if (message.block === 'furnace') {
-          const furnaceId = furnaceIdAt(message.at)
+        } else if (placedBlock === 'furnace') {
+          const furnaceId = furnaceIdAt(at)
           furnaces.set(furnaceId, {
             furnaceId,
             input: null,
             fuel: null,
             output: null,
             burnTicksRemaining: 0,
+            burnTicksTotal: 0,
             cookTicks: 0,
           })
-        } else if (message.block === 'brewing_stand') {
-          brewingStands.set(positionKey(message.at), { at: { ...message.at }, state: emptyBrewingStandState() })
+        } else if (placedBlock === 'brewing_stand') {
+          brewingStands.set(positionKey(at), { at: { ...at }, state: emptyBrewingStandState() })
         }
-        revision += 1
         notifyStateChanged()
         broadcast({ ...message, world: worldId })
         broadcast({
@@ -3488,88 +4728,112 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           player: message.player,
           state: inventorySnapshot(inventory),
         })
-        if (message.block === 'brewing_stand') {
-          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...message.at }, state: emptyBrewingStandState() })
+        if (placedBlock === 'brewing_stand') {
+          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: emptyBrewingStandState() })
         }
-        if (containerKind !== undefined || message.block === 'furnace' || message.block === 'brewing_stand') broadcast(authoritativeSnapshot())
+        if (containerKind !== undefined || placedBlock === 'furnace' || placedBlock === 'brewing_stand') broadcast(authoritativeSnapshot())
         return { accepted: true, message }
       }
       case 'BlockBreak': {
         if (message.world !== undefined && message.world !== worldId) return rejectMutation(client, message, 'unauthorized-player', 'wrong-world')
-        if (!isInBounds(message.at)) return rejectMutation(client, message, 'out-of-bounds')
+        const at = breakBlockIntent(message)
+        if (!isInBounds(at)) return rejectMutation(client, message, 'out-of-bounds')
         const player = players.get(message.player)
-        if (player === undefined || !isBlockWithinReach(player, message.at)) return rejectMutation(client, message, 'unauthorized-player', 'invalid-mutation')
-        const brokenBlock = blockAt(message.at)
+        if (player === undefined || !isBlockWithinReach(player, at)) return rejectMutation(client, message, 'unauthorized-player', 'invalid-mutation')
+        const brokenBlockResult = blockAt(at)
+        if (Result.isFailure(brokenBlockResult)) {
+          return rejectMutation(client, message, 'missing-block', 'invalid-mutation', brokenBlockResult.failure)
+        }
+        const brokenBlock = brokenBlockResult.success
         if (brokenBlock === null) return rejectMutation(client, message, 'missing-block')
-        blocks.set(positionKey(message.at), { at: message.at, block: null })
-        poweredRails.delete(positionKey(message.at))
-        levers.delete(positionKey(message.at))
-        disturbFallingBlocks([message.at])
+        let lootBlockId: BlockId | undefined
+        if (isBlockType(brokenBlock)) {
+          const blockId = blockIdOf(brokenBlock)
+          if (Option.isNone(blockId)) {
+            return rejectMutation(client, message, 'missing-block', 'invalid-mutation', {
+              _tag: 'BlockRegistryLookupFailure',
+              operation: 'block-break',
+              block: brokenBlock,
+            })
+          }
+          lootBlockId = blockId.value
+        }
+        // A bed break can skip the night, so the break reserves that second advance before it changes state.
+        const reserved = revisionAfter(2)
+        if (Result.isFailure(reserved)) return rejectMutation(client, message, 'stale-revision', 'invalid-mutation', reserved.failure)
+        const breakRevision = revision + 1
+        const inventory = inventories.get(message.player)
+        const heldItem = inventory?.slots[inventory.selectedSlot]?.item
+        // lootBlockId comes from blockIdOf on a registered block type.
+        const blockLootStacks = lootBlockId === undefined
+          ? []
+          : Result.getOrThrow(blockLoot(
+              lootBlockId,
+              miningLootContextForItem(typeof heldItem === 'string' && isItemType(heldItem) ? heldItem : null),
+              Array.from({ length: 4 }, (_, index) => deterministicRoll(
+                `block:${positionKey(at)}:${String(breakRevision)}:${String(index)}`,
+              )),
+            ))
         // Capture whatever a chest/shulker/dispenser/dropper/hopper, furnace, or brewing
         // stand was holding before its state is deleted, so breaking it drops the
         // contents instead of silently destroying them. Partial-progress fields (cook
         // time, burn time, brew fuel charges) are not items and are intentionally
         // discarded, matching the single-player break path in apps/web/main.ts.
         const storedStacks: Array<ItemStack> = []
+        const containerId = containerIdAt(at)
+        const furnaceId = furnaceIdAt(at)
+        const brewingKey = positionKey(at)
         if (containerKindForBlock(brokenBlock) !== undefined) {
-          const containerId = containerIdAt(message.at)
           const container = containers.get(containerId)
           if (container !== undefined) {
             for (const stack of container.slots) if (stack !== null && stack !== undefined) storedStacks.push(stack)
           }
-          containers.delete(containerId)
         } else if (brokenBlock === 'furnace') {
-          const furnaceId = furnaceIdAt(message.at)
           const furnace = furnaces.get(furnaceId)
           if (furnace !== undefined) {
             for (const stack of [furnace.input, furnace.fuel, furnace.output]) if (stack !== null) storedStacks.push(stack)
           }
-          furnaces.delete(furnaceId)
         } else if (brokenBlock === 'brewing_stand') {
-          const brewingKey = positionKey(message.at)
           const stand = brewingStands.get(brewingKey)
           if (stand !== undefined) {
             if (stand.state.bottle !== undefined) storedStacks.push({ item: brewingBottleItem(stand.state.bottle), count: 1 })
             if (stand.state.ingredient !== undefined) storedStacks.push({ item: stand.state.ingredient, count: 1 })
           }
-          brewingStands.delete(brewingKey)
         }
-        revision += 1
-        const inventory = inventories.get(message.player)
-        const heldItem = inventory?.slots[inventory.selectedSlot]?.item
-        const blockDrops = isBlockType(brokenBlock)
-          ? blockLoot(
-              blockIdOf(brokenBlock),
-              miningLootContextForItem(typeof heldItem === 'string' && isItemType(heldItem) ? heldItem : null),
-              Array.from({ length: 4 }, (_, index) => deterministicRoll(
-                `block:${positionKey(message.at)}:${String(revision)}:${String(index)}`,
-              )),
-            ).map((stack, index): AuthoritativeEntityState => ({
-              _tag: 'item-drop',
-              entityId: `block:${positionKey(message.at)}:drop:${String(revision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-              at: { x: message.at.x + 0.5, y: message.at.y + 0.5, z: message.at.z + 0.5 },
-              stack,
-            }))
-          : []
+        const blockDrops = blockLootStacks.map((stack, index): AuthoritativeEntityState => ({
+          _tag: 'item-drop',
+          entityId: `block:${positionKey(at)}:drop:${String(breakRevision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+          at: { x: at.x + 0.5, y: at.y + 0.5, z: at.z + 0.5 },
+          stack,
+        }))
         const contentsDrops = storedStacks.map((stack, index): AuthoritativeEntityState => ({
           _tag: 'item-drop',
-          entityId: `contents:${positionKey(message.at)}:drop:${String(revision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-          at: { x: message.at.x + 0.5, y: message.at.y + 0.5, z: message.at.z + 0.5 },
+          entityId: `contents:${positionKey(at)}:drop:${String(breakRevision)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+          at: { x: at.x + 0.5, y: at.y + 0.5, z: at.z + 0.5 },
           stack,
         }))
         const drops = [...blockDrops, ...contentsDrops]
-        for (const drop of drops) entities.set(drop.entityId, drop)
+        const dropped = writePositions(drops.map((drop) => ({ _tag: 'entity', entity: drop })))
+        if (Result.isFailure(dropped)) return rejectMutation(client, message, 'out-of-bounds', 'invalid-mutation', dropped.failure)
+        // revisionAfter(2) succeeded above, and writing the drops does not advance the revision.
+        Result.getOrThrow(advanceRevision())
+        blocks.set(positionKey(at), { at, block: null })
+        poweredRails.delete(positionKey(at))
+        levers.delete(positionKey(at))
+        disturbFallingBlocks([at])
+        if (containerKindForBlock(brokenBlock) !== undefined) containers.delete(containerId)
+        else if (brokenBlock === 'furnace') furnaces.delete(furnaceId)
+        else if (brokenBlock === 'brewing_stand') brewingStands.delete(brewingKey)
         notifyStateChanged()
         broadcast({ ...message, world: worldId })
         for (const drop of drops) broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity: drop })
         if (brokenBlock === 'brewing_stand') {
-          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...message.at }, state: emptyBrewingStandState() })
+          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: emptyBrewingStandState() })
         }
         if (containerKindForBlock(brokenBlock) !== undefined || brokenBlock === 'furnace' || brokenBlock === 'brewing_stand') broadcast(authoritativeSnapshot())
-        {
-          const events = sleepAuthority.reconcile()
-          if (events.length > 0) broadcastSleep({ _tag: 'SleepEvents', revision: sleepAuthority.snapshot().revision, events })
-        }
+        const sleepEvents = sleepAuthority.reconcile()
+        // revisionAfter(2) reserved the advance a skipped night takes.
+        Result.getOrThrow(publishSleepEvents(sleepAuthority.snapshot().revision, sleepEvents))
         return { accepted: true, message }
       }
       case 'Pong':
@@ -3629,31 +4893,39 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       case 'WitherCommandAccepted':
       case 'WitherCommandRejected':
       case 'WitherSnapshotDelta':
+      case 'ReplicatedWorldDelta':
+      case 'ReplicatedWorldSnapshot':
+      case 'ReplicatedWorldSnapshotStart':
+      case 'ReplicatedWorldSnapshotChunk':
+      case 'ReplicatedWorldSnapshotEnd':
         return { accepted: false, reason: 'identity-spoof' }
     }
   }
 
-  const disconnect = (clientId: ClientId): void => {
+  // A socket close cannot be refused, so the player always leaves and a failed night skip is reported afterwards.
+  const disconnect = (clientId: ClientId): Result.Result<void, MultiplayerServerCoreFailure> => {
     const client = clients.get(clientId)
-    if (client === undefined) return
+    if (client === undefined) return Result.succeed(undefined)
     const playerId = client.playerId
     removePlayer(clientId, client)
-    if (playerId !== null) {
-      bowDrawStartedAt.delete(playerId)
-      const events = sleepAuthority.disconnect(playerId)
-      if (events.length > 0) broadcastSleep({ _tag: 'SleepEvents', revision: sleepAuthority.snapshot().revision, events })
-    }
     clients.delete(clientId)
+    if (playerId === null) return Result.succeed(undefined)
+    bowDrawStartedAt.delete(playerId)
+    const events = sleepAuthority.disconnect(playerId)
+    return publishSleepEvents(sleepAuthority.snapshot().revision, events)
   }
 
-  const detachPlayer = (clientId: ClientId): RealmTransferPlayer | undefined => {
+  const detachPlayer = (clientId: ClientId): Result.Result<RealmTransferPlayer | undefined, MultiplayerServerCoreFailure> => {
     const client = clients.get(clientId)
-    if (client === undefined || client.playerId === null) return undefined
+    if (client === undefined || client.playerId === null) return Result.succeed(undefined)
     const playerId = client.playerId
     const player = players.get(playerId)
     const inventory = inventories.get(playerId)
     const playerVitals = vitals.get(playerId)
-    if (player === undefined || inventory === undefined || playerVitals === undefined) return undefined
+    if (player === undefined || inventory === undefined || playerVitals === undefined) return Result.succeed(undefined)
+    // Leaving can skip the night, so the player stays in this realm unless that advance fits.
+    const reserved = revisionAfter(1)
+    if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
     const transfer: RealmTransferPlayer = {
       player: player.player,
       name: player.name,
@@ -3667,16 +4939,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     removePlayer(clientId, client)
     bowDrawStartedAt.delete(playerId)
     const sleepEvents = sleepAuthority.disconnect(playerId)
-    if (sleepEvents.length > 0) broadcastSleep({ _tag: 'SleepEvents', revision: sleepAuthority.snapshot().revision, events: sleepEvents })
+    // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
+    Result.getOrThrow(publishSleepEvents(sleepAuthority.snapshot().revision, sleepEvents))
     inventories.delete(playerId)
     vitals.delete(playerId)
     statusEffects.delete(playerId)
     anvilNames.delete(playerId)
     enchantments.delete(playerId)
-    hungerActors.delete(playerId)
+    hungerPlayers.delete(playerId)
+    hungerStates.delete(playerId)
     playerPositions.delete(playerId)
     notifyStateChanged()
-    return transfer
+    return Result.succeed(transfer)
   }
 
   const acceptRealmTransfer = (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival): boolean => {
@@ -3686,13 +4960,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       player: transfer.player,
       name: transfer.name,
       world: worldId,
-      at: { ...arrival.at },
-      facing: { ...arrival.facing },
+      at: arrival.at,
+      facing: arrival.facing,
     }
+    if (Result.isFailure(writePositions([{ _tag: 'player', presence: player, at: arrival.at, facing: arrival.facing }]))) return false
     client.playerId = transfer.player
-    players.set(transfer.player, player)
     playerClients.set(transfer.player, clientId)
-    playerPositions.set(transfer.player, { at: { ...arrival.at }, facing: { ...arrival.facing } })
     inventories.set(transfer.player, cloneInventory(transfer.inventory))
     vitals.set(transfer.player, { ...transfer.vitals })
     statusEffects.set(transfer.player, copyStatusEffectState(transfer.statusEffects))
@@ -3739,144 +5012,313 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return true
   }
 
-  const tick = (elapsedMs: number): void => {
+  /**
+   * Steps ecosystem mobs for `elapsedTicks` game ticks as mx-gameplay's entities stage does: each game tick first steps
+   * every mob's AI with stepEcosystemMob, which judges attacks from where the mob stands and sets its movement goal
+   * toward its target, then moves the whole roster once with planMobMovementRoster. The roster shares one search budget
+   * and one rotating start per call, so the plan is one call over every mob. A planner fault fails the step rather than
+   * leaving one mob behind silently.
+   */
+  const planMobs = (
+    mobs: ReadonlyArray<MovingMob>,
+    elapsedTicks: number,
+  ): Result.Result<ReadonlyArray<MovingMob>, MultiplayerServerCoreFailure> => {
+    if (mobs.length === 0 || elapsedTicks === 0) return Result.succeed(mobs)
+    // mx-gameplay's entities stage opens its movement window one chunk width around each mob. The window holds the
+    // loaded chunk values, and nothing writes a block until the plan is done, so every game tick reads the same cells.
+    const coords = new Map<string, ChunkCoord>()
+    for (const { feet } of mobs) {
+      for (const coord of chunkCoordsAround(feet, CHUNK_SIZE_XZ)) coords.set(chunkKeyOf(coord.cx, coord.cz), coord)
+    }
+    const window = world.openWindow([...coords.values()])
+    if (Result.isFailure(window)) return Result.fail(window.failure)
+    const movementWorld = mobMovementWorldFromChunkWindow(window.success)
+    let current = mobs
+    for (let gameTick = 0; gameTick < elapsedTicks; gameTick += 1) {
+      // stepEcosystemMob advances exactly one game tick per call and leaves the mob's feet in place.
+      const stepped = current.map((mob) => {
+        const step = stepEcosystemMob(mob.kind, mob.ecosystem, mob.feet, mob.target?.at, GAME_TICK_SECS)
+        return {
+          ...mob,
+          ecosystem: step.state,
+          attackDamages: step.attack === undefined ? mob.attackDamages : [...mob.attackDamages, step.attack.damage],
+        }
+      })
+      // The roster lives for one plan, so it mints no serials. Health is the wire value, finite and positive.
+      const roster: MobRoster = {
+        nextSerial: EntitySerial(0),
+        entities: stepped.map((mob) => ({
+          id: mob.entity.entityId,
+          kind: EntityKind(mob.kind),
+          feetPosition: mob.feet,
+          healthPoints: EntityHealthPoints(mob.entity.health),
+          behaviour: mob.ecosystem,
+          dimension,
+        })),
+      }
+      // simulationTick already counts this tick's game ticks, so this game tick is the matching earlier one.
+      const plannedTick = SimulationTick(simulationTick - elapsedTicks + gameTick + 1)
+      // The roster's target only stands in for a mob without a movement goal, and stepEcosystemMob has just set each
+      // mob's goal from its own nearest player, or from wandering when there is none, so no roster target is needed.
+      const planned = Result.getOrThrow(planMobMovementRoster(roster, undefined, movementWorld, plannedTick, dimension))
+      const [fault] = planned.faults
+      if (fault !== undefined) return Result.fail({ _tag: 'MobMovementFailure', fault })
+      const plannedById = new Map(planned.roster.entities.map((entity) => [String(entity.id), entity]))
+      current = stepped.map((mob) => {
+        // planMobMovementRoster maps every roster entity to its planned entity under the same id, writing an ecosystem
+        // mob's behaviour back as its ecosystem state with the planned movement.
+        const entity = Option.getOrThrow(Option.fromNullishOr(plannedById.get(mob.entity.entityId)))
+        const behaviour = entity.behaviour
+        const ecosystem = Option.getOrThrow(Option.fromNullishOr(behaviour?._tag === 'EcosystemMob' ? behaviour : undefined))
+        return { ...mob, feet: entity.feetPosition, ecosystem }
+      })
+    }
+    return Result.succeed(current)
+  }
+
+  const tick = (elapsedMs: number): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
+      return Result.fail({ _tag: 'InvalidServerTickDuration', elapsedMs })
+    }
+    // A step computed in this tick that leaves addressable cells is refused for that entity alone, so one entity
+    // cannot stop the world; each refusal is reported to the caller.
+    const refusals: PositionWriteRefused[] = []
+    const refuse = (outside: PositionOutsideAddressableCells, kind: string, action: PositionWriteRefused['action']): void => {
+      refusals.push({ _tag: 'PositionWriteRefused', subject: outside.subject, id: outside.id, kind, at: outside.at, action })
+    }
     let stateChanged = false
     let worldSnapshotRequired = false
     const postPersistenceDeltas: AuthoritativeDelta[] = []
+    // Furnace, brewing, Wither, and ender dragon messages, built when their step completes. publish requests
+    // persistence first and then sends them ahead of the deltas; it does not wait for the write to finish.
+    const postPersistenceSends: Array<() => void> = []
     const changedFurnaces: MutableFurnaceState[] = []
-    const elapsedSecs = Number.isFinite(elapsedMs) && elapsedMs > 0 ? elapsedMs / 1_000 : 0
-    const validElapsedMs = elapsedSecs * 1_000
+    // The time delta carries the revision after the furnace step, so the time step leaves it pending until then, or
+    // until a later failure publishes the completed time step.
+    let timeDeltaPending = false
+    const pushTimeDelta = (): void => {
+      if (!timeDeltaPending) return
+      timeDeltaPending = false
+      postPersistenceDeltas.push({ _tag: 'WorldTimeWeatherDelta', world: worldId, revision, state: { ...timeWeather } })
+    }
+    const publish = (): void => {
+      pushTimeDelta()
+      if (stateChanged) notifyStateChanged()
+      for (const send of postPersistenceSends) send()
+      for (const delta of postPersistenceDeltas) broadcast(delta)
+      if (worldSnapshotRequired) broadcast(snapshot())
+    }
+    // A failing step is left wholly unapplied: it checks its revision advance and its fallible reads before it changes
+    // any state, or undoes its changes through beginStepUndo. The steps before it are complete, so they are
+    // published before the failure returns.
+    const failStep = (failure: MultiplayerServerCoreFailure): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
+      publish()
+      return Result.fail(failure)
+    }
+    /**
+     * Records what the entity and Wither steps can change, for steps whose later reads see earlier changes and so
+     * cannot read everything first. `undo` puts every recorded map back as the step found it.
+     */
+    const beginStepUndo = (): Readonly<{ destroyBlock: (at: BlockPos) => void; undo: () => void }> => {
+      const savedEntities = new Map(entities)
+      const savedRecoveries = new Map(eyeOfEnderRecoveries)
+      const savedVitals = new Map([...vitals].map(([player, state]) => [player, { ...state }]))
+      const savedFallingPending = new Map(fallingPending)
+      const savedMobMovements = new Map(mobMovements)
+      const replacedBlocks: Array<Readonly<{ key: string; previous: BlockOverride | undefined }>> = []
+      return {
+        destroyBlock: (at) => {
+          const key = positionKey(at)
+          replacedBlocks.push({ key, previous: blocks.get(key) })
+          blocks.set(key, { at, block: null })
+          disturbFallingBlocks([at])
+        },
+        undo: () => {
+          entities.clear()
+          for (const [id, entity] of savedEntities) entities.set(id, entity)
+          eyeOfEnderRecoveries.clear()
+          for (const [key, recovery] of savedRecoveries) eyeOfEnderRecoveries.set(key, recovery)
+          for (const [player, state] of savedVitals) {
+            const current = vitals.get(player)
+            if (current !== undefined) Object.assign(current, state)
+          }
+          fallingPending.clear()
+          for (const [key, at] of savedFallingPending) fallingPending.set(key, at)
+          mobMovements.clear()
+          for (const [id, movement] of savedMobMovements) mobMovements.set(id, movement)
+          // Both set and delete mark the chunk stale, so the next read regenerates it with the restored edits.
+          for (const { key, previous } of [...replacedBlocks].reverse()) {
+            if (previous === undefined) blocks.delete(key)
+            else blocks.set(key, previous)
+          }
+        },
+      }
+    }
+    const elapsedSecs = elapsedMs / 1_000
+    const validElapsedMs = elapsedMs
     const elapsedTicks = Math.floor((timeTickRemainderMs + validElapsedMs) / MINECRAFT_TICK_MS)
+    const nextSimulationTick = simulationTick + elapsedTicks
+    if (!Number.isSafeInteger(nextSimulationTick)) return Result.fail({ _tag: 'SimulationTickExhausted', simulationTick, elapsedTicks })
     timeTickRemainderMs = timeTickRemainderMs + validElapsedMs - elapsedTicks * MINECRAFT_TICK_MS
+    simulationTick = nextSimulationTick
     const timeChanged = elapsedTicks > 0
     if (elapsedSecs > 0) {
       const fishingDeltas: Array<Omit<Extract<AuthoritativeDelta, { readonly _tag: 'PlayerFishingDelta' }>, 'revision'>> = []
+      const fishingCommits: Array<() => void> = []
       for (const [player, active] of fishingSessions) {
         const actor = players.get(player)
         const inventory = inventories.get(player)
         if (actor === undefined || inventory?.slots[active.slot]?.item !== 'fishing_rod') {
-          fishingSessions.delete(player)
+          fishingCommits.push(() => fishingSessions.delete(player))
           if (actor !== undefined) fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'idle', result: 'cancelled' } })
           continue
         }
-        const advanced = advanceFishing(active.session, elapsedSecs, { hasWater: blockAt(active.water) === 'water' })
+        const water = blockAt(active.water)
+        if (Result.isFailure(water)) return failStep(water.failure)
+        const advanced = advanceFishing(active.session, elapsedSecs, { hasWater: water.success === 'water' })
         if (advanced._tag === 'Cancelled') {
-          fishingSessions.delete(player)
+          fishingCommits.push(() => fishingSessions.delete(player))
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'idle', result: 'lost-water' } })
-        } else if (advanced._tag === 'Bite') {
-          active.session = advanced.session
+          continue
+        }
+        const session = advanced.session
+        fishingCommits.push(() => { active.session = session })
+        if (advanced._tag === 'Bite') {
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'bite', result: 'bite' } })
         } else if (advanced._tag === 'Escaped') {
-          active.session = advanced.session
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'escaped', result: 'escaped' } })
-        } else if (advanced._tag === 'Waiting') active.session = advanced.session
+        }
       }
       if (fishingDeltas.length > 0) {
-        revision += 1
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
         stateChanged = true
         postPersistenceDeltas.push(...fishingDeltas.map((delta) => ({ ...delta, revision })))
       }
+      for (const commit of fishingCommits) commit()
     }
     if (timeChanged) {
       const elapsedGameSecs = (elapsedTicks * MINECRAFT_TICK_MS) / 1_000
       const weatherState = { weather: timeWeather.weather, remainingSecs: weatherClock.remainingSecs }
-      const transitionDraw = weatherExpires(weatherState, elapsedGameSecs)
-        ? nextRoll(weatherClock.seed)
-        : undefined
-      const durationDraw = transitionDraw === undefined ? undefined : nextRoll(transitionDraw.seed)
-      const nextWeather = advanceWeather(
-        weatherState,
-        elapsedGameSecs,
-        transitionDraw === undefined || durationDraw === undefined
-          ? LOWEST_WEATHER_ROLLS
-          : { transition: transitionDraw.roll, duration: durationDraw.roll },
-      )
-      timeWeather = {
+      // The weather state is load-validated or an advanceWeather result, and the elapsed time is whole game ticks.
+      const expires = Result.getOrThrow(weatherExpires(weatherState, elapsedGameSecs))
+      let rolls = LOWEST_WEATHER_ROLLS
+      let nextWeatherSeed = weatherClock.seed
+      if (expires) {
+        // The weather seed is a load-validated safe integer, DEFAULT_ROLL_SEED, or a nextRoll result.
+        const transitionDraw = Result.getOrThrow(nextRoll(weatherClock.seed))
+        const durationDraw = Result.getOrThrow(nextRoll(transitionDraw.seed))
+        rolls = { transition: transitionDraw.roll, duration: durationDraw.roll }
+        nextWeatherSeed = durationDraw.seed
+      }
+      // Same inputs as weatherExpires, plus rolls from nextRoll or LOWEST_WEATHER_ROLLS.
+      const nextWeather = Result.getOrThrow(advanceWeather(weatherState, elapsedGameSecs, rolls))
+      const nextTimeWeather = {
         timeOfDay: (timeWeather.timeOfDay + elapsedTicks) % MINECRAFT_DAY_TICKS,
         weather: nextWeather.weather,
       }
+      const nextThunderStrikeSequence = Math.floor(nextTimeWeather.timeOfDay / THUNDER_STRIKE_INTERVAL_TICKS)
+      const strikes = nextTimeWeather.weather === 'thunder' && nextThunderStrikeSequence !== thunderStrikeSequence
+      const target = [...players.values()][0]
+      const strikeAt = target === undefined
+        ? { x: 0, y: bounds.maxY, z: 0 }
+        : { x: target.at.x, y: target.at.y, z: target.at.z }
+      // A player position is stored in an addressable cell, and construction checked that the bounds are finite, so
+      // every axis of the strike is finite.
+      const strikePosition = strikes ? Result.getOrThrow(positionFromNumbers(strikeAt.x, strikeAt.y, strikeAt.z)) : undefined
+      if (strikes) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
+      }
+      timeWeather = nextTimeWeather
       weatherClock = {
         remainingSecs: nextWeather.remainingSecs,
-        seed: durationDraw?.seed ?? weatherClock.seed,
+        seed: nextWeatherSeed,
       }
-      const nextThunderStrikeSequence = Math.floor(timeWeather.timeOfDay / THUNDER_STRIKE_INTERVAL_TICKS)
-      if (
-        timeWeather.weather === 'thunder'
-        && nextThunderStrikeSequence !== thunderStrikeSequence
-      ) {
-        revision += 1
-        stateChanged = true
-        const target = [...players.values()][0]
-        const at = target === undefined
-          ? { x: 0, y: bounds.maxY, z: 0 }
-          : { x: target.at.x, y: target.at.y, z: target.at.z }
+      thunderStrikeSequence = nextThunderStrikeSequence
+      // Time is replicated state but does not invalidate gameplay commands, so it advances no revision.
+      stateChanged = true
+      timeDeltaPending = true
+      if (strikePosition !== undefined) {
         postPersistenceDeltas.push({
           _tag: 'LightningStrikeDelta',
           world: worldId,
           revision,
-          at,
+          at: strikeAt,
         })
         for (const entity of entities.values()) {
           if (
             entity._tag !== 'living'
             || entity.entityType !== CREEPER_KIND
             || entity.mobState?.charged === true
-            || !isWithinLightningStrikeRadius(entity.at, at)
           ) continue
-          entities.set(entity.entityId, {
-            ...entity,
-            mobState: { ...mobWireState(entity.mobState), charged: true },
-          })
+          // A stored entity position passed writePositions or load validation, so it lies in an addressable cell and
+          // each axis is finite.
+          const entityPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
+          if (!isWithinLightningStrikeRadius(entityPosition, strikePosition)) continue
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{
+            _tag: 'entity',
+            entity: { ...entity, mobState: { ...mobWireState(entity.mobState), charged: true } },
+          }]))
         }
       }
-      thunderStrikeSequence = nextThunderStrikeSequence
     }
     if (elapsedSecs > 0) {
+      const furnaceSteps: Array<Readonly<{ furnace: MutableFurnaceState; state: SimFurnaceState }>> = []
       for (const furnace of furnaces.values()) {
-        let current = furnaceSimulationState(furnace)
-        if (current === null) continue
-        let remainingSecs = elapsedSecs
-        let changed = false
-        while (remainingSecs > 0) {
-          const plan = planFurnaceAdvance(current, remainingSecs)
-          const applied = applyFurnaceAdvance(current, plan)
-          if (applied._tag !== 'Applied') break
-          changed ||= furnaceAdvanceChanged(plan)
-          current = applied.state
-          remainingSecs = plan.deferredSecs
+        const current = furnaceSimulationState(furnace)
+        if (Result.isFailure(current)) {
+          return failStep({ _tag: 'FurnaceAdvanceFailure', failure: current.failure })
         }
-        if (!changed) continue
-        applyFurnaceSimulationState(furnace, current)
+        const advanced = advanceFurnace(current.success, elapsedSecs)
+        if (Result.isFailure(advanced)) {
+          return failStep({ _tag: 'FurnaceAdvanceFailure', failure: advanced.failure })
+        }
+        if (!furnaceSimulationStateChanged(current.success, advanced.success.state)) continue
+        furnaceSteps.push({ furnace, state: advanced.success.state })
+      }
+      if (furnaceSteps.length > 0) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
+      }
+      for (const { furnace, state } of furnaceSteps) {
+        applyFurnaceSimulationState(furnace, state)
         changedFurnaces.push(furnace)
       }
-      if (timeChanged || changedFurnaces.length > 0) {
-        // Time is replicated state but does not invalidate gameplay commands.
-        if (changedFurnaces.length > 0) revision += 1
+      pushTimeDelta()
+      if (changedFurnaces.length > 0) {
         stateChanged = true
-        if (timeChanged) postPersistenceDeltas.push({ _tag: 'WorldTimeWeatherDelta', world: worldId, revision, state: { ...timeWeather } })
         for (const furnace of changedFurnaces) {
-          broadcast({ _tag: 'FurnaceDelta', world: worldId, revision, state: furnaceSnapshot(furnace) })
+          const delta: NetworkMessage = { _tag: 'FurnaceDelta', world: worldId, revision, state: furnaceSnapshot(furnace) }
+          postPersistenceSends.push(() => broadcast(delta))
         }
       }
     }
 
     if (elapsedSecs > 0) {
       const changedBrewingStands: Array<Readonly<{ at: BlockPos; state: BrewingStandState }>> = []
-      const changedEffects = new Set<PlayerId>()
+      const changedEffects = new Map<PlayerId, StatusEffectState>()
       const changedVitals = new Set<PlayerId>()
+      const advancedEffects: Array<Readonly<{ player: PlayerId; effects: StatusEffectState; advanced: StatusEffectTick }>> = []
 
+      for (const [player, effects] of statusEffects) {
+        // Status-effect state is load-validated or an mx-gameplay result, and elapsedSecs passed the tick validation.
+        advancedEffects.push({ player, effects, advanced: Result.getOrThrow(tickStatusEffects(effects, DeltaTimeSecs(elapsedSecs))) })
+      }
+
+      const brewingCommits: Array<() => void> = []
       for (const [key, stand] of brewingStands) {
         const next = tickBrewingStand(stand.state, DeltaTimeSecs(elapsedSecs))
         if (JSON.stringify(next) === JSON.stringify(stand.state)) continue
-        brewingStands.set(key, { at: stand.at, state: next })
+        brewingCommits.push(() => brewingStands.set(key, { at: stand.at, state: next }))
         changedBrewingStands.push({ at: stand.at, state: next })
       }
 
-      for (const [player, effects] of statusEffects) {
-        const advanced = tickStatusEffects(effects, DeltaTimeSecs(elapsedSecs))
+      for (const { player, effects, advanced } of advancedEffects) {
         if (JSON.stringify(advanced.state) !== JSON.stringify(effects)) {
-          statusEffects.set(player, advanced.state)
-          changedEffects.add(player)
+          brewingCommits.push(() => statusEffects.set(player, advanced.state))
+          changedEffects.set(player, advanced.state)
         }
 
         const playerVitals = vitals.get(player)
@@ -3889,23 +5331,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           ),
         )
         if (nextHealth === playerVitals.health) continue
-        playerVitals.health = nextHealth
-        const hungerActor = hungerActors.get(player)
-        if (hungerActor !== undefined) hungerActors.set(player, {
-          ...hungerActor,
-          state: { ...hungerActor.state, health: playerVitals.health },
-        })
+        brewingCommits.push(() => { playerVitals.health = nextHealth })
         changedVitals.add(player)
       }
 
       if (changedBrewingStands.length > 0 || changedEffects.size > 0 || changedVitals.size > 0) {
-        revision += 1
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
+        for (const commit of brewingCommits) commit()
         stateChanged = true
         for (const stand of changedBrewingStands) {
-          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: stand.at, state: copyBrewingStandState(stand.state) })
+          const delta: BrewingWireMessage = { _tag: 'BrewingStandDelta', world: worldId, revision, at: stand.at, state: copyBrewingStandState(stand.state) }
+          postPersistenceSends.push(() => broadcastBrewing(delta))
         }
-        for (const player of changedEffects) {
-          broadcastBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision, player, state: copyStatusEffectState(statusEffects.get(player) as StatusEffectState) })
+        for (const [player, effects] of changedEffects) {
+          const delta: BrewingWireMessage = { _tag: 'PlayerStatusEffectsDelta', world: worldId, revision, player, state: copyStatusEffectState(effects) }
+          postPersistenceSends.push(() => broadcastBrewing(delta))
         }
         for (const player of changedVitals) {
           const presence = players.get(player)
@@ -3921,38 +5362,49 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
 
     if (elapsedSecs > 0) {
-      simulationElapsedSecs += elapsedSecs
+      const nextSimulationElapsedSecs = simulationElapsedSecs + elapsedSecs
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
+      const inactivePlayers: PlayerId[] = []
+      const contactSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; step: EnvironmentalContactDamageStep }>> = []
 
       for (const [player, presence] of players) {
         const playerVitals = vitals.get(player)
         if (playerVitals === undefined || playerVitals.health <= 0) {
-          environmentalContactDamageStates.delete(player)
+          inactivePlayers.push(player)
           continue
         }
-        const resolution = resolveEnvironmentalContactDamage(
+        const contactsResult = environmentalContactsAt(presence.at)
+        if (Result.isFailure(contactsResult)) return failStep(contactsResult.failure)
+        // The state is the initial value or a previous result, the contacts come from kernel contactDamage for
+        // lava and cactus, and the simulation time is a sum of validated positive elapsed times.
+        const step = Result.getOrThrow(resolveEnvironmentalContactDamage(
           environmentalContactDamageStates.get(player) ?? INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-          environmentalContactsAt(presence.at),
-          simulationElapsedSecs,
-        )
-        environmentalContactDamageStates.set(player, resolution.state)
-        const damage = resolution.damages.reduce((total, entry) => total + entry.amount, 0)
+          contactsResult.success,
+          nextSimulationElapsedSecs,
+        ))
+        contactSteps.push({ player, playerVitals, step })
+      }
+
+      const contactDamage = (step: EnvironmentalContactDamageStep): number => step.damages.reduce((total, entry) => total + entry.amount, 0)
+      if (contactSteps.some(({ step }) => contactDamage(step) > 0)) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
+      }
+      for (const player of inactivePlayers) environmentalContactDamageStates.delete(player)
+      for (const { player, playerVitals, step } of contactSteps) {
+        environmentalContactDamageStates.set(player, step.state)
+        const damage = contactDamage(step)
         if (damage <= 0) continue
 
         const wasAlive = playerVitals.health > 0
         playerVitals.health = Math.max(0, playerVitals.health - damage)
-        const hungerActor = hungerActors.get(player)
-        if (hungerActor !== undefined) hungerActors.set(player, {
-          ...hungerActor,
-          state: { ...hungerActor.state, health: playerVitals.health },
-        })
         damagedPlayers.add(player)
         if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
       }
 
+      simulationElapsedSecs = nextSimulationElapsedSecs
       if (damagedPlayers.size > 0) {
-        revision += 1
         stateChanged = true
         postPersistenceDeltas.push(...applyPlayerDeaths([...deadPlayers], revision))
         for (const player of damagedPlayers) {
@@ -3969,105 +5421,144 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
 
     if (elapsedTicks > 0) {
-      if (applyPendingFallingBlocks()) {
-        revision += 1
+      const fallingBlocksResult = planPendingFallingBlocks()
+      if (Result.isFailure(fallingBlocksResult)) return failStep(fallingBlocksResult.failure)
+      if (fallingBlocksResult.success.moved) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
         stateChanged = true
         worldSnapshotRequired = true
       }
+      fallingBlocksResult.success.commit()
 
       const agedEntities: AuthoritativeDelta[] = []
+      const agingCommits: Array<() => void> = []
       for (const entity of entities.values()) {
         if (entity._tag !== 'item-drop') continue
         const ageTicks = (entity.ageTicks ?? 0) + elapsedTicks
         if (ageTicks >= ITEM_DROP_LIFESPAN_TICKS) {
-          entities.delete(entity.entityId)
-          droppedItemMetadata.delete(entity.entityId)
+          agingCommits.push(() => {
+            entities.delete(entity.entityId)
+            droppedItemMetadata.delete(entity.entityId)
+          })
           agedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
           continue
         }
         if (ageTicks === entity.ageTicks) continue
         const updated = { ...entity, ageTicks }
-        entities.set(entity.entityId, updated)
+        // The update keeps the stored entity position, which writePositions or load validation admitted.
+        agingCommits.push(() => Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }])))
         agedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
       }
+      // Age updates are replicated visual state; only a despawn invalidates commands.
+      if (agedEntities.some((delta) => delta._tag === 'EntityDespawnDelta')) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
+      }
+      for (const commit of agingCommits) commit()
       if (agedEntities.length > 0) {
-        // Age updates are replicated visual state; only a despawn invalidates commands.
-        if (agedEntities.some((delta) => delta._tag === 'EntityDespawnDelta')) revision += 1
         stateChanged = true
         postPersistenceDeltas.push(...agedEntities.map((delta) => ({ ...delta, revision })))
       }
     }
 
-    if (elapsedSecs > 0) {
+    // Recoveries, arrows, primed TNT, and living mobs change on every step and later ones read earlier ones' effects,
+    // so this step checks its single revision advance before it changes anything, and undoes its changes when a
+    // block read or explosion plan fails part-way.
+    const entityStepRuns = elapsedSecs > 0 && (eyeOfEnderRecoveries.size > 0
+      || [...entities.values()].some((entity) => entity._tag === 'arrow' || entity._tag === 'primed-tnt' || entity._tag === 'living'))
+    if (entityStepRuns) {
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return failStep(reserved.failure)
+    }
+    if (entityStepRuns) {
+      const stepUndo = beginStepUndo()
+      const failEntityStep = (failure: MultiplayerServerCoreFailure): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
+        stepUndo.undo()
+        return failStep(failure)
+      }
       const movedEntities: AuthoritativeDelta[] = []
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
       let worldChanged = false
+      const movingMobs: MovingMob[] = []
       for (const [key, recovery] of eyeOfEnderRecoveries) {
         const remainingSecs = recovery.remainingSecs - elapsedSecs
         if (remainingSecs > 0) {
-          eyeOfEnderRecoveries.set(key, { ...recovery, remainingSecs })
+          // The update keeps the stored recovery position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'eye-of-ender-recovery', recovery: { ...recovery, remainingSecs } }]))
           worldChanged = true
           continue
         }
-        eyeOfEnderRecoveries.delete(key)
         const drop: AuthoritativeEntityState = {
           _tag: 'item-drop',
           entityId: recovery.entityId,
           at: recovery.at,
           stack: { item: 'eye_of_ender', count: 1 },
         }
-        entities.set(drop.entityId, drop)
+        // The drop copies the stored recovery position, which writePositions or load validation admitted.
+        Result.getOrThrow(writePositions([{ _tag: 'entity', entity: drop }]))
+        eyeOfEnderRecoveries.delete(key)
         movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
         worldChanged = true
       }
       const applyExplosion = (
         center: Readonly<{ x: number; y: number; z: number }>,
         explosion: Explosion,
-      ): void => {
-        // Explosion resolution always needs a snapshot, including an empty crater.
-        worldChanged = true
+      ): Result.Result<void, MultiplayerServerCoreFailure> => {
+        // The centre is a stored entity position, which writePositions or load validation kept in an addressable
+        // cell, so each axis is finite.
+        const centerPosition = Result.getOrThrow(positionFromNumbers(center.x, center.y, center.z))
+        let blockReadFailure: MultiplayerServerCoreFailure | undefined
         const blockReader = (position: BlockPos) => {
           if (!isInBounds(position)) return undefined
           const block = blockAt(position)
-          return block === null ? { resistance: 0, destructible: false } : {
+          if (Result.isFailure(block)) {
+            blockReadFailure ??= block.failure
+            return undefined
+          }
+          return block.success === null ? { resistance: 0, destructible: false } : {
             resistance: 1,
-            destructible: block !== 'bedrock',
+            destructible: block.success !== 'bedrock',
           }
         }
-        const plan = planExplosion({
-          center,
+        const planResult = planExplosion({
+          center: centerPosition,
           radius: explosion.power,
           seed: revision,
           blocks: blockReader,
           entities: [],
         })
-        for (const position of plan.destroyedBlocks) {
-          blocks.set(positionKey(position), { at: position, block: null })
-          disturbFallingBlocks([position])
-          worldChanged = true
+        if (blockReadFailure !== undefined) return Result.fail(blockReadFailure)
+        if (Result.isFailure(planResult)) {
+          return Result.fail({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
         }
+        const plan = planResult.success
+        const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
         for (const [player, presence] of players) {
           if (presence.world !== worldId) continue
+          const playerVitals = vitals.get(player)
+          if (playerVitals === undefined) continue
           const distance = Math.hypot(
             presence.at.x - center.x,
             presence.at.y + 0.9 - center.y,
             presence.at.z - center.z,
           )
-          const damage = explosionDamageAt(explosion, distance)
-          if (damage.amount <= 0) continue
-          const playerVitals = vitals.get(player)
-          if (playerVitals === undefined) continue
+          // The power is a TNT, creeper, or wither constant. The centre and the player are stored positions, which
+          // writePositions or load validation kept in addressable cells, so the distance is finite.
+          const damage = Result.getOrThrow(explosionDamageAt(explosion, distance))
+          if (damage.amount > 0) damageSteps.push({ player, playerVitals, amount: damage.amount })
+        }
+        // Explosion resolution always needs a snapshot, including an empty crater.
+        worldChanged = true
+        for (const position of plan.destroyedBlocks) stepUndo.destroyBlock(position)
+        for (const { player, playerVitals, amount } of damageSteps) {
           const wasAlive = playerVitals.health > 0
-          playerVitals.health = Math.max(0, playerVitals.health - damage.amount)
-          const hungerActor = hungerActors.get(player)
-          if (hungerActor !== undefined) hungerActors.set(player, {
-            ...hungerActor,
-            state: { ...hungerActor.state, health: playerVitals.health },
-          })
+          playerVitals.health = Math.max(0, playerVitals.health - amount)
           damagedPlayers.add(player)
           if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
         }
+        return Result.succeed(undefined)
       }
       for (const entity of entities.values()) {
         if (entity._tag === 'arrow') {
@@ -4078,45 +5569,92 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             z: entity.at.z + entity.velocity.z * elapsedSecs,
           }
           const velocity = { ...entity.velocity, y: entity.velocity.y - ARROW_GRAVITY * elapsedSecs }
+          // The flight is written before the raycast, which then only reads cells between two admitted positions.
+          // A hit below despawns the arrow, so the early write never reaches a client.
+          const updated = { ...entity, at, velocity, ageTicks }
+          const flown = writePositions([{ _tag: 'entity', entity: updated }])
+          if (Result.isFailure(flown)) {
+            // Keeping the arrow would retry the same flight every tick, so it is despawned.
+            refuse(flown.failure, entity._tag, 'removed')
+            entities.delete(entity.entityId)
+            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+            continue
+          }
           const travel = {
             x: at.x - entity.at.x,
             y: at.y - entity.at.y,
             z: at.z - entity.at.z,
           }
-          const blockImpact = raycastArrowBlock(entity.at, at, (x, y, z) => {
+          // Both ends passed writePositions or load validation, so they lie in addressable cells and are finite.
+          const fromPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
+          const toPosition = Result.getOrThrow(positionFromNumbers(at.x, at.y, at.z))
+          let blockReadFailure: MultiplayerServerCoreFailure | undefined
+          const blockImpactResult = raycastArrowBlock(fromPosition, toPosition, (x, y, z) => {
             const position: BlockPos = { x, y, z }
             if (!isInBounds(position)) return true
             const block = blockAt(position)
-            return block !== null && options.passableBlocks?.has(block) !== true
+            if (Result.isFailure(block)) {
+              blockReadFailure ??= block.failure
+              return true
+            }
+            return block.success !== null && options.passableBlocks?.has(block.success) !== true
           })
+          if (blockReadFailure !== undefined) return failEntityStep(blockReadFailure)
+          if (Result.isFailure(blockImpactResult)) {
+            return failEntityStep({ _tag: 'ArrowRaycastFailure', failure: blockImpactResult.failure })
+          }
+          const blockImpact = blockImpactResult.success
           const travelDistance = Math.hypot(travel.x, travel.y, travel.z)
           const blockProjection = Option.isNone(blockImpact) ? undefined : blockImpact.value.distance / travelDistance
           const blockWasHit = Option.isSome(blockImpact)
-          const livingHit = [...entities.values()]
-            .filter((candidate): candidate is Extract<AuthoritativeEntityState, { readonly _tag: 'living' }> => candidate._tag === 'living')
-            .map((candidate) => ({
-              candidate,
-              projection: arrowHitProjection(entity.at, at, { ...candidate.at, y: candidate.at.y + 0.9 }),
-            }))
-            .filter((candidate): candidate is { candidate: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>; projection: number } => candidate.projection !== undefined)
-            .sort((left, right) => left.projection - right.projection)[0]
-          const playerHit = [...players.entries()]
-            .filter(([player, presence]) =>
-              player !== entity.owner
-              && presence.world === worldId
-              && (vitals.get(player)?.health ?? 0) > 0,
-            )
-            .map(([player, presence]) => ({
-              player,
-              projection: arrowHitProjection(entity.at, at, { ...presence.at, y: presence.at.y + 0.9 }),
-            }))
-            .filter((candidate): candidate is { player: PlayerId; projection: number } => candidate.projection !== undefined)
-            .sort((left, right) => left.projection - right.projection)[0]
+          const livingHits: Array<Readonly<{
+            candidate: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
+            projection: number
+          }>> = []
+          for (const candidate of entities.values()) {
+            if (candidate._tag !== 'living') continue
+            // A stored entity position is finite, and adding 0.9 to it stays finite.
+            const targetPosition = Result.getOrThrow(positionFromNumbers(candidate.at.x, candidate.at.y + 0.9, candidate.at.z))
+            const projection = arrowHitProjection(fromPosition, toPosition, targetPosition)
+            if (projection !== undefined) livingHits.push({ candidate, projection })
+          }
+          livingHits.sort((left, right) => left.projection - right.projection)
+          const livingHit = livingHits[0]
+          const playerHits: Array<Readonly<{ player: PlayerId; projection: number }>> = []
+          for (const [player, presence] of players) {
+            if (player === entity.owner || presence.world !== worldId || (vitals.get(player)?.health ?? 0) <= 0) continue
+            // A stored player position is finite, and adding 0.9 to it stays finite.
+            const targetPosition = Result.getOrThrow(positionFromNumbers(presence.at.x, presence.at.y + 0.9, presence.at.z))
+            const projection = arrowHitProjection(fromPosition, toPosition, targetPosition)
+            if (projection !== undefined) playerHits.push({ player, projection })
+          }
+          playerHits.sort((left, right) => left.projection - right.projection)
+          const playerHit = playerHits[0]
           const livingWasHit = livingHit !== undefined
             && (blockProjection === undefined || livingHit.projection < blockProjection)
           const playerWasHit = playerHit !== undefined
             && (blockProjection === undefined || playerHit.projection < blockProjection)
             && (livingHit === undefined || playerHit.projection < livingHit.projection)
+          let livingHitExperienceReward = 0
+          let livingHitDrops: ReadonlyArray<AuthoritativeEntityState> = []
+          if (!playerWasHit && livingWasHit && livingHit !== undefined && livingHit.candidate.health <= entity.damage) {
+            const kind = supportedMobKind(livingHit.candidate.entityType)
+            if (kind !== undefined) {
+              livingHitExperienceReward = mobXpReward(
+                { _tag: 'Slain', lootingLevel: NO_LOOTING_LEVEL },
+                mobExperienceReward(kind),
+              )
+              livingHitDrops = mobLoot(
+                kind,
+                (index) => `${String(options.seed)}:${String(entity.owner)}:${String(entity.entityId)}:${String(livingHit.candidate.entityId)}:${String(index)}`,
+              ).map((stack, index): AuthoritativeEntityState => ({
+                _tag: 'item-drop',
+                entityId: `${livingHit.candidate.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
+                at: livingHit.candidate.at,
+                stack,
+              }))
+            }
+          }
           if (ageTicks >= ARROW_LIFESPAN_TICKS || blockWasHit || livingWasHit || playerWasHit) {
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
@@ -4127,18 +5665,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
                 at: blockImpact.value.point,
                 stack: { item: 'arrow', count: 1 },
               }
-              entities.set(drop.entityId, drop)
-              movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
+              const dropped = writePositions([{ _tag: 'entity', entity: drop }])
+              if (Result.isFailure(dropped)) refuse(dropped.failure, drop._tag, 'skipped')
+              else movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
             }
             if (playerWasHit) {
               const playerVitals = vitals.get(playerHit.player)
               if (playerVitals !== undefined) {
                 const wasAlive = playerVitals.health > 0
                 playerVitals.health = Math.max(0, playerVitals.health - entity.damage)
-                const hungerActor = hungerActors.get(playerHit.player)
-                if (hungerActor !== undefined) {
-                  hungerActors.set(playerHit.player, { ...hungerActor, state: { ...hungerActor.state, health: playerVitals.health } })
-                }
                 damagedPlayers.add(playerHit.player)
                 if (wasAlive && playerVitals.health <= 0) deadPlayers.add(playerHit.player)
               }
@@ -4147,56 +5682,46 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               const health = hit.health - entity.damage
               if (health > 0) {
                 const updated = { ...hit, health }
-                entities.set(updated.entityId, updated)
+                // The update keeps the stored entity position, which writePositions or load validation admitted.
+                Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
                 movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
               } else {
                 entities.delete(hit.entityId)
                 movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: hit.entityId })
-                const kind = supportedMobKind(hit.entityType)
-                const experienceReward = kind === undefined ? 0 : mobXpReward({ _tag: 'Slain', lootingLevel: 0 }, mobExperienceReward(kind))
                 if (entity.owner !== null) {
                   const ownerVitals = vitals.get(entity.owner)
                   const owner = players.get(entity.owner)
-                  if (experienceReward > 0 && ownerVitals !== undefined) {
-                    ownerVitals.experience += experienceReward
+                  if (livingHitExperienceReward > 0 && ownerVitals !== undefined) {
+                    ownerVitals.experience += livingHitExperienceReward
                     if (owner !== undefined) movedEntities.push({
                       _tag: 'PlayerVitalsDelta', world: owner.world, revision: 0, player: entity.owner, state: vitalsSnapshot(ownerVitals),
                     })
                   }
                 }
-                const loot = kind === undefined ? [] : rollDropsOfKind(kind, { _tag: 'Slain', lootingLevel: 0 }, Array.from(
-                  { length: dropRollsNeeded(kind) },
-                  (_, index) => deterministicRoll(`${String(options.seed)}:${String(entity.owner)}:${String(entity.entityId)}:${String(hit.entityId)}:${String(index)}`),
-                ))
-                for (const [index, stack] of loot.entries()) {
-                  const drop: AuthoritativeEntityState = {
-                    _tag: 'item-drop',
-                    entityId: `${hit.entityId}:drop:${String(revision + 1)}:${String(index)}` as AuthoritativeEntityState['entityId'],
-                    at: hit.at,
-                    stack,
-                  }
-                  entities.set(drop.entityId, drop)
+                // Each drop copies the slain entity's stored position, which writePositions or load validation admitted.
+                Result.getOrThrow(writePositions(livingHitDrops.map((drop) => ({ _tag: 'entity', entity: drop }))))
+                for (const drop of livingHitDrops) {
                   movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
                 }
               }
             }
             continue
           }
-          const updated = { ...entity, at, velocity, ageTicks }
-          entities.set(updated.entityId, updated)
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
           continue
         }
         if (entity._tag === 'primed-tnt') {
           const burnedSecs = entity.burnedSecs + elapsedSecs
           if (burnedSecs >= PRIMED_TNT_FUSE_SECS) {
+            const explosionResult = applyExplosion(entity.at, { source: 'tnt', power: TNT_EXPLOSION_POWER })
+            if (Result.isFailure(explosionResult)) return failEntityStep(explosionResult.failure)
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
-            applyExplosion(entity.at, { source: 'tnt', power: TNT_EXPLOSION_POWER })
             continue
           }
           const updated = { ...entity, burnedSecs }
-          entities.set(updated.entityId, updated)
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
           continue
         }
@@ -4214,7 +5739,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           ? { ...initialMobState, ageTicks: (initialMobState.ageTicks ?? 0) + elapsedTicks }
           : initialMobState
         if (isAuthoritativeHostileMob(entity.entityType)) {
-          const verdict = despawnVerdict({
+          // mobWireState validated every field and the roll is in [0, 1). The distance is finite because every
+          // stored entity and player position passed writePositions or load validation, so each lies in an
+          // addressable cell.
+          const verdict = Result.getOrThrow(despawnVerdict({
             distanceToPlayerBlocks: targetEntry?.[2],
             persistent: hostileMobState.persistent === true,
             ...(hostileMobState.named === undefined ? {} : { named: hostileMobState.named }),
@@ -4222,7 +5750,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             ...(hostileMobState.ageTicks === undefined ? {} : { ageTicks: hostileMobState.ageTicks }),
             randomRoll: deterministicRoll(`${String(options.seed)}:${String(revision)}:${String(entity.entityId)}:despawn:${String(hostileMobState.ageTicks)}`),
             difficulty: options.difficulty ?? 'normal',
-          })
+          }))
           if (verdict._tag === 'Despawn') {
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
@@ -4239,14 +5767,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             creeperDeltaTime(elapsedSecs),
           )
           if (step.explosion !== undefined) {
+            const explosionResult = applyExplosion(entity.at, step.explosion)
+            if (Result.isFailure(explosionResult)) return failEntityStep(explosionResult.failure)
             entities.delete(entity.entityId)
             movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
-            applyExplosion(entity.at, step.explosion)
             continue
           }
           const mobState = creeperWireState(step.fuse, hostileMobState)
           const updated = { ...entity, mobState }
-          entities.set(entity.entityId, updated)
+          // The update keeps the stored entity position, which writePositions or load validation admitted.
+          Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
           continue
         }
@@ -4271,8 +5801,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               // and `rolls` internally, and a cell array built from different positions
               // never matches what it looks up, so every candidate reads as unloaded and
               // the teleport is always refused.
+              let blockReadFailure: MultiplayerServerCoreFailure | undefined
+              // A candidate outside addressable cells has no block to read, so it is left out like one out of bounds.
               const cells: EndermanTeleportCell[] = endermanTeleportCandidateCells(entity.at, anchor, rolls)
-                .filter((position) => isInBounds({
+                .filter((position) => isInAddressableCell(position) && isInBounds({
                   x: Math.floor(position.x),
                   y: Math.floor(position.y),
                   z: Math.floor(position.z),
@@ -4284,58 +5816,96 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
                     z: Math.floor(position.z),
                   }
                   const block = blockAt(blockPosition)
+                  if (Result.isFailure(block)) {
+                    blockReadFailure ??= block.failure
+                    return { position, block: 'air', solid: true }
+                  }
                   return {
                     position,
-                    block: block ?? 'air',
-                    solid: block !== null && options.passableBlocks?.has(block) !== true,
+                    block: block.success ?? 'air',
+                    solid: block.success !== null && options.passableBlocks?.has(block.success) !== true,
                   }
                 })
+              if (blockReadFailure !== undefined) return failEntityStep(blockReadFailure)
               at = resolveSafeEndermanTeleport(entity.at, anchor, rolls, cells)
             }
           }
           const updated = { ...entity, at, mobState: { ...mobState, provoked: false } }
-          entities.set(entity.entityId, updated)
+          const teleported = writePositions([{ _tag: 'entity', entity: updated }])
+          if (Result.isFailure(teleported)) {
+            refuse(teleported.failure, entity.entityType, 'kept')
+            continue
+          }
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
           continue
         }
         const passiveKind = supportedPassiveMobKind(entity.entityType)
         const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
-        const kind = passiveKind ?? hostileKind
-        if (kind === undefined) continue
-        const target = hostileKind === undefined ? undefined : targetEntry?.[1].at
-        const state = ecosystemMobStateForSimulation(entity.mobState) ?? initialEcosystemMobState()
-        const step = stepEcosystemMob(kind, state, entity.at, target, elapsedSecs)
+        // Only supported kinds are repaired below; load and spawn validation skip the others, so they are left as they are.
+        if (passiveKind === undefined && hostileKind === undefined) continue
+        // validateEcosystemMobStates checked loaded and spawned mobs of supported kinds, and the tick only writes
+        // mx-gameplay results back.
+        const state = Result.getOrThrow(ecosystemMobStateForSimulation(entity.mobState)) ?? initialEcosystemMobState()
+        // The mob and its target player are stored positions, which writePositions or load validation kept in
+        // addressable cells, so each axis is finite.
+        const selfPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
+        const movement = mobMovements.get(entity.entityId)
+        const ecosystem = movement === undefined ? state : { ...state, movement }
+        // Every ecosystem mob, passive ones included, gets its nearest living player, as mx-gameplay's entities stage
+        // hands each mob the player; mx-gameplay's rules decide whether that player is close enough to flee or chase.
+        const target = targetEntry === undefined
+          ? undefined
+          : { player: targetEntry[0], at: Result.getOrThrow(positionFromNumbers(targetEntry[1].at.x, targetEntry[1].at.y, targetEntry[1].at.z)) }
+        if (passiveKind !== undefined) {
+          movingMobs.push({ entity, kind: passiveKind, mobState: initialMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
+          continue
+        }
+        if (hostileKind === undefined) continue
+        movingMobs.push({ entity, kind: hostileKind, mobState: hostileMobState, ecosystem, feet: selfPosition, target, attackDamages: [] })
+      }
+      // Ecosystem mobs move as one roster after the loop: mx-gameplay plans the whole roster once per game tick.
+      const plannedMobs = planMobs(movingMobs, elapsedTicks)
+      if (Result.isFailure(plannedMobs)) return failEntityStep(plannedMobs.failure)
+      for (const { entity, mobState, ecosystem, feet, target, attackDamages } of plannedMobs.success) {
         const at = {
-          ...step.feetPosition,
-          x: Math.min(bounds.maxX, Math.max(bounds.minX, step.feetPosition.x)),
-          z: Math.min(bounds.maxZ, Math.max(bounds.minZ, step.feetPosition.z)),
+          ...feet,
+          x: Math.min(bounds.maxX, Math.max(bounds.minX, feet.x)),
+          z: Math.min(bounds.maxZ, Math.max(bounds.minZ, feet.z)),
         }
-        const mobState = {
-          ...(hostileKind === undefined ? initialMobState : hostileMobState),
-          attackCooldownSecs: step.state.attackCooldownSecs,
-          motionPhase: step.state.motionPhase,
-          provoked: step.state.provoked,
+        const updated = {
+          ...entity,
+          at,
+          mobState: {
+            ...mobState,
+            attackCooldownSecs: ecosystem.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
+            motionPhase: ecosystem.motionPhase,
+            provoked: ecosystem.provoked,
+          },
         }
-        const updated = { ...entity, at, mobState }
-        entities.set(entity.entityId, updated)
+        const walked = writePositions([{ _tag: 'entity', entity: updated }])
+        if (Result.isFailure(walked)) {
+          // A refused mob keeps its position and movement, and none of its attacks from this step apply.
+          refuse(walked.failure, entity.entityType, 'kept')
+          continue
+        }
+        if (ecosystem.movement === undefined) mobMovements.delete(entity.entityId)
+        else mobMovements.set(entity.entityId, ecosystem.movement)
         movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
-        if (step.attack !== undefined && targetEntry !== undefined) {
-          const playerVitals = vitals.get(targetEntry[0])
-          if (playerVitals !== undefined) {
+        const playerVitals = target === undefined ? undefined : vitals.get(target.player)
+        if (target !== undefined && playerVitals !== undefined) {
+          for (const damage of attackDamages) {
             const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - step.attack.damage)
-            const hungerActor = hungerActors.get(targetEntry[0])
-            if (hungerActor !== undefined) hungerActors.set(targetEntry[0], {
-              ...hungerActor,
-              state: { ...hungerActor.state, health: playerVitals.health },
-            })
-            damagedPlayers.add(targetEntry[0])
-            if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
+            playerVitals.health = Math.max(0, playerVitals.health - damage)
+            damagedPlayers.add(target.player)
+            if (wasAlive && playerVitals.health <= 0) deadPlayers.add(target.player)
           }
         }
       }
+      // A despawned or slain mob leaves no movement behind.
+      for (const id of mobMovements.keys()) if (!entities.has(id)) mobMovements.delete(id)
       if (movedEntities.length > 0 || damagedPlayers.size > 0 || worldChanged) {
-        revision += 1
+        // revisionAfter(1) succeeded before this step changed anything, and nothing in it advances the revision.
+        Result.getOrThrow(advanceRevision())
         stateChanged = true
         postPersistenceDeltas.push(...movedEntities.map((delta) => ({ ...delta, revision })))
         postPersistenceDeltas.push(...applyPlayerDeaths([...deadPlayers], revision))
@@ -4353,20 +5923,30 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
     }
 
-    if (hungerActors.size > 0) {
-      const authority = createHungerAuthority({ world: worldId, revision, difficulty: options.difficulty ?? 'normal', actors: [...hungerActors.values()], tickRemainderMs: hungerTickRemainderMs })
-      const events = authority.tick(elapsedMs)
-      hungerTickRemainderMs = authority.snapshot().tickRemainderMs
-      hungerActors.clear()
-      for (const actor of authority.snapshot().actors) hungerActors.set(actor.player, actor)
-      const { changed, deaths } = applyHungerEvents(events)
+    if (hungerPlayers.size > 0) {
+      const elapsed = DeltaTimeSecs(elapsedSecs)
+      const steps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; before: SurvivalHungerState; after: SurvivalHungerState; died: boolean }>> = []
+      for (const player of hungerPlayers) {
+        // hungerPlayers only holds players whose vitals ensurePlayerState created; detachPlayer removes both.
+        const playerVitals = Option.getOrThrow(Option.fromNullishOr(vitals.get(player)))
+        const before = readHunger(player, playerVitals)
+        if (Result.isFailure(before)) return failStep(before.failure)
+        const ticked = options.parts.survivalHunger.tick(before.success, elapsed)
+        if (Result.isFailure(ticked)) return failStep(hungerFailure(ticked.failure))
+        steps.push({ player, playerVitals, before: before.success, after: ticked.success.state, died: ticked.success.died })
+      }
+      const changed = steps.filter((step) => hungerChanged(step.before, step.after))
       if (changed.length > 0) {
-        revision += 1
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
+      }
+      for (const step of steps) commitHunger(step.player, step.playerVitals, step.after)
+      if (changed.length > 0) {
         stateChanged = true
-        postPersistenceDeltas.push(...applyPlayerDeaths(deaths, revision))
-        for (const player of changed) {
-          const presence = players.get(player)
-          if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) })
+        postPersistenceDeltas.push(...applyPlayerDeaths(steps.filter((step) => step.died).map((step) => step.player), revision))
+        for (const step of changed) {
+          const presence = players.get(step.player)
+          if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player: step.player, state: vitalsSnapshot(step.playerVitals) })
         }
       }
     }
@@ -4381,6 +5961,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
       let worldChanged = false
+      // Melee and explosions advance the revision once for this whole step, so that advance is checked before the
+      // first of them is applied. A later explosion's block read can still fail after melee or an earlier explosion
+      // applied, so a failure undoes the step's changes.
+      let revisionReserved = false
+      const stepUndo = beginStepUndo()
+      const failWitherStep = (failure: MultiplayerServerCoreFailure): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
+        stepUndo.undo()
+        return failStep(failure)
+      }
       for (const dimension of dimensions) {
         const dimensionWithers = advanced.withers.filter((wither) => wither.dimension === dimension)
         const targetEntry = [...players.entries()]
@@ -4393,68 +5982,127 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           .filter((entry) => entry[2] <= WITHER_TARGET_RANGE)
           .sort((left, right) => left[2] - right[2])[0]
         const target = targetEntry?.[1].at ?? dimensionWithers[0]?.state.feetPosition ?? { x: 0, y: 64, z: 0 }
-        const result = advanceWitherRuntime(
-          advanced,
-          dimension,
-          target,
-          elapsedMs / 1_000,
-          (_skull, position) => blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) }) !== null,
-        )
-        advanced = result.state
-        if (result.meleeDamage > 0 && targetEntry !== undefined) {
+        // mc-sim returns one dimension's melee, launches, and explosions summed over its withers, so a wither whose
+        // step leaves addressable cells is left out and the dimension is stepped again. The refused wither keeps its
+        // state, and none of its step's movement, regeneration, charge, launch, or melee applies.
+        const refusedWitherIds = new Set<string>()
+        const advanceDimension = (): Result.Result<WitherRuntimeAdvance, MultiplayerServerCoreFailure> => {
+          let skullBlockReadFailure: MultiplayerServerCoreFailure | undefined
+          const stepped = advanceWitherRuntime(
+            { ...advanced, withers: advanced.withers.filter((wither) => !refusedWitherIds.has(wither.id)) },
+            dimension,
+            target,
+            elapsedMs / 1_000,
+            (_skull, position) => {
+              // A cell outside addressable cells holds no block; the skull flies on and is refused below.
+              if (!isInAddressableCell(position)) return false
+              const block = blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) })
+              if (Result.isFailure(block)) {
+                skullBlockReadFailure ??= block.failure
+                return false
+              }
+              return block.success !== null
+            },
+          )
+          if (skullBlockReadFailure !== undefined) return Result.fail(skullBlockReadFailure)
+          if (Result.isFailure(stepped)) return Result.fail({ _tag: 'WitherRuntimeFailure', operation: 'advance', failure: stepped.failure })
+          return Result.succeed(stepped.success)
+        }
+        let advanceResult = advanceDimension()
+        // Each pass leaves out at least one more wither, so the passes end within the number of withers.
+        while (Result.isSuccess(advanceResult)) {
+          const outside = advanceResult.success.state.withers
+            .filter((wither) => wither.dimension === dimension)
+            .flatMap((wither) => {
+              const refused = firstOutsideAddressableCells(witherPositions(wither))
+              return refused === undefined ? [] : [refused]
+            })
+          if (outside.length === 0) break
+          for (const refused of outside) {
+            refuse(refused, 'wither', 'kept')
+            refusedWitherIds.add(refused.id)
+          }
+          advanceResult = advanceDimension()
+        }
+        if (Result.isFailure(advanceResult)) return failWitherStep(advanceResult.failure)
+        const steppedWithers = new Map(advanceResult.success.state.withers.map((wither) => [wither.id, wither]))
+        const hasEffects = advanceResult.success.explosions.length > 0
+          || (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined)
+        if (hasEffects && !revisionReserved) {
+          const reserved = revisionAfter(1)
+          if (Result.isFailure(reserved)) return failWitherStep(reserved.failure)
+          revisionReserved = true
+        }
+        advanced = {
+          ...advanceResult.success.state,
+          // A refused wither was left out of the step, so it is the only one steppedWithers lacks.
+          withers: advanced.withers.map((wither) => steppedWithers.get(wither.id) ?? wither),
+          skulls: advanceResult.success.state.skulls.filter((skull) => {
+            if (skull.dimension !== dimension) return true
+            const outside = firstOutsideAddressableCells(witherSkullPositions(skull))
+            // Keeping a skull in flight would retry the same step every tick, so it leaves the next WitherSnapshot.
+            if (outside !== undefined) refuse(outside, 'wither-skull', 'removed')
+            return outside === undefined
+          }),
+        }
+        if (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined) {
           const playerVitals = vitals.get(targetEntry[0])
           if (playerVitals !== undefined) {
             const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - result.meleeDamage)
-            const hungerActor = hungerActors.get(targetEntry[0])
-            if (hungerActor !== undefined) hungerActors.set(targetEntry[0], {
-              ...hungerActor,
-              state: { ...hungerActor.state, health: playerVitals.health },
-            })
+            playerVitals.health = Math.max(0, playerVitals.health - advanceResult.success.meleeDamage)
             damagedPlayers.add(targetEntry[0])
             if (wasAlive && playerVitals.health <= 0) deadPlayers.add(targetEntry[0])
           }
         }
-        for (const explosion of result.explosions) {
+        for (const explosion of advanceResult.success.explosions) {
+          let explosionBlockReadFailure: MultiplayerServerCoreFailure | undefined
           const blockReader = (position: BlockPos) => {
             if (!isInBounds(position)) return undefined
             const block = blockAt(position)
-            return block === null ? { resistance: 0, destructible: false } : {
+            if (Result.isFailure(block)) {
+              explosionBlockReadFailure ??= block.failure
+              return undefined
+            }
+            return block.success === null ? { resistance: 0, destructible: false } : {
               resistance: explosion.destroysResistantBlocks ? 0 : 1,
-              destructible: block !== 'bedrock',
+              destructible: block.success !== 'bedrock',
             }
           }
-          const plan = planExplosion({ center: explosion.position, radius: explosion.power, seed: revision + witherRevision, blocks: blockReader, entities: [] })
-          for (const position of plan.destroyedBlocks) {
-            blocks.set(positionKey(position), { at: position, block: null })
-            disturbFallingBlocks([position])
-            worldChanged = true
+          const planResult = planExplosion({ center: explosion.position, radius: explosion.power, seed: revision + witherRevision, blocks: blockReader, entities: [] })
+          if (explosionBlockReadFailure !== undefined) return failWitherStep(explosionBlockReadFailure)
+          if (Result.isFailure(planResult)) {
+            return failWitherStep({ _tag: 'ExplosionPlanFailure', failure: planResult.failure })
           }
+          const damageSteps: Array<Readonly<{ player: PlayerId; playerVitals: MutableVitalsState; amount: number }>> = []
           for (const [player, presence] of players) {
             if (presence.world !== dimension) continue
+            const playerVitals = vitals.get(player)
+            if (playerVitals === undefined) continue
             const distance = Math.hypot(
               presence.at.x - explosion.position.x,
               presence.at.y + 0.9 - explosion.position.y,
               presence.at.z - explosion.position.z,
             )
-            const damageAmount = explosionDamageAmount(explosion.power, distance)
-            if (damageAmount <= 0) continue
-            const playerVitals = vitals.get(player)
-            if (playerVitals === undefined) continue
+            // The power is a wither constant. A skull explodes one finite step from a position writePositions or load
+            // validation admitted, and the player's stored position passed the same check, so the distance is finite.
+            const damageAmount = Result.getOrThrow(explosionDamageAmount(explosion.power, distance))
+            if (damageAmount > 0) damageSteps.push({ player, playerVitals, amount: damageAmount })
+          }
+          for (const position of planResult.success.destroyedBlocks) {
+            stepUndo.destroyBlock(position)
+            worldChanged = true
+          }
+          for (const { player, playerVitals, amount } of damageSteps) {
             const wasAlive = playerVitals.health > 0
-            playerVitals.health = Math.max(0, playerVitals.health - damageAmount)
-            const hungerActor = hungerActors.get(player)
-            if (hungerActor !== undefined) hungerActors.set(player, {
-              ...hungerActor,
-              state: { ...hungerActor.state, health: playerVitals.health },
-            })
+            playerVitals.health = Math.max(0, playerVitals.health - amount)
             damagedPlayers.add(player)
             if (wasAlive && playerVitals.health <= 0) deadPlayers.add(player)
           }
         }
       }
       if (worldChanged || damagedPlayers.size > 0) {
-        revision += 1
+        // revisionAfter(1) succeeded before the first melee or explosion, and nothing in this step advanced since.
+        Result.getOrThrow(advanceRevision())
         stateChanged = true
         const deathDeltas = applyPlayerDeaths([...deadPlayers], revision)
         if (worldChanged) worldSnapshotRequired = true
@@ -4466,66 +6114,83 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
       const nextSnapshot = snapshotWitherRuntime(advanced)
     if (JSON.stringify(nextSnapshot) !== JSON.stringify(previousSnapshot)) {
-      witherState = advanced
+      // Every refused wither kept its stored, admitted state and every refused skull was removed above.
+      Result.getOrThrow(writePositions([{ _tag: 'wither', state: advanced }]))
       stateChanged = true
-      broadcastWither(witherSnapshot())
+      const witherMessage = witherSnapshot()
+      postPersistenceSends.push(() => broadcastWither(witherMessage))
     }
     }
 
     if (dimension === 'end') {
       const [advancedDragon, dragonEvents] = advanceEnderDragonEncounter(enderDragonState, elapsedMs / 1_000)
-      if (JSON.stringify(advancedDragon) !== JSON.stringify(enderDragonState)) {
-        enderDragonState = advancedDragon
-        enderDragonRevision += 1
-        stateChanged = true
-        broadcastEnderDragon(enderDragonSnapshot())
-      }
-      for (const event of dragonEvents) {
-        if (event._tag !== 'PlayerDamaged') continue
-        const angle = advancedDragon.phaseTimerSecs * (advancedDragon.phase === 'charging' ? 1.4 : 0.35)
-        const radius = advancedDragon.phase === 'perching' ? 4 : advancedDragon.phase === 'charging' ? 8 : 20
-        const dragonAt = { x: Math.cos(angle) * radius, y: 72 + Math.sin(angle * 0.5) * 8, z: Math.sin(angle) * radius }
-        const damagedPlayers = [...players].flatMap(([player, presence]) => {
+      const dragonChanged = JSON.stringify(advancedDragon) !== JSON.stringify(enderDragonState)
+      const angle = advancedDragon.phaseTimerSecs * (advancedDragon.phase === 'charging' ? 1.4 : 0.35)
+      const radius = advancedDragon.phase === 'perching' ? 4 : advancedDragon.phase === 'charging' ? 8 : 20
+      const dragonAt = { x: Math.cos(angle) * radius, y: 72 + Math.sin(angle * 0.5) * 8, z: Math.sin(angle) * radius }
+      // The dragon's step and the damage it deals are planned first, then their revision advances are checked, so a
+      // step that cannot advance changes neither the dragon nor any player.
+      const plannedHealth = new Map<PlayerId, number>()
+      const damageSteps = dragonEvents.flatMap((event) => {
+        if (event._tag !== 'PlayerDamaged') return []
+        const damaged = [...players].flatMap(([player, presence]) => {
           if (presence.world !== worldId || Math.hypot(
             presence.at.x - dragonAt.x,
             presence.at.y - dragonAt.y,
             presence.at.z - dragonAt.z,
           ) > 6) return []
           const playerVitals = vitals.get(player)
-          if (playerVitals === undefined || playerVitals.health <= 0) return []
-          const wasAlive = playerVitals.health > 0
-          playerVitals.health = Math.max(0, playerVitals.health - event.amount)
-          const hungerActor = hungerActors.get(player)
-          if (hungerActor !== undefined) hungerActors.set(player, {
-            ...hungerActor,
-            state: { ...hungerActor.state, health: playerVitals.health },
-          })
-          return [{ player, died: wasAlive && playerVitals.health <= 0 }] as const
+          if (playerVitals === undefined) return []
+          const health = plannedHealth.get(player) ?? playerVitals.health
+          if (health <= 0) return []
+          const nextHealth = Math.max(0, health - event.amount)
+          plannedHealth.set(player, nextHealth)
+          return [{ player, playerVitals, health: nextHealth, died: nextHealth <= 0 }] as const
         })
-        if (damagedPlayers.length === 0) continue
-        revision += 1
+        return damaged.length === 0 ? [] : [damaged]
+      })
+      const nextEnderDragonRevision = revisionAfterSteps('ender-dragon', enderDragonRevision, dragonChanged ? 1 : 0)
+      if (Result.isFailure(nextEnderDragonRevision)) return failStep(nextEnderDragonRevision.failure)
+      const reserved = revisionAfter(damageSteps.length)
+      if (Result.isFailure(reserved)) return failStep(reserved.failure)
+      if (dragonChanged) {
+        enderDragonState = advancedDragon
+        enderDragonRevision = nextEnderDragonRevision.success
         stateChanged = true
-        postPersistenceDeltas.push(...applyPlayerDeaths(damagedPlayers.filter((entry) => entry.died).map((entry) => entry.player), revision))
-        for (const { player } of damagedPlayers) {
+        const dragonMessage = enderDragonSnapshot()
+        postPersistenceSends.push(() => broadcastEnderDragon(dragonMessage))
+      }
+      for (const damaged of damageSteps) {
+        for (const { playerVitals, health } of damaged) playerVitals.health = health
+        // revisionAfter(damageSteps.length) succeeded above, and each damage step advances the revision once.
+        Result.getOrThrow(advanceRevision())
+        stateChanged = true
+        postPersistenceDeltas.push(...applyPlayerDeaths(damaged.filter((entry) => entry.died).map((entry) => entry.player), revision))
+        for (const { player } of damaged) {
           const presence = players.get(player)
           if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) })
         }
       }
     }
 
-    if (stateChanged) notifyStateChanged()
-    for (const delta of postPersistenceDeltas) broadcast(delta)
-    if (worldSnapshotRequired) broadcast(snapshot())
+    publish()
+    return Result.succeed({ refusals })
   }
 
-  const spawnEntity = (entity: AuthoritativeEntityState): boolean => {
-    if (entities.has(entity.entityId)) return false
-    entities.set(entity.entityId, entity)
-    revision += 1
+  const spawnEntity = (entity: AuthoritativeEntityState): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+    if (entities.has(entity.entityId)) return Result.succeed(false)
+    const mobStates = validateEcosystemMobStates([entity])
+    if (Result.isFailure(mobStates)) return Result.fail(mobStates.failure)
+    const reserved = revisionAfter(1)
+    if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
+    const spawned = writePositions([{ _tag: 'entity', entity }])
+    if (Result.isFailure(spawned)) return Result.fail(spawned.failure)
+    // revisionAfter(1) succeeded above, and writing the entity does not advance the revision.
+    Result.getOrThrow(advanceRevision())
     notifyStateChanged()
     broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity })
-    return true
+    return Result.succeed(true)
   }
 
-  return { connect, receive, disconnect, detachPlayer, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity }
+  return Result.succeed({ connect, receive, disconnect, detachPlayer, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
 }
