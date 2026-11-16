@@ -30,7 +30,7 @@ import {
 } from '@nerima-games/mx-multiplayer'
 import { AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { blockIndex, type Chunk, type ChunkWithBlockStates, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import { blockIndex, readBlock, type Chunk, type ChunkWithBlockStates, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
@@ -1235,9 +1235,10 @@ const makeWorldReader = (
       return Result.succeed({ ...chunk, blockStates: chunk.blockStates })
     }
     const blockStates = new Uint32Array(chunk.blocks.length)
-    const defaults = new Map<number, EncodedBlockState>()
-    for (const [index, value] of chunk.blocks.entries()) {
-      let encoded = defaults.get(value)
+    const defaults: Array<EncodedBlockState | undefined> = []
+    for (let index = 0; index < chunk.blocks.length; index += 1) {
+      const value = readBlock(chunk.blocks, index)
+      let encoded = defaults[value]
       if (encoded === undefined) {
         // A Uint16Array element is inside BlockId's representable range.
         const id = Result.getOrThrow(BlockId.result(value))
@@ -1246,7 +1247,7 @@ const makeWorldReader = (
         const result = encodeBlockState(id, state.success)
         if (Result.isFailure(result)) return Result.fail(result.failure)
         encoded = result.success
-        defaults.set(value, encoded)
+        defaults[value] = encoded
       }
       blockStates[index] = encoded
     }
