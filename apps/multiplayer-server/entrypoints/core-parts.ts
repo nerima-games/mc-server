@@ -14,6 +14,7 @@ import {
 import { Effect, Result } from 'effect'
 
 import type { MultiplayerServerCoreParts } from '../core.js'
+import { makeServerWorldWrite } from '../world-write-port.js'
 
 // Bounds resident terrain. The core never writes a chunk, so evicting one only costs regeneration.
 const CHUNK_STORE_CAPACITY = Result.getOrThrow(ChunkCapacity.result(256))
@@ -73,6 +74,7 @@ const openWindowOver = (chunks: ReadonlyArray<ReadonlyChunkWithBlockStates>): Ch
  * The server entrypoint and the tests that construct a core both build their parts here.
  */
 export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => ({
+  makeWorldWrite: (options) => Effect.runSync(Effect.result(makeServerWorldWrite(options))),
   survivalHunger: {
     create: (vitals, difficulty) => Effect.runSync(Effect.gen(function* () {
       // The in-memory vitals normalise spawn saturation against the given hunger.
@@ -92,6 +94,7 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
   openChunkStore: (source) => {
     const store = Effect.runSync(makeChunkStore(source, CHUNK_STORE_CAPACITY))
     return {
+      store,
       peek: (coord) => Effect.runSync(store.peek(coord)),
       load: (coord) => Effect.runSync(Effect.result(store.load(coord))),
       unload: (coord) => Effect.runSync(Effect.result(store.unload(coord))),
