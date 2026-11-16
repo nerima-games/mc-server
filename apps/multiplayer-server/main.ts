@@ -639,7 +639,7 @@ export const startMultiplayerServer = async (
     })) return
     activeRealms.set(clientId, destination)
   }
-  overworldCore = makeMultiplayerServerCore({
+  const overworldCoreResult = makeMultiplayerServerCore({
     worldId: options.worldId,
     dimension: dimensionForWorld(options.worldId),
     seed: options.seed,
@@ -657,7 +657,9 @@ export const startMultiplayerServer = async (
     onEndPortalUse: (clientId, command) => transferPlayer(clientId, overworldCore, endCore, endSpawnAt, command),
     onNetherPortalUse: (clientId, command) => transferPlayer(clientId, overworldCore, netherCore, netherSpawnAt, command),
   })
-  netherCore = makeMultiplayerServerCore({
+  if (Result.isFailure(overworldCoreResult)) return Result.fail(overworldCoreResult.failure)
+  overworldCore = overworldCoreResult.success
+  const netherCoreResult = makeMultiplayerServerCore({
     worldId: 'nether',
     dimension: 'nether',
     seed: options.seed,
@@ -672,7 +674,9 @@ export const startMultiplayerServer = async (
     passableBlocks: new Set(['water', 'nether_portal']),
     onNetherPortalUse: (clientId, command) => transferPlayer(clientId, netherCore, overworldCore, overworldSpawnAt, command),
   })
-  endCore = makeMultiplayerServerCore({
+  if (Result.isFailure(netherCoreResult)) return Result.fail(netherCoreResult.failure)
+  netherCore = netherCoreResult.success
+  const endCoreResult = makeMultiplayerServerCore({
     worldId: 'end',
     dimension: 'end',
     seed: options.seed,
@@ -687,6 +691,8 @@ export const startMultiplayerServer = async (
     passableBlocks: new Set(['water', 'end_portal']),
     onEndPortalUse: (clientId, command) => transferPlayer(clientId, endCore, overworldCore, overworldSpawnAt, command),
   })
+  if (Result.isFailure(endCoreResult)) return Result.fail(endCoreResult.failure)
+  endCore = endCoreResult.success
   const redstoneRuntime = await makeMultiplayerRedstoneRuntime([
     { dimension: dimensionForWorld(options.worldId), core: overworldCore },
     { dimension: 'nether', core: netherCore },

@@ -8,6 +8,8 @@ import {
   initialEnderDragonEncounter,
 } from '@nerima-games/mx-gameplay'
 import { EntityId, type PlayerId } from '@nerima-games/mx-multiplayer'
+import { PositionAxis, position } from '@nerima-games/mc-kernel'
+import { WitherProjectileSpeed, witherSkullProjectile } from '@nerima-games/mc-sim'
 import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 
@@ -233,6 +235,82 @@ describe('multiplayer state file round trip', () => {
       expect(loaded).toEqual(Result.fail({
         _tag: 'PositionOutsideAddressableCells', subject: 'eye-of-ender-recovery', id: 'eye-1', at: { x: 0, y: 64, z: far },
       }))
+    })
+  })
+
+  describe('rejects saved values every later tick would fail on', () => {
+    const loadWith = async (state: MultiplayerServerState) => {
+      const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-round-trip-')), 'state.json')
+      await writeServerState(stateFile, worldId, seed, state)
+      return loadServerState(stateFile, worldId, seed)
+    }
+
+    it('for a block edit whose name the block registry lacks', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        blocks: [{ at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }],
+      })
+      expect(loaded).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }))
+    })
+
+    it('for a furnace holding an item the item registry lacks', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        furnaces: [{
+          furnaceId: '["world-1",2,64,0]', input: { item: 'legacy_ore', count: 1 }, fuel: null, output: null,
+          burnTicksRemaining: 0, cookTicks: 0,
+        }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'SavedFurnaceInvalid',
+        furnaceId: '["world-1",2,64,0]',
+        failure: { _tag: 'UnknownFurnaceItemType', slot: 'input', item: 'legacy_ore' },
+      }))
+    })
+
+    describe('for a Wither skull outside mc-sim projectile rules', () => {
+      const origin = position(PositionAxis(0), PositionAxis(64), PositionAxis(0))
+      const rules = witherSkullProjectile(origin, origin, 'normal')
+      const withSkull = (descriptor: typeof rules): MultiplayerServerState => ({
+        ...fullyPopulatedState(),
+        wither: {
+          nextWitherId: 1,
+          nextSkullId: 1,
+          withers: [],
+          skulls: [{ id: 'skull-1', ownerId: 'wither-1', dimension: worldId, descriptor, position: origin, ageSecs: 0 }],
+        },
+      })
+
+      it('rejects an overflowing direction at a speed mc-sim never gives', async () => {
+        const loaded = await loadWith(withSkull({
+          ...rules,
+          direction: position(PositionAxis(Number.MAX_VALUE), PositionAxis(0), PositionAxis(0)),
+          speed: WitherProjectileSpeed(14),
+        }))
+        expect(loaded).toEqual(Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: 'skull-1' }))
+      })
+
+      it('rejects an overflowing direction at the variant speed', async () => {
+        const loaded = await loadWith(withSkull({
+          ...rules,
+          direction: position(PositionAxis(Number.MAX_VALUE), PositionAxis(0), PositionAxis(0)),
+        }))
+        expect(loaded).toEqual(Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: 'skull-1' }))
+      })
+
+      it('rejects a unit direction with a speed mc-sim never gives the variant', async () => {
+        const loaded = await loadWith(withSkull({
+          ...rules,
+          direction: position(PositionAxis(1), PositionAxis(0), PositionAxis(0)),
+          speed: WitherProjectileSpeed(14),
+        }))
+        expect(loaded).toEqual(Result.fail({ _tag: 'WitherSkullOutsideProjectileRules', id: 'skull-1' }))
+      })
+
+      it('loads a unit direction at the variant speed', async () => {
+        const state = withSkull({ ...rules, direction: position(PositionAxis(1), PositionAxis(0), PositionAxis(0)) })
+        expect(await loadWith(state)).toEqual(Result.succeed(state))
+      })
     })
   })
 

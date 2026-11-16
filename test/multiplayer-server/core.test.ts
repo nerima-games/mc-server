@@ -110,7 +110,7 @@ const makeFixture = (
   const sent = new Map<string, Array<WireText>>()
   const persisted: Array<MultiplayerServerState> = []
   let nowMs = 0
-  const server = makeMultiplayerServerCore({
+  const server = Result.getOrThrow(makeMultiplayerServerCore({
     worldId: 'world-1',
     dimension,
     seed: 42,
@@ -136,7 +136,7 @@ const makeFixture = (
       villagerTrades: [],
       ...metadata,
     },
-  })
+  }))
   const connect = (clientId: string): Array<WireText> => {
     const out: Array<WireText> = []
     sent.set(clientId, out)
@@ -171,7 +171,7 @@ const wholeStateAfterObserverJoins = (fixture: ReturnType<typeof makeFixture>): 
 
 describe('authoritative multiplayer server core', () => {
   it('validates a loaded chunk edit the same way whichever cell of the chunk is read', () => {
-    const server = makeMultiplayerServerCore({
+    const server = Result.getOrThrow(makeMultiplayerServerCore({
       worldId: 'world-1',
       seed: 42,
       allowedBlocks: new Set(['stone']),
@@ -188,7 +188,7 @@ describe('authoritative multiplayer server core', () => {
         furnaces: [],
         villagerTrades: [],
       },
-    })
+    }))
     const expected = Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { x: 0, y: 64, z: 0 }, block: 'legacy_unknown' })
     expect(server.readPistonCell({ x: 0, y: 64, z: 0 })).toEqual(expected)
     expect(server.readPistonCell({ x: 1, y: 64, z: 0 })).toEqual(expected)
@@ -1070,7 +1070,7 @@ describe('authoritative multiplayer server core', () => {
     source.receive('socket-a', join('alice'))
 
     const destinationFrames: Array<WireText> = []
-    const destination = makeMultiplayerServerCore({
+    const destination = Result.getOrThrow(makeMultiplayerServerCore({
       worldId: 'end',
       dimension: 'end',
       seed: 42,
@@ -1080,7 +1080,7 @@ describe('authoritative multiplayer server core', () => {
       chunkSource: airTerrain,
       parts: makeMultiplayerServerCoreParts(),
       staticBlocks: [{ at: { x: 0, y: 64, z: 0 }, block: 'end_portal' }],
-    })
+    }))
     expect(destination.connect('socket-a', (wire) => destinationFrames.push(wire))).toBe(true)
 
     const transfer = Result.getOrThrow(source.server.detachPlayer('socket-a'))

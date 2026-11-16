@@ -193,7 +193,7 @@ const makeFixture = (
   const sent: Array<WireText> = []
   const persisted: Array<MultiplayerServerState> = []
   const timeline: Array<'persist' | 'send'> = []
-  const server = makeMultiplayerServerCore({
+  const server = Result.getOrThrow(makeMultiplayerServerCore({
     worldId: 'world-1',
     seed: 42,
     allowedBlocks: new Set(['stone', 'sand', 'gravel', 'chest', 'furnace', 'tnt']),
@@ -207,7 +207,7 @@ const makeFixture = (
       timeline.push('persist')
       persisted.push(state)
     },
-  })
+  }))
   expect(server.connect('socket-a', (wire) => {
     timeline.push('send')
     sent.push(wire)
@@ -1071,6 +1071,226 @@ describe('multiplayer server authoritative state', () => {
     }))
     expect(messages(fixture.sent)).not.toContainEqual(expect.objectContaining({ _tag: 'PlayerVitalsDelta' }))
     expect(wholeStateAfterObserverJoins(fixture)).toEqual(afterTimeOnlyTick(untouched))
+  })
+
+  // A save may hold a block the registry no longer has: state decoding admits any block name, and every read of that
+  // block's chunk then fails with BlockOverrideNotInRegistry.
+  const unreadableChunkBlock = { at: { x: 40, y: 64, z: 0 }, block: 'legacy_unknown' }
+  const unreadableChunkFailure = { _tag: 'BlockOverrideNotInRegistry', ...unreadableChunkBlock }
+
+  it('publishes the completed time step when the furnace step fails on a loaded item it cannot read', () => {
+    const state: MultiplayerServerState = {
+      ...initialState(),
+      furnaces: [{
+        furnaceId: '["world-1",2,64,0]', input: { item: 'legacy_ore', count: 1 }, fuel: null, output: null,
+        burnTicksRemaining: 0, cookTicks: 0,
+      }],
+    }
+    const untouched = makeFixture(state)
+    const fixture = makeFixture(state)
+    fixture.sent.length = 0
+
+    expect(fixture.server.tick(100)).toEqual(Result.fail({
+      _tag: 'FurnaceAdvanceFailure', failure: { _tag: 'UnknownFurnaceItemType', slot: 'input', item: 'legacy_ore' },
+    }))
+    const timeWeather = { timeOfDay: 6_002, weather: 'clear' }
+    expect(messages(fixture.sent)).toEqual([{ _tag: 'WorldTimeWeatherDelta', world: 'world-1', revision: 4, state: timeWeather }])
+    expect(fixture.persisted.at(-1)?.timeWeather).toEqual(timeWeather)
+    const expected = wholeStateAfterObserverJoins(untouched)
+    const { weatherClock } = expected
+    if (weatherClock === undefined) throw new Error('the core persists its weather clock')
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual({
+      ...expected,
+      timeWeather,
+      weatherClock: { ...weatherClock, remainingSecs: weatherClock.remainingSecs - 0.1 },
+    })
+  })
+
+  it('undoes the entity step when an arrow reads a chunk it cannot load after earlier entities changed state', () => {
+    const state: MultiplayerServerState = {
+      ...initialState(),
+      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
+      blocks: [...initialState().blocks, { at: { x: 11, y: 64, z: 0 }, block: 'stone' }, unreadableChunkBlock],
+      entities: [
+        // Each of these changes state before the last arrow's read fails: the TNT destroys blocks, one arrow hits
+        // the player, and one moves.
+        { _tag: 'primed-tnt', entityId: entityId('fused-tnt'), at: { x: 10.5, y: 64, z: 0.5 }, burnedSecs: 3.99, owner: null },
+        {
+          _tag: 'arrow', entityId: entityId('hitting-arrow'), at: { x: 0, y: 65, z: -1 }, velocity: { x: 0, y: 0, z: 30 },
+          damage: 2, owner: null, ageTicks: 0,
+        },
+        {
+          _tag: 'arrow', entityId: entityId('flying-arrow'), at: { x: 5, y: 100, z: 5 }, velocity: { x: 10, y: 0, z: 0 },
+          damage: 2, owner: null, ageTicks: 0,
+        },
+        {
+          _tag: 'arrow', entityId: entityId('blocked-arrow'), at: { x: 39.5, y: 100.5, z: 0.5 }, velocity: { x: 30, y: 0, z: 0 },
+          damage: 2, owner: null, ageTicks: 0,
+        },
+      ],
+    }
+    const untouched = makeFixture(state)
+    const fixture = makeFixture(state)
+    const before = fixture.server.snapshot()
+    fixture.sent.length = 0
+
+    // 40 ms is less than a game tick, so no step before the entity step changes anything.
+    expect(fixture.server.tick(40)).toEqual(Result.fail(unreadableChunkFailure))
+    expect(fixture.sent).toEqual([])
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
+  })
+
+  // R-SV3b's input: an arrow in a chunk whose saved block name the registry lacks. Load validation now rejects that
+  // save, so the core is built here from initialState directly to reach the runtime path.
+  const arrowInUnreadableChunk: MultiplayerServerState = {
+    ...initialState(),
+    blocks: [...initialState().blocks, { at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }],
+    entities: [{
+      _tag: 'arrow', entityId: entityId('far-arrow'), at: { x: 64, y: 100, z: 0 }, velocity: { x: 1, y: 0, z: 0 },
+      damage: 2, owner: null, ageTicks: 0,
+    }],
+  }
+
+  it('keeps an arrow whose raycast cannot read its chunk unflown, so a later join does not persist the flight', () => {
+    const untouched = makeFixture(arrowInUnreadableChunk)
+    const fixture = makeFixture(arrowInUnreadableChunk)
+    fixture.sent.length = 0
+
+    // raycastArrowBlock reads only the cells a flight enters, so a 50 ms flight inside x = 64 reads nothing. One
+    // second carries the arrow into x = 65: the time step completes, then the raycast's read fails.
+    expect(fixture.server.tick(1_000)).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }))
+    expect(messages(fixture.sent)).toEqual([expect.objectContaining({ _tag: 'WorldTimeWeatherDelta', state: { timeOfDay: 6_020, weather: 'clear' } })])
+    const joined = wholeStateAfterObserverJoins(fixture)
+    expect(joined.entities).toEqual(arrowInUnreadableChunk.entities)
+    const expected = wholeStateAfterObserverJoins(untouched)
+    const { weatherClock } = expected
+    if (weatherClock === undefined) throw new Error('the core persists its weather clock')
+    expect(joined).toEqual({
+      ...expected,
+      timeWeather: { timeOfDay: 6_020, weather: 'clear' },
+      weatherClock: { ...weatherClock, remainingSecs: weatherClock.remainingSecs - 1 },
+    })
+  })
+
+  it('sends a completed furnace step only after persisting it when a later step of the tick fails', () => {
+    const state: MultiplayerServerState = {
+      ...arrowInUnreadableChunk,
+      furnaces: [{
+        furnaceId: '["world-1",2,64,0]', input: { item: 'iron_ore', count: 1 }, fuel: { item: 'coal', count: 1 }, output: null,
+        burnTicksRemaining: 0, cookTicks: 0,
+      }],
+    }
+    const fixture = makeFixture(state)
+    fixture.sent.length = 0
+    fixture.timeline.length = 0
+
+    expect(fixture.server.tick(1_000)).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }))
+    const furnaceDelta = messages(fixture.sent).find((message) => message._tag === 'FurnaceDelta')
+    if (furnaceDelta?._tag !== 'FurnaceDelta') throw new Error('the completed furnace step publishes its delta')
+    // The furnace delta and the persisted furnace agree, and the state was persisted before anything was sent.
+    expect(fixture.persisted).toEqual([expect.objectContaining({ furnaces: [furnaceDelta.state] })])
+    expect(fixture.timeline[0]).toBe('persist')
+    expect(fixture.persisted.at(-1)?.entities).toEqual(arrowInUnreadableChunk.entities)
+  })
+
+  it('undoes the Wither step when its skull explosion reads a chunk it cannot load after its melee hit', () => {
+    // The player's body stays in x = 15, so the contact step reads only that column, while the skull explosion at the
+    // player's head reaches the cell at x = 16 in the unreadable chunk.
+    const playerAt = { x: 15.7, y: 64, z: 0.5 }
+    const unreadable = { at: { x: 20, y: 64, z: 0 }, block: 'legacy_unknown' }
+    const state: MultiplayerServerState = {
+      ...initialState(),
+      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
+      blocks: [...initialState().blocks, unreadable],
+      wither: {
+        nextWitherId: 1,
+        nextSkullId: 0,
+        withers: [{
+          id: 'wither-1',
+          dimension: 'world-1',
+          snapshot: {
+            kind: 'wither',
+            version: 1,
+            state: {
+              phase: 'airborne',
+              healthPoints: WitherHealthPoints(300),
+              chargeRemainingSecs: WitherChargeRemainingSecs(0),
+              feetPosition: { x: PositionAxis(playerAt.x), y: PositionAxis(playerAt.y), z: PositionAxis(playerAt.z) },
+              velocity: stillVelocity,
+            },
+          },
+          // The wither melees the player on its own cell and launches a skull that hits the player's head this step.
+          rangedCooldownSecs: 0.01,
+          meleeCooldownSecs: 0,
+          shotsFired: 0,
+        }],
+        skulls: [],
+      },
+    }
+    const untouched = makeFixture(state, playerAt)
+    const fixture = makeFixture(state, playerAt)
+    const before = fixture.server.snapshot()
+    fixture.sent.length = 0
+
+    expect(fixture.server.tick(40)).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', ...unreadable }))
+    expect(fixture.sent).toEqual([])
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
+  })
+
+  it('fails a sleep command on a bed it cannot read before the request is recorded or answered', () => {
+    const playerAt = { x: 15.5, y: 64, z: 0.5 }
+    const unreadable = { at: { x: 20, y: 64, z: 0 }, block: 'legacy_unknown' }
+    const fixture = makeFixture({ ...initialState(), blocks: [...initialState().blocks, unreadable] }, playerAt)
+    fixture.sent.length = 0
+    const enterSleep = JSON.stringify({
+      _tag: 'SleepCommand',
+      command: {
+        _tag: 'EnterSleep', actor: playerId('alice'), session: 'alice', requestId: 'sleep-on-unreadable-bed',
+        expectedRevision: 4, clientTick: 20, bed: { x: 16, y: 64, z: 0 },
+      },
+    })
+
+    expect(fixture.server.receive('socket-a', enterSleep)).toEqual({
+      accepted: false, reason: 'invalid-command', failure: { _tag: 'BlockOverrideNotInRegistry', ...unreadable },
+    })
+    expect(sleepResult(fixture.sent)).toBeUndefined()
+    expect(fixture.sent).toEqual([])
+    expect(fixture.persisted).toEqual([])
+  })
+
+  describe('checks the configured bounds when the core is constructed', () => {
+    const makeThunderCore = (bounds: NonNullable<MultiplayerServerOptions['bounds']>) => makeMultiplayerServerCore({
+      worldId: 'world-1',
+      seed: 42,
+      allowedBlocks: new Set(['stone']),
+      initialState: { ...initialState(), timeWeather: { timeOfDay: 159, weather: 'thunder' } },
+      bounds,
+      spawnAt: { x: 0, y: 64, z: 0 },
+      chunkSource: airTerrain,
+      parts: makeMultiplayerServerCoreParts(),
+    })
+    const finite = { minX: -64, maxX: 64, minY: -64, maxY: 319, minZ: -64, maxZ: 64 }
+
+    it.each([
+      ['an infinite maximum', { ...finite, maxY: Number.POSITIVE_INFINITY }],
+      ['a NaN minimum', { ...finite, minX: Number.NaN }],
+      ['a minimum above its maximum', { ...finite, minZ: 65 }],
+    ])('rejects %s with a typed failure', (_name, bounds) => {
+      expect(makeThunderCore(bounds)).toEqual(Result.fail({ _tag: 'InvalidServerBounds', bounds }))
+    })
+
+    it('strikes the top of finite bounds when no player is present', () => {
+      const server = Result.getOrThrow(makeThunderCore(finite))
+
+      // Two game ticks cross a strike interval in thunder, with no player for the strike to fall on; the strike
+      // advances the revision from 4.
+      expect(server.tick(100)).toEqual(Result.succeed({ refusals: [] }))
+      expect(server.snapshot().revision).toBe(5)
+    })
   })
 
   it('resolves bucket collection and placement from the authoritative player pose', () => {
@@ -3139,6 +3359,9 @@ describe('multiplayer server authoritative state', () => {
     })
     fixture.sent.length = 0
     fixture.persisted.length = 0
+    // mx-gameplay 0.11 stepEcosystemMob adds one to motionPhase per call, and the core calls it once per game tick,
+    // so a 1000 ms tick advances the phase by 1000 ms / DEFAULT_TICK_DURATION = 20 ticks.
+    const ticksPerSecond = 1_000 / (Number(DEFAULT_TICK_DURATION) * 1_000)
 
     fixture.server.tick(1_000)
 
@@ -3147,12 +3370,12 @@ describe('multiplayer server authoritative state', () => {
       entity: {
         entityId: 'cow-1',
         at: { x: expect.closeTo(Math.cos(1) * 1, 10), z: expect.closeTo(Math.sin(1) * 1, 10) },
-        mobState: expect.objectContaining({ motionPhase: 1, attackCooldownSecs: 0, provoked: false }),
+        mobState: expect.objectContaining({ motionPhase: ticksPerSecond, attackCooldownSecs: 0, provoked: false }),
       },
     })
     expect(fixture.persisted.at(-1)?.entities).toContainEqual(expect.objectContaining({
       entityId: 'cow-1',
-      mobState: { motionPhase: 1, attackCooldownSecs: 0, provoked: false },
+      mobState: { motionPhase: ticksPerSecond, attackCooldownSecs: 0, provoked: false },
     }))
   })
 
