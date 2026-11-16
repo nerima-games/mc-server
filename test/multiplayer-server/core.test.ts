@@ -207,11 +207,12 @@ describe('authoritative multiplayer server core', () => {
       at: { x: 9, y: 99, z: 9 },
     }).accepted).toBe(true)
 
-    expect(messages(aliceFrames).slice(0, 2)).toEqual([
+    expect(messages(aliceFrames).slice(0, 3)).toEqual([
       expect.objectContaining({
         _tag: 'WorldSnapshot',
         players: [expect.objectContaining({ player: 'alice', at: spawnAt })],
       }),
+      { _tag: 'ReplicatedWorldSnapshot', world: worldId('world-1'), revision: 0, owners: [], blocks: [] },
       expect.objectContaining({
         _tag: 'PlayerMove',
         player: 'alice',
@@ -273,9 +274,6 @@ describe('authoritative multiplayer server core', () => {
     fixture.receive('socket-a', join('alice'))
     const before = fixture.server.snapshot()
 
-    // mx-multiplayer 0.17 decodes a ReplicatedWorldSnapshot only against a ReplicatedOwnerRegistry.
-    // The server decodes client frames without one, so a well-formed enveloped snapshot from a
-    // client fails decoding as a malformed frame before it can reach the server-only message check.
     expect(fixture.server.receive('socket-a', JSON.stringify({
       protocolVersion: PROTOCOL_VERSION,
       message: {
@@ -285,7 +283,7 @@ describe('authoritative multiplayer server core', () => {
         blocks: [],
         owners: [],
       },
-    }) as WireText)).toEqual({ accepted: false, reason: 'malformed-frame' })
+    }) as WireText)).toEqual({ accepted: false, reason: 'identity-spoof' })
     expect(fixture.server.snapshot()).toEqual(before)
   })
 
@@ -551,11 +549,12 @@ describe('authoritative multiplayer server core', () => {
       at: { x: -8, y: 80, z: 8 },
     }).accepted).toBe(true)
 
-    expect(messages(reconnectFrames).slice(0, 2)).toEqual([
+    expect(messages(reconnectFrames).slice(0, 3)).toEqual([
       expect.objectContaining({
         _tag: 'WorldSnapshot',
         players: [expect.objectContaining({ player: 'alice', at: restoredAt, facing: restoredFacing })],
       }),
+      { _tag: 'ReplicatedWorldSnapshot', world: worldId('world-1'), revision: 0, owners: [], blocks: [] },
       expect.objectContaining({
         _tag: 'PlayerMove', player: 'alice', at: restoredAt, facing: restoredFacing,
       }),

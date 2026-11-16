@@ -160,7 +160,7 @@ const makeBoundaryExplosion = () => {
     skulls: [],
   } } })
   Result.getOrThrow(fixture.core.readPistonCell(center))
-  return { fixture, loaded, center, untouched }
+  return { fixture, loaded, center, untouched, terrain }
 }
 
 describe('coordinator-backed multiplayer block writes', () => {
@@ -414,7 +414,7 @@ describe('coordinator-backed multiplayer block writes', () => {
     ] } })
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.core }])
 
-    expect(Result.isSuccess(await Effect.runPromise(runtime.tick(100)))).toBe(true)
+    expect(await Effect.runPromise(runtime.tick(100))).toEqual(Result.succeed(undefined))
 
     expect(Effect.runSync(fixture.store.getBlockWithState(at(P)))).toMatchObject({
       _tag: 'Block', block: doorOpen, state,
@@ -480,13 +480,21 @@ describe('coordinator-backed multiplayer block writes', () => {
   })
 
   it('does not load or edit the adjacent unloaded chunk while planning a boundary explosion', () => {
-    const { fixture, loaded, center, untouched } = makeBoundaryExplosion()
+    const { fixture, loaded, center, untouched, terrain } = makeBoundaryExplosion()
+    const controlLoads: Array<string> = []
+    const control = makeFixture({ source: (coord) => {
+      controlLoads.push(`${String(coord.cx)},${String(coord.cz)}`)
+      return terrain(coord)
+    } })
+    Result.getOrThrow(control.core.readPistonCell(center))
     expect(loaded).toEqual(['0,0'])
     expect(Effect.runSync(fixture.store.isLoaded(chunkCoord(ChunkAxis(1), ChunkAxis(0))))).toBe(false)
 
+    expect(Result.isSuccess(control.core.tick(100))).toBe(true)
     expect(Result.isSuccess(fixture.core.tick(100))).toBe(true)
 
-    expect(loaded).toEqual(['0,0'])
+    expect(loaded).toEqual(controlLoads)
+    expect(loaded).not.toContain('1,0')
     expect(Effect.runSync(fixture.store.isLoaded(chunkCoord(ChunkAxis(1), ChunkAxis(0))))).toBe(false)
     expect(fixture.deltas(fixture.bob)).toContainEqual(expect.objectContaining({
       blockChanges: expect.arrayContaining([expect.objectContaining({

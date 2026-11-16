@@ -12,7 +12,7 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import {
-  CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, type ChunkCoord, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
+  AIR_BLOCK_ID, BlockAxis, blockIdOf, defaultBlockState, CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, type ChunkCoord, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
   PositionAxis, SimulationTick, position, type Position,
 } from '@nerima-games/mc-kernel'
 import { DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
@@ -21,7 +21,7 @@ import {
   chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, openChunkWindow, planMobMovementRoster,
   SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS, stepEcosystemMob,
 } from '@nerima-games/mx-gameplay'
-import { Effect, Result, Schema } from 'effect'
+import { Effect, Option, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -665,7 +665,7 @@ describe('multiplayer server authoritative state', () => {
 
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
       expect.objectContaining({ _tag: 'EntityDespawnDelta', entityId: 'ignite-tnt:tnt' }),
-      expect.objectContaining({ _tag: 'WorldSnapshot' }),
+      expect.objectContaining({ _tag: 'ReplicatedWorldDelta', revision: 2 }),
       expect.objectContaining({
         _tag: 'PlayerVitalsDelta',
         player: playerId('alice'),
@@ -768,10 +768,10 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted).toEqual([])
   })
 
-  it('rejects an ender pearl landing outside addressable cells without moving the player or consuming the pearl', () => {
-    // Looking straight down, the pearl lands the eye height below the stone it hits, which here is below the
-    // lowest addressable cell.
+  it('rejects an ender pearl ray outside addressable cells without moving the player or consuming the pearl', () => {
     const at = { x: 0.5, y: Number.MIN_SAFE_INTEGER + 3, z: 0.5 }
+    const invalidTarget = BlockAxis.result(-(2 ** 53))
+    if (Result.isSuccess(invalidTarget)) return expect.unreachable('the target must be outside addressable cells')
     const pearls = { item: 'ender_pearl', count: 2 } as const
     const fixture = makeFixture({
       ...initialState(),
@@ -789,10 +789,9 @@ describe('multiplayer server authoritative state', () => {
       accepted: false,
       reason: 'invalid-command',
       failure: {
-        _tag: 'PositionOutsideAddressableCells',
-        subject: 'player',
-        id: 'alice',
-        at: expect.objectContaining({ y: -(2 ** 53) }),
+        _tag: 'CameraPoseFailure',
+        operation: 'target',
+        failure: invalidTarget.failure,
       },
     })
 
@@ -801,14 +800,25 @@ describe('multiplayer server authoritative state', () => {
     ])
     expect(fixture.persisted).toEqual([])
     expect(fixture.server.snapshot().players).toEqual([expect.objectContaining({ player: playerId('alice'), at })])
+    expect(fixture.server.snapshot().revision).toBe(4)
     fixture.sent.length = 0
     fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: worldId('world-1'), lastKnownRevision: 4 })
-    expect(messages(fixture.sent)).toEqual([expect.objectContaining({
-      _tag: 'AuthoritativeSnapshot',
-      revision: 4,
-      inventories: [{ player: 'alice', state: expect.objectContaining({ slots: [pearls, null, null] }) }],
-      vitals: [{ player: 'alice', state: { health: 20, hunger: 20, experience: 7 } }],
-    })])
+    expect(messages(fixture.sent)).toEqual([
+      expect.objectContaining({
+        _tag: 'AuthoritativeSnapshot',
+        revision: 4,
+        inventories: [{ player: 'alice', state: expect.objectContaining({ slots: [pearls, null, null] }) }],
+        vitals: [{ player: 'alice', state: { health: 20, hunger: 20, experience: 7 } }],
+        entities: [],
+      }),
+      {
+        _tag: 'ReplicatedWorldSnapshot', world: worldId('world-1'), revision: 0, owners: [],
+        blocks: [{
+          dimension: 'overworld', position: { x: 0, y: Number.MIN_SAFE_INTEGER, z: 0 },
+          reading: { _tag: 'OutOfWorld' },
+        }],
+      },
+    ])
   })
 
   it('rejects commands without throwing once the revision reaches the largest safe integer', () => {
@@ -835,7 +845,7 @@ describe('multiplayer server authoritative state', () => {
         reason: 'invalid-command',
         revision: Number.MAX_SAFE_INTEGER,
       }),
-      expect.objectContaining({ _tag: 'BlockMutationRejected', at: { x: 1, y: 64, z: 1 }, revision: Number.MAX_SAFE_INTEGER }),
+      expect.objectContaining({ _tag: 'BlockMutationRejected', at: { x: 1, y: 64, z: 1 }, revision: 0 }),
     ])
 
     expect(fixture.persisted).toEqual([])
@@ -846,11 +856,26 @@ describe('multiplayer server authoritative state', () => {
     }))
     fixture.sent.length = 0
     fixture.receive({ _tag: 'AuthoritativeResyncRequest', world: worldId('world-1'), lastKnownRevision: 4 })
-    expect(messages(fixture.sent)).toEqual([expect.objectContaining({
-      _tag: 'AuthoritativeSnapshot',
-      revision: Number.MAX_SAFE_INTEGER,
-      inventories: [{ player: 'alice', state: expect.objectContaining({ selectedSlot: 0, slots }) }],
-    })])
+    expect(messages(fixture.sent)).toEqual([
+      expect.objectContaining({
+        _tag: 'AuthoritativeSnapshot',
+        revision: Number.MAX_SAFE_INTEGER,
+        inventories: [{ player: 'alice', state: expect.objectContaining({ selectedSlot: 0, slots }) }],
+      }),
+      {
+        _tag: 'ReplicatedWorldSnapshot', world: worldId('world-1'), revision: 0, owners: [],
+        blocks: [
+          {
+            dimension: 'overworld', position: { x: 1, y: 64, z: 0 },
+            reading: { _tag: 'Block', block: Option.getOrThrow(blockIdOf('chest')) }, state: DEFAULT_BLOCK_STATE,
+          },
+          {
+            dimension: 'overworld', position: { x: 2, y: 64, z: 0 },
+            reading: { _tag: 'Block', block: Option.getOrThrow(blockIdOf('furnace')) }, state: DEFAULT_BLOCK_STATE,
+          },
+        ],
+      },
+    ])
     expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
   })
 
@@ -1203,9 +1228,7 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted.at(-1)?.entities).toEqual(arrowInUnreadableChunk.entities)
   })
 
-  it('undoes the Wither step when its skull explosion reads a chunk it cannot load after its melee hit', () => {
-    // The player's body stays in x = 15, so the contact step reads only that column, while the skull explosion at the
-    // player's head reaches the cell at x = 16 in the unreadable chunk.
+  it('keeps a skull explosion out of an unloaded corrupt chunk and reports corruption when that chunk is read', () => {
     const playerAt = { x: 15.7, y: 64, z: 0.5 }
     const unreadable = { at: { x: 20, y: 64, z: 0 }, block: 'legacy_unknown' }
     const state: MultiplayerServerState = {
@@ -1237,16 +1260,22 @@ describe('multiplayer server authoritative state', () => {
         skulls: [],
       },
     }
-    const untouched = makeFixture(state, playerAt)
     const fixture = makeFixture(state, playerAt)
-    const before = fixture.server.snapshot()
     fixture.sent.length = 0
 
-    expect(fixture.server.tick(40)).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', ...unreadable }))
-    expect(fixture.sent).toEqual([])
-    expect(fixture.persisted).toEqual([])
-    expect(fixture.server.snapshot()).toEqual(before)
-    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
+    expect(fixture.server.tick(40)).toEqual(Result.succeed({ refusals: [] }))
+    expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
+      _tag: 'PlayerVitalsDelta', player: playerId('alice'),
+    }))
+    expect(fixture.persisted.at(-1)?.vitals.find(({ player }) => player === playerId('alice'))?.state.health).toBeLessThan(20)
+    expect(fixture.persisted.at(-1)?.wither?.withers[0]?.shotsFired).toBe(1)
+    expect(fixture.server.snapshot().blocks).toContainEqual({ world: worldId('world-1'), ...unreadable })
+
+    const beforeRead = fixture.server.snapshot()
+    expect(fixture.server.readPistonCell(unreadable.at)).toEqual(Result.fail({
+      _tag: 'BlockOverrideNotInRegistry', ...unreadable,
+    }))
+    expect(fixture.server.snapshot()).toStrictEqual(beforeRead)
   })
 
   it('fails a sleep command on a bed it cannot read before the request is recorded or answered', () => {
@@ -1326,7 +1355,13 @@ describe('multiplayer server authoritative state', () => {
         _tag: 'PlayerInventoryDelta', revision: 5, player: playerId('alice'),
         state: expect.objectContaining({ slots: [{ item: 'water_bucket', count: 1 }, null, null] }),
       }),
-      expect.objectContaining({ _tag: 'BlockBreak', at: { x: 0, y: 65, z: -1 } }),
+      expect.objectContaining({
+        _tag: 'ReplicatedWorldDelta', revision: 1,
+        blockChanges: [expect.objectContaining({
+          dimension: 'overworld', position: { x: 0, y: 65, z: -1 },
+          before: Option.getOrThrow(blockIdOf('water')), after: AIR_BLOCK_ID,
+        })],
+      }),
     ]))
 
     fixture.sent.length = 0
@@ -1339,7 +1374,13 @@ describe('multiplayer server authoritative state', () => {
         _tag: 'PlayerInventoryDelta', revision: 6, player: playerId('alice'),
         state: expect.objectContaining({ slots: [{ item: 'bucket', count: 1 }, null, null] }),
       }),
-      expect.objectContaining({ _tag: 'BlockPlace', at: { x: 0, y: 65, z: -1 }, block: 'water' }),
+      expect.objectContaining({
+        _tag: 'ReplicatedWorldDelta', revision: 2,
+        blockChanges: [expect.objectContaining({
+          dimension: 'overworld', position: { x: 0, y: 65, z: -1 },
+          before: AIR_BLOCK_ID, after: Option.getOrThrow(blockIdOf('water')),
+        })],
+      }),
     ]))
   })
 
@@ -1529,7 +1570,7 @@ describe('multiplayer server authoritative state', () => {
     }))
   })
 
-  it('moves unsupported sand through the server snapshot after its support is broken', () => {
+  it('broadcasts unsupported sand through one coordinator batch after its support is broken', () => {
     const state = initialState()
     const fixture = makeFixture({
       ...state,
@@ -1551,14 +1592,23 @@ describe('multiplayer server authoritative state', () => {
     const emitted = messages(fixture.sent)
     expect(emitted).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        _tag: 'WorldSnapshot',
-        blocks: expect.arrayContaining([
-          expect.objectContaining({ at: { x: 1, y: 65, z: 0 }, block: null }),
-          expect.objectContaining({ at: { x: 1, y: 64, z: 0 }, block: 'sand' }),
-        ]),
+        _tag: 'ReplicatedWorldDelta',
+        revision: 2,
+        blockChanges: [
+          expect.objectContaining({
+            dimension: 'overworld', position: { x: 1, y: 65, z: 0 },
+            before: Option.getOrThrow(blockIdOf('sand')), after: AIR_BLOCK_ID,
+          }),
+          expect.objectContaining({
+            dimension: 'overworld', position: { x: 1, y: 64, z: 0 },
+            before: AIR_BLOCK_ID, after: Option.getOrThrow(blockIdOf('sand')),
+          }),
+        ],
       }),
     ]))
-    expect(emitted.at(-1)).toEqual(expect.objectContaining({ _tag: 'WorldSnapshot', revision: 6 }))
+    expect(emitted.at(-1)).toEqual(expect.objectContaining({
+      _tag: 'WorldTimeWeatherDelta', revision: 5, state: { timeOfDay: 6001, weather: 'clear' },
+    }))
   })
 
   it.each([
@@ -1677,6 +1727,13 @@ describe('multiplayer server authoritative state', () => {
     }).accepted).toBe(true)
     expect(messages(fixture.sent)).toEqual([
       expect.objectContaining({ _tag: 'AuthoritativeSnapshot', revision: 4 }),
+      {
+        _tag: 'ReplicatedWorldSnapshot', world: worldId('world-1'), revision: 0, owners: [],
+        blocks: [
+          { dimension: 'overworld', position: { x: 1, y: 64, z: 0 }, reading: { _tag: 'ChunkNotLoaded' } },
+          { dimension: 'overworld', position: { x: 2, y: 64, z: 0 }, reading: { _tag: 'ChunkNotLoaded' } },
+        ],
+      },
     ])
   })
 
@@ -4453,9 +4510,15 @@ describe('multiplayer server authoritative state', () => {
     })
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        _tag: 'WorldSnapshot',
-        revision: 5,
-        blocks: expect.arrayContaining([{ world: worldId('world-1'), at: { x: 1, y: 64, z: 0 }, block: 'redstone_lamp_lit' }]),
+        _tag: 'ReplicatedWorldDelta',
+        world: worldId('world-1'),
+        revision: 1,
+        blockChanges: [expect.objectContaining({
+          dimension: 'overworld', position: { x: 1, y: 64, z: 0 },
+          before: Option.getOrThrow(blockIdOf('redstone_lamp')),
+          after: Option.getOrThrow(blockIdOf('redstone_lamp_lit')),
+          beforeState: DEFAULT_BLOCK_STATE, afterState: DEFAULT_BLOCK_STATE,
+        })],
       }),
     ]))
   })
@@ -4568,13 +4631,22 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
       revision: 5,
-      blocks: expect.arrayContaining([{ at: { x: 1, y: 64, z: 0 }, block: 'door_open' }]),
+      blocks: expect.arrayContaining([{
+        at: { x: 1, y: 64, z: 0 }, block: 'door_open',
+        state: Result.getOrThrow(defaultBlockState(Option.getOrThrow(blockIdOf('door_open')))),
+      }]),
     })
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        _tag: 'WorldSnapshot',
-        revision: 5,
-        blocks: expect.arrayContaining([{ world: worldId('world-1'), at: { x: 1, y: 64, z: 0 }, block: 'door_open' }]),
+        _tag: 'ReplicatedWorldDelta',
+        world: worldId('world-1'),
+        revision: 1,
+        blockChanges: [expect.objectContaining({
+          dimension: 'overworld', position: { x: 1, y: 64, z: 0 },
+          before: Option.getOrThrow(blockIdOf('door')),
+          after: Option.getOrThrow(blockIdOf('door_open')),
+          beforeState: DEFAULT_BLOCK_STATE, afterState: DEFAULT_BLOCK_STATE,
+        })],
       }),
     ]))
   })
@@ -4638,17 +4710,30 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted[0]).toMatchObject({
       revision: 5,
       blocks: expect.arrayContaining([
-        { at: { x: 1, y: 64, z: -1 }, block: 'piston_head' },
+        {
+          at: { x: 1, y: 64, z: -1 }, block: 'piston_head',
+          state: Result.getOrThrow(defaultBlockState(Option.getOrThrow(blockIdOf('piston_head')))),
+        },
         { at: { x: 1, y: 64, z: -2 }, block: 'stone' },
       ]),
     })
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        _tag: 'WorldSnapshot',
-        revision: 5,
-        blocks: expect.arrayContaining([
-          { world: worldId('world-1'), at: { x: 1, y: 64, z: -1 }, block: 'piston_head' },
-          { world: worldId('world-1'), at: { x: 1, y: 64, z: -2 }, block: 'stone' },
+        _tag: 'ReplicatedWorldDelta',
+        world: worldId('world-1'),
+        revision: 1,
+        blockChanges: expect.arrayContaining([
+          expect.objectContaining({
+            dimension: 'overworld', position: { x: 1, y: 64, z: -1 },
+            before: Option.getOrThrow(blockIdOf('stone')),
+            after: Option.getOrThrow(blockIdOf('piston_head')),
+            beforeState: DEFAULT_BLOCK_STATE, afterState: DEFAULT_BLOCK_STATE,
+          }),
+          expect.objectContaining({
+            dimension: 'overworld', position: { x: 1, y: 64, z: -2 },
+            before: AIR_BLOCK_ID, after: Option.getOrThrow(blockIdOf('stone')),
+            beforeState: DEFAULT_BLOCK_STATE, afterState: DEFAULT_BLOCK_STATE,
+          }),
         ]),
       }),
     ]))

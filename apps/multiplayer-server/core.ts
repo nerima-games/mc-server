@@ -1276,7 +1276,8 @@ const makeWorldReader = (
     if (Result.isFailure(blockId)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockIdFailure', failure: blockId.failure }))
     const block = blockTypeOfId(blockId.success)
     if (Result.isFailure(block)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockRegistryFailure', failure: block.failure }))
-    return Result.succeed(block.success === undefined || block.success === 'air' ? null : block.success)
+    if (block.success === undefined) return Result.fail({ _tag: 'UnresolvedBlockId', blockId: blockId.success })
+    return Result.succeed(block.success === 'air' ? null : block.success)
   }
 
   const openWindow = (coords: ReadonlyArray<ChunkCoord>): Result.Result<ChunkWindow, MultiplayerServerCoreFailure> => {
@@ -1345,7 +1346,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const commitBlockEdits = (edits: ReadonlyArray<BlockOverride>, rollback?: () => void): Result.Result<BlockCommit, MultiplayerServerCoreFailure> => {
     const expected = blockRevisions()
     const batchEdits: Array<unknown> = []
-    const prepared = new Map<string, Readonly<{ name: string | null; state: BlockStateValues; beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
+    const prepared = new Map<string, Readonly<{ beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
     const previewChanges: Array<Extract<NetworkMessage, { _tag: 'ReplicatedWorldDelta' }>['blockChanges'][number]> = []
     for (const edit of edits) {
       const block = overrideBlockId(edit.block)
@@ -1356,7 +1357,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: edit.at, failure: state.failure })
       const encoded = encodeBlockState(block.value, state.success)
       if (Result.isFailure(encoded)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: edit.at, failure: encoded.failure })
-      prepared.set(positionKey(edit.at), { name: edit.block, state: state.success, beforeState: before.success.state, afterState: encoded.success })
+      prepared.set(positionKey(edit.at), { beforeState: before.success.state, afterState: encoded.success })
       const position = Schema.decodeUnknownResult(BlockPositionSchema)(edit.at)
       if (Result.isFailure(position)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: position.failure })
       if (before.success.block !== block.value || before.success.state !== encoded.success) {
@@ -1377,7 +1378,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     // The coordinator publishes this validated batch; all wire states were encoded before that publication.
     const changes = committed.success.delta.blockChanges.map((change) => {
       const cell = Option.getOrThrow(Option.fromNullishOr(prepared.get(positionKey(change.position))))
-      blocks.record({ at: change.position, block: cell.name, state: change.state === undefined ? cell.state : change.state })
+      const block = change.after === AIR_BLOCK_ID ? null
+        : Option.getOrThrow(Option.fromNullishOr(Result.getOrThrow(blockTypeOfId(change.after))))
+      blocks.record(change.state === undefined
+        ? { at: change.position, block }
+        : { at: change.position, block, state: change.state })
       return { dimension: change.dimension, position: change.position, before: change.before, after: change.after, beforeState: cell.beforeState, afterState: cell.afterState }
     })
     const message = { _tag: 'ReplicatedWorldDelta', world: committed.success.delta.world, revision: committed.success.delta.revision, changes: committed.success.delta.changes, blockChanges: changes }
@@ -2212,7 +2217,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     if (Result.isFailure(encoded)) return Result.fail(encoded.failure)
     const state = decodeBlockState(currentId, encoded.success)
     if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at, failure: state.failure })
-    const committed = commitBlockEdits([{ at, block: nextBlock, state: state.success }])
+    const nextState = { ...state.success }
+    // door_open encodes openness in its id and has no open property; the shared facing/half/hinge remain.
+    if (nextBlock === 'door_open') delete nextState.open
+    const committed = commitBlockEdits([{ at, block: nextBlock, state: nextState }])
     if (Result.isFailure(committed)) return Result.fail(committed.failure)
     Result.getOrThrow(advanceRevision())
     notifyStateChanged()
@@ -2845,6 +2853,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         disturbFallingBlocks([message.at])
         return {
           accepted: true,
+          worldSnapshotRequired: true,
           frames: [committed.success.frame],
           deltas: (nextRevision) => [
             ...(selected.item === 'fire_charge'
