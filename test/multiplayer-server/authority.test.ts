@@ -15,7 +15,7 @@ import {
   AIR_BLOCK_ID, BlockAxis, blockIdOf, defaultBlockState, CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, type ChunkCoord, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
   PositionAxis, SimulationTick, position, itemStackFromUnknown, type Position,
 } from '@nerima-games/mc-kernel'
-import { CHEST_CONTAINER_CAPACITY, HOPPER_CONTAINER_CAPACITY, containerCapacity, DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
+import { CHEST_CONTAINER_CAPACITY, DISPENSER_CONTAINER_CAPACITY, HOPPER_CONTAINER_CAPACITY, containerCapacity, DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
 import { CHUNK_VOLUME, type ChunkSource, type ChunkStoreApi, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import {
   chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, openChunkWindow, planMobMovementRoster,
@@ -30,7 +30,6 @@ import {
   type MultiplayerServerOptions,
   playerDamageResultKey,
   type MultiplayerServerState,
-  type MultiplayerServerInitialState,
   type ReceiveResult,
 } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerRedstoneRuntime } from '../../apps/multiplayer-server/redstone-runtime'
@@ -99,7 +98,7 @@ const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage
     return decoded.success
   })
 
-const initialState = (): MultiplayerServerInitialState => ({
+const initialState = (): MultiplayerServerState => ({
   revision: 4,
   blocks: [
     { at: { x: 1, y: 64, z: 0 }, block: 'chest' },
@@ -118,7 +117,7 @@ const initialState = (): MultiplayerServerInitialState => ({
   }],
   vitals: [{ player: playerId('alice'), state: { health: 3, hunger: 2, experience: 7 } }],
   timeWeather: { timeOfDay: 6_000, weather: 'clear' },
-  containers: [{ containerId: 'world-1:1,64,0', kind: 'chest', slots: [null, { item: 'apple', count: 2 }] }],
+  containers: [{ containerId: 'overworld:1,64,0', kind: 'chest', slots: [null, { ...Result.getOrThrow(itemStackFromUnknown('apple', 2)), durability: null }, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 2 }, () => null)] }],
   furnaces: [{
     furnaceId: '["world-1",2,64,0]',
     input: null,
@@ -165,7 +164,7 @@ const edgeAt = { x: Number.MAX_SAFE_INTEGER - 1, y: 64, z: 0 }
  * player gives it no acceleration, and its melee reaches 2.25 blocks from the stepped feet, so a 0.4 s step at speed 5
  * moves it 2 blocks and still hits.
  */
-const edgeWitherState = (velocityX: number): MultiplayerServerInitialState => ({
+const edgeWitherState = (velocityX: number): MultiplayerServerState => ({
   ...initialState(),
   vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
   wither: {
@@ -194,7 +193,7 @@ const edgeWitherState = (velocityX: number): MultiplayerServerInitialState => ({
 })
 
 const makeFixture = (
-  state: MultiplayerServerInitialState = initialState(),
+  state: MultiplayerServerState = initialState(),
   joinAt: Readonly<{ x: number; y: number; z: number }> = { x: 0, y: 64, z: 0 },
   difficulty: 'peaceful' | 'easy' | 'normal' | 'hard' = 'normal',
   serverOptions: Partial<Pick<MultiplayerServerOptions, 'allowedBlocks' | 'chunkSource' | 'now' | 'passableBlocks' | 'spawnAt'>> = {},
@@ -899,7 +898,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('fails a tick with a typed failure when it cannot advance the revision or the simulation tick', () => {
-    const state: MultiplayerServerInitialState = {
+    const state: MultiplayerServerState = {
       ...initialState(),
       revision: Number.MAX_SAFE_INTEGER,
       entities: [{
@@ -937,7 +936,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('leaves positions and health unchanged when the entity step cannot advance the revision', () => {
-    const state = (revision: number): MultiplayerServerInitialState => ({
+    const state = (revision: number): MultiplayerServerState => ({
       ...initialState(),
       revision,
       vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
@@ -1113,7 +1112,7 @@ describe('multiplayer server authoritative state', () => {
   const unreadableChunkFailure = { _tag: 'BlockOverrideNotInRegistry', ...unreadableChunkBlock }
 
   it('publishes the completed time step when the furnace step fails on a loaded item it cannot read', () => {
-    const state: MultiplayerServerInitialState = {
+    const state: MultiplayerServerState = {
       ...initialState(),
       furnaces: [{
         furnaceId: '["world-1",2,64,0]', input: { item: 'legacy_ore', count: 1 }, fuel: null, output: null,
@@ -1141,7 +1140,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('undoes the entity step when an arrow reads a chunk it cannot load after earlier entities changed state', () => {
-    const state: MultiplayerServerInitialState = {
+    const state: MultiplayerServerState = {
       ...initialState(),
       vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
       blocks: [...initialState().blocks, { at: { x: 11, y: 64, z: 0 }, block: 'stone' }, unreadableChunkBlock],
@@ -1178,7 +1177,7 @@ describe('multiplayer server authoritative state', () => {
 
   // R-SV3b's input: an arrow in a chunk whose saved block name the registry lacks. Load validation now rejects that
   // save, so the core is built here from initialState directly to reach the runtime path.
-  const arrowInUnreadableChunk: MultiplayerServerInitialState = {
+  const arrowInUnreadableChunk: MultiplayerServerState = {
     ...initialState(),
     blocks: [...initialState().blocks, { at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }],
     entities: [{
@@ -1209,7 +1208,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('sends a completed furnace step only after persisting it when a later step of the tick fails', () => {
-    const state: MultiplayerServerInitialState = {
+    const state: MultiplayerServerState = {
       ...arrowInUnreadableChunk,
       furnaces: [{
         furnaceId: '["world-1",2,64,0]', input: { item: 'iron_ore', count: 1 }, fuel: { item: 'coal', count: 1 }, output: null,
@@ -1232,7 +1231,7 @@ describe('multiplayer server authoritative state', () => {
   it('keeps a skull explosion out of an unloaded corrupt chunk and reports corruption when that chunk is read', () => {
     const playerAt = { x: 15.7, y: 64, z: 0.5 }
     const unreadable = { at: { x: 20, y: 64, z: 0 }, block: 'legacy_unknown' }
-    const state: MultiplayerServerInitialState = {
+    const state: MultiplayerServerState = {
       ...initialState(),
       vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
       blocks: [...initialState().blocks, unreadable],
@@ -3427,7 +3426,7 @@ describe('multiplayer server authoritative state', () => {
   const pastureTerrain = floorTerrain(63, 'stone')
   const cowStart = { x: 0, y: 64, z: 8 }
   const pastureJoinAt = { x: -2, y: 64, z: 8 }
-  const pastureState = (): MultiplayerServerInitialState => ({
+  const pastureState = (): MultiplayerServerState => ({
     ...initialState(),
     entities: [{ _tag: 'living', entityId: entityId('cow-1'), entityType: 'cow', at: cowStart, health: 10, maxHealth: 10 }],
   })
@@ -3571,7 +3570,7 @@ describe('multiplayer server authoritative state', () => {
     // A saved block name the registry lacks, in a chunk inside the cow's movement window. Load validation rejects
     // such a save, so the core is built from initialState directly to reach the runtime path.
     const unreadable = { at: { x: 20, y: 64, z: 8 }, block: 'legacy_unknown' }
-    const state: MultiplayerServerInitialState = { ...pastureState(), blocks: [...initialState().blocks, unreadable] }
+    const state: MultiplayerServerState = { ...pastureState(), blocks: [...initialState().blocks, unreadable] }
     const untouched = makeFixture(state, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
     const fixture = makeFixture(state, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
     fixture.sent.length = 0
@@ -3651,7 +3650,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   // R-SV3b's input: a cow on a stone floor with no saved edits, two blocks from where a player may stand.
-  const fleeState = (): MultiplayerServerInitialState => ({
+  const fleeState = (): MultiplayerServerState => ({
     ...initialState(),
     blocks: [],
     containers: [],
@@ -3713,7 +3712,7 @@ describe('multiplayer server authoritative state', () => {
   it('leaves a living entity of an unsupported kind untouched instead of repairing its state', () => {
     // R-SV3b's input: state decoding admits any entity type and any finite motion phase, and load validation skips
     // kinds mx-gameplay does not simulate, so this phase never meets the repair that rejects it.
-    const state: MultiplayerServerInitialState = {
+    const state: MultiplayerServerState = {
       ...initialState(),
       entities: [{
         _tag: 'living', entityId: entityId('custom-1'), entityType: 'custom-mob', at: { x: 0, y: 64, z: 0 },
@@ -4142,7 +4141,7 @@ describe('multiplayer server authoritative state', () => {
         { at: { x: 20, y: 64, z: 0 }, block: 'chest' },
         { at: { x: 21, y: 64, z: 0 }, block: 'furnace' },
       ],
-      containers: [{ containerId: 'world-1:20,64,0', kind: 'chest', slots: [] }],
+      containers: [{ containerId: 'overworld:20,64,0', kind: 'chest', slots: Array.from({ length: CHEST_CONTAINER_CAPACITY }, () => null) }],
       furnaces: [{
         furnaceId: '["world-1",21,64,0]',
         input: null,
@@ -4381,9 +4380,9 @@ describe('multiplayer server authoritative state', () => {
         { at: { x: 1, y: 63, z: 0 }, block: 'chest' },
       ],
       containers: [
-        { containerId: 'world-1:1,65,0', kind: 'chest', slots: [{ item: 'apple', count: 2 }] },
-        { containerId: 'world-1:1,64,0', kind: 'hopper', slots: Array.from({ length: 5 }, () => null) },
-        { containerId: 'world-1:1,63,0', kind: 'chest', slots: Array.from({ length: 27 }, () => null) },
+        { containerId: 'overworld:1,65,0', kind: 'chest', slots: [{ ...Result.getOrThrow(itemStackFromUnknown('apple', 2)), durability: null }, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)] },
+        { containerId: 'overworld:1,64,0', kind: 'hopper', slots: Array.from({ length: HOPPER_CONTAINER_CAPACITY }, () => null) },
+        { containerId: 'overworld:1,63,0', kind: 'chest', slots: Array.from({ length: CHEST_CONTAINER_CAPACITY }, () => null) },
       ],
       furnaces: [],
     })
@@ -4439,7 +4438,7 @@ describe('multiplayer server authoritative state', () => {
         { at: { x: 1, y: 64, z: 0 }, block: 'dispenser' },
       ],
       containers: [
-        { containerId: 'world-1:1,64,0', kind: 'dispenser', slots: [{ item: 'apple', count: 2 }, ...Array.from({ length: 8 }, () => null)] },
+        { containerId: 'overworld:1,64,0', kind: 'dispenser', slots: [{ ...Result.getOrThrow(itemStackFromUnknown('apple', 2)), durability: null }, ...Array.from({ length: DISPENSER_CONTAINER_CAPACITY - 1 }, () => null)] },
       ],
       furnaces: [],
     })
@@ -4479,7 +4478,7 @@ describe('multiplayer server authoritative state', () => {
         { at: { x: 1, y: 64, z: 0 }, block: 'dropper' },
       ],
       containers: [
-        { containerId: 'world-1:1,64,0', kind: 'dropper', slots: [{ item: 'apple', count: 2 }, ...Array.from({ length: 8 }, () => null)] },
+        { containerId: 'overworld:1,64,0', kind: 'dropper', slots: [{ ...Result.getOrThrow(itemStackFromUnknown('apple', 2)), durability: null }, ...Array.from({ length: DISPENSER_CONTAINER_CAPACITY - 1 }, () => null)] },
       ],
       furnaces: [],
     })
@@ -4555,7 +4554,7 @@ describe('multiplayer server authoritative state', () => {
         { at: { x: 0, y: 64, z: -1 }, block: 'redstone_lamp' },
       ],
       containers: [
-        { containerId: 'world-1:0,64,1', kind: 'chest', slots: [{ item: 'apple', count: 32 }, ...Array.from({ length: 26 }, () => null)] },
+        { containerId: 'overworld:0,64,1', kind: 'chest', slots: [{ ...Result.getOrThrow(itemStackFromUnknown('apple', 32)), durability: null }, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)] },
       ],
       furnaces: [],
     })

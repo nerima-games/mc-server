@@ -225,48 +225,36 @@ export const makeMultiplayerRedstoneRuntime = async (
           }
           const sync = yield* Effect.result(runtime.syncSnapshot({ dimension: dimension.success, components }))
           if (Result.isFailure(sync)) return Result.fail({ _tag: 'RedstoneSnapshotSyncFailure', failure: sync.failure })
-        for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
-          for (const stage of stages) {
-            yield* stage.run(gameTickSecs).pipe(Effect.provide(ServerClockLayer))
+          for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
+            for (const stage of stages) {
+              yield* stage.run(gameTickSecs).pipe(Effect.provide(ServerClockLayer))
+            }
           }
-        }
-        for (const event of (yield* runtime.drainTriggerEvents)) {
-          const core = realmsByDimension.get(event.dimension)?.core
-          if (core === undefined) continue
-          let result: Result.Result<boolean, MultiplayerServerCoreFailure>
-          if (event.kind === 'dispenser') {
-            result = core.applyDispenserTrigger(event.position)
-          } else if (event.kind === 'dropper') {
-            result = core.applyDropperTrigger(event.position)
-          } else {
-            continue
-          }
-          if (Result.isFailure(result)) {
-            if (result.failure._tag === 'UnsupportedContainerItemComponents' || result.failure._tag === 'ContainerStorageFailure') {
-              console.error('Multiplayer redstone container transfer failed', { dimension: event.dimension, position: event.position, failure: result.failure })
+          for (const event of (yield* runtime.drainTriggerEvents)) {
+            const core = realmsByDimension.get(event.dimension)?.core
+            if (core === undefined) continue
+            let result: Result.Result<boolean, MultiplayerServerCoreFailure>
+            if (event.kind === 'dispenser') {
+              result = core.applyDispenserTrigger(event.position)
+            } else if (event.kind === 'dropper') {
+              result = core.applyDropperTrigger(event.position)
+            } else {
               continue
             }
-            return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
-          }
-        }
-        for (const event of (yield* runtime.drainLampTransitions)) {
-          const result = realmsByDimension.get(event.dimension)?.core.applyRedstoneBlockState(
-            event.position,
-            lampBlocks,
-            event.lit ? 'redstone_lamp_lit' : 'redstone_lamp',
-          )
-          if (result !== undefined && Result.isFailure(result)) {
-            if (result.failure._tag === 'WorldWriteFailure') {
-              console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.position, failure: result.failure })
-              continue
+            if (Result.isFailure(result)) {
+              if (result.failure._tag === 'UnsupportedContainerItemComponents' || result.failure._tag === 'ContainerStorageFailure') {
+                console.error('Multiplayer redstone container transfer failed', { dimension: event.dimension, position: event.position, failure: result.failure })
+                continue
+              }
+              return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
             }
-            return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
           }
-        }
-        for (const event of (yield* runtime.drainPoweredComponentTransitions)) {
-          const core = realmsByDimension.get(event.dimension)?.core
-          if (event.kind === 'door') {
-            const result = core?.applyRedstoneBlockState(event.position, doorBlocks, event.powered ? 'door_open' : 'door')
+          for (const event of (yield* runtime.drainLampTransitions)) {
+            const result = realmsByDimension.get(event.dimension)?.core.applyRedstoneBlockState(
+              event.position,
+              lampBlocks,
+              event.lit ? 'redstone_lamp_lit' : 'redstone_lamp',
+            )
             if (result !== undefined && Result.isFailure(result)) {
               if (result.failure._tag === 'WorldWriteFailure') {
                 console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.position, failure: result.failure })
@@ -274,51 +262,63 @@ export const makeMultiplayerRedstoneRuntime = async (
               }
               return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
             }
-          } else if (event.kind === 'powered-rail') {
-            const result = core?.applyPoweredRailState(event.position, event.powered)
-            if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
           }
-        }
-        for (const event of (yield* runtime.drainPistonTransitions)) {
-          const realm = realmsByDimension.get(event.dimension)
-          if (realm === undefined) continue
-          const pistonCapabilities = makePistonCapabilities()
-          let pistonReadFailure: MultiplayerServerCoreFailure | undefined
-          const outcome = planPistonTransition(event, {
-            read: (at) => {
-              const read = realm.core.readPistonCell(at)
-              if (Result.isFailure(read)) {
-                pistonReadFailure ??= read.failure
-                return { kind: 'out-of-world' }
+          for (const event of (yield* runtime.drainPoweredComponentTransitions)) {
+            const core = realmsByDimension.get(event.dimension)?.core
+            if (event.kind === 'door') {
+              const result = core?.applyRedstoneBlockState(event.position, doorBlocks, event.powered ? 'door_open' : 'door')
+              if (result !== undefined && Result.isFailure(result)) {
+                if (result.failure._tag === 'WorldWriteFailure') {
+                  console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.position, failure: result.failure })
+                  continue
+                }
+                return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
               }
-              return read.success
-            }
-          }, pistonCapabilities.capabilities)
-          if (pistonReadFailure !== undefined) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: pistonReadFailure })
-          const capabilityFailure = pistonCapabilities.failure()
-          if (capabilityFailure !== undefined) {
-            return Result.fail({ _tag: 'PistonCapabilityFailure', failure: capabilityFailure })
-          }
-          if (outcome.kind === 'failed') {
-            return Result.fail({
-              _tag: 'PistonCapabilityFailure',
-              failure: { _tag: 'BlockCapabilityResolutionFailure', failure: outcome.failure },
-            })
-          }
-          if (outcome.kind === 'move') {
-            const result = realm.core.applyPistonPlan(outcome.plan)
-            if (Result.isFailure(result)) {
-              if (result.failure._tag === 'WorldWriteFailure') {
-                console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.piston, failure: result.failure })
-                continue
-              }
-              return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+            } else if (event.kind === 'powered-rail') {
+              const result = core?.applyPoweredRailState(event.position, event.powered)
+              if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
             }
           }
-        }
+          for (const event of (yield* runtime.drainPistonTransitions)) {
+            const realm = realmsByDimension.get(event.dimension)
+            if (realm === undefined) continue
+            const pistonCapabilities = makePistonCapabilities()
+            let pistonReadFailure: MultiplayerServerCoreFailure | undefined
+            const outcome = planPistonTransition(event, {
+              read: (at) => {
+                const read = realm.core.readPistonCell(at)
+                if (Result.isFailure(read)) {
+                  pistonReadFailure ??= read.failure
+                  return { kind: 'out-of-world' }
+                }
+                return read.success
+              }
+            }, pistonCapabilities.capabilities)
+            if (pistonReadFailure !== undefined) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: pistonReadFailure })
+            const capabilityFailure = pistonCapabilities.failure()
+            if (capabilityFailure !== undefined) {
+              return Result.fail({ _tag: 'PistonCapabilityFailure', failure: capabilityFailure })
+            }
+            if (outcome.kind === 'failed') {
+              return Result.fail({
+                _tag: 'PistonCapabilityFailure',
+                failure: { _tag: 'BlockCapabilityResolutionFailure', failure: outcome.failure },
+              })
+            }
+            if (outcome.kind === 'move') {
+              const result = realm.core.applyPistonPlan(outcome.plan)
+              if (Result.isFailure(result)) {
+                if (result.failure._tag === 'WorldWriteFailure') {
+                  console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.piston, failure: result.failure })
+                  continue
+                }
+                return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+              }
+            }
+          }
           const hopper = yield* realm.core.applyHopperEvents(runtime)
           if (Result.isFailure(hopper)) {
-            if (hopper.failure._tag === 'HopperFailure') {
+            if (hopper.failure._tag === 'HopperFailure' || hopper.failure._tag === 'RevisionExhausted') {
               console.error('Multiplayer hopper transfer failed', { dimension: realm.dimension, failure: hopper.failure })
               continue
             }

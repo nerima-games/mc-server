@@ -7,7 +7,7 @@ import { dirname } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 
-import { AIR_BLOCK_ID, blockIdOf, BlockStateValuesSchema, encodeBlockState, isBlockType } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, blockIdOf, BlockPositionSchema, BlockStateValuesSchema, encodeBlockState, isBlockType } from '@nerima-games/mc-kernel'
 import { containerCapacity, CONTAINER_STORAGE_SNAPSHOT_VERSION, ContainerStorageSnapshotSchema, durabilityForItem, DurabilitySchema, isDamageableItemType, isValidDurabilityForItem, LegacyItemStackSchema, type ContainerStoredStack, type Durability } from '@nerima-games/mc-sim'
 import {
   CHUNK_HEIGHT,
@@ -203,6 +203,28 @@ interface PersistedServerState {
 }
 
 type SavedItemStackFailure = Extract<MultiplayerServerCoreFailure, { _tag: 'SavedItemStackFailure' }>
+
+type SavedContainerIdFailure = Extract<MultiplayerServerCoreFailure, { _tag: 'SavedContainerIdInvalid' }>
+type ServerStateWriteFailure = SavedItemStackFailure | SavedContainerIdFailure
+const migratedContainerId = (value: unknown, worldId: string, format: 1 | 2): Result.Result<string, ServerStateWriteFailure> => {
+  const parsed = Schema.decodeUnknownResult(Schema.String)(value)
+  if (Result.isFailure(parsed)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: parsed.failure })
+  const id = parsed.success
+  const dimension = dimensionForWorld(worldId)
+  const prefix = format === 1 ? worldId : dimension
+  if (!id.startsWith(`${prefix}:`)) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  const suffix = id.slice(prefix.length + 1)
+  const match = /^(-?\d+),(-?\d+),(-?\d+)$/.exec(suffix)
+  if (match === null || match[0] !== suffix) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  const position = Schema.decodeUnknownResult(BlockPositionSchema)({ x: Number(match[1]), y: Number(match[2]), z: Number(match[3]) })
+  if (Result.isFailure(position) || position.success.y < 0 || position.success.y >= CHUNK_HEIGHT) {
+    return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  }
+  const canonical = `${dimension}:${String(position.success.x)},${String(position.success.y)},${String(position.success.z)}`
+  if (format === 2 && id !== canonical) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  return Result.succeed(canonical)
+}
+
 type SavedItemTransform = Readonly<{
   state: unknown
   containerItems: ReadonlyMap<string, ContainerStoredStack>
@@ -231,14 +253,6 @@ const transformSavedItems = (
     if (Result.isFailure(fields)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: fields.failure })
     const stack = record.success
     const container = path.startsWith('containers.')
-    if (direction === 'read' && format === 1 && !container) {
-      if (Object.hasOwn(stack, 'components')) {
-        const components = Schema.decodeUnknownResult(Schema.Null)(stack['components'])
-        if (Result.isFailure(components)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: components.failure })
-      }
-      const { components: _components, ...wire } = stack
-      return Result.succeed(wire)
-    }
     if (direction === 'read' && format === 1 && Object.hasOwn(stack, 'components')) {
       const components = Schema.decodeUnknownResult(Schema.Null)(stack['components'])
       if (Result.isFailure(components)) return Result.fail({ _tag: 'SavedItemStackFailure', path, failure: components.failure })
@@ -312,14 +326,18 @@ const transformSavedItems = (
 
 const validatePersistentContainers = (
   containers: MultiplayerServerState['containers'],
-): Result.Result<void, SavedItemStackFailure> => {
+  worldId: string,
+): Result.Result<void, ServerStateWriteFailure> => {
+  for (const container of containers) {
+    const id = migratedContainerId(container.containerId, worldId, 2)
+    if (Result.isFailure(id)) return Result.fail(id.failure)
+  }
   const decoded = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({
     version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
     containers: containers.map(({ containerId, kind, slots }) => ({ id: containerId, kind, slots })),
   })
-  return Result.isFailure(decoded)
-    ? Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: decoded.failure })
-    : Result.succeed(undefined)
+  if (Result.isFailure(decoded)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: decoded.failure })
+  return Result.succeed(undefined)
 }
 
 const isBlockPos = (value: unknown): value is BlockPos => {
@@ -512,10 +530,22 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
         }
       })
     : savedContainers
+  const canonicalIds: Array<unknown> = []
+  if (Array.isArray(migratedContainers)) {
+    for (const container of migratedContainers) {
+      if (!isRecord(container) || typeof container['containerId'] !== 'string') {
+        canonicalIds.push(container)
+        continue
+      }
+      const id = migratedContainerId(container['containerId'], worldId, format)
+      if (Result.isFailure(id)) return Result.fail(id.failure)
+      canonicalIds.push({ ...container, containerId: id.success })
+    }
+  }
   const stored = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({
     version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
     containers: Array.isArray(migratedContainers)
-      ? migratedContainers.map((container, containerIndex) => !isRecord(container) ? container : ({
+      ? canonicalIds.map((container, containerIndex) => !isRecord(container) ? container : ({
           id: container['containerId'], kind: container['kind'],
           slots: Array.isArray(container['slots'])
             ? container['slots'].map((slot, slotIndex) => slot === null ? null
@@ -611,10 +641,10 @@ export const writeServerState = async (
   worldId: string,
   seed: number,
   state: MultiplayerServerState,
-): Promise<Result.Result<void, SavedItemStackFailure>> => {
+): Promise<Result.Result<void, ServerStateWriteFailure>> => {
   const encoded = transformSavedItems(state, 2, 'write')
   if (Result.isFailure(encoded)) return Result.fail(encoded.failure)
-  const validContainers = validatePersistentContainers(state.containers)
+  const validContainers = validatePersistentContainers(state.containers, worldId)
   if (Result.isFailure(validContainers)) return validContainers
   await mkdir(dirname(path), { recursive: true })
   const temporaryPath = `${path}.${String(process.pid)}.${randomUUID()}.tmp`
@@ -631,14 +661,16 @@ export type LatestStatePersistence<State> = {
 
 export const createLatestStatePersistence = <State>(
   write: (state: State) => Promise<void>,
+  onFailure: (failure: unknown) => void,
 ): LatestStatePersistence<State> => {
   let pending!: State
   let hasPending = false
   let running: Promise<void> | undefined
   let failure: unknown
+  let failed = false
 
   const start = (): void => {
-    if (running !== undefined || !hasPending) return
+    if (running !== undefined || !hasPending || failed) return
     let complete!: () => void
     running = new Promise<void>((resolve) => { complete = resolve })
     void (async () => {
@@ -647,34 +679,34 @@ export const createLatestStatePersistence = <State>(
         hasPending = false
         try {
           await write(state)
-          failure = undefined
         } catch (error: unknown) {
-          if (!hasPending) {
-            pending = state
-            hasPending = true
-          }
           failure = error
+          failed = true
+          hasPending = false
+          onFailure(error)
           return
         }
       }
     })().finally(() => {
       running = undefined
-      if (hasPending && failure === undefined) start()
+      if (hasPending && !failed) start()
       complete()
     })
   }
 
   return {
     request: (state) => {
+      if (failed) return
       pending = state
       hasPending = true
       start()
     },
     drain: async () => {
+      if (failed) throw failure
       while (running !== undefined || hasPending) {
         start()
         await running
-        if (failure !== undefined) throw failure
+        if (failed) throw failure
       }
     },
   }
@@ -744,10 +776,21 @@ export const startMultiplayerServer = async (
     ? undefined
     : await loadLegacyPlayerClaims(options.legacyPlayerClaimsFile)
   const reconnectAuth = await createReconnectAuth(stateFile)
+  let persistenceFailed = false
+  const onPersistenceFailure = (failure: unknown): void => {
+    if (persistenceFailed) return
+    persistenceFailed = true
+    console.error('Multiplayer state persistence failed', { failure })
+    if (options.installSignalHandlers === true) process.exitCode = 1
+    void close().catch((shutdownFailure: unknown) => {
+      if (shutdownFailure !== failure) console.error('Multiplayer server shutdown failed', { failure: shutdownFailure })
+    })
+  }
   const persistence = stateFile === undefined
     ? undefined
     : createLatestStatePersistence(async (state: MultiplayerServerState) =>
         Result.getOrThrow(await writeServerState(stateFile, options.worldId, options.seed, state)),
+        onPersistenceFailure,
       )
   const endStateFile = stateFile === undefined ? undefined : `${stateFile}.end`
   const endInitialStateResult = endStateFile === undefined
@@ -759,6 +802,7 @@ export const startMultiplayerServer = async (
     ? undefined
     : createLatestStatePersistence(async (state: MultiplayerServerState) =>
         Result.getOrThrow(await writeServerState(endStateFile, 'end', options.seed, state)),
+        onPersistenceFailure,
       )
   const netherStateFile = stateFile === undefined ? undefined : `${stateFile}.nether`
   const netherInitialStateResult = netherStateFile === undefined
@@ -770,6 +814,7 @@ export const startMultiplayerServer = async (
     ? undefined
     : createLatestStatePersistence(async (state: MultiplayerServerState) =>
         Result.getOrThrow(await writeServerState(netherStateFile, 'nether', options.seed, state)),
+        onPersistenceFailure,
       )
   const endSpawnAt: BlockPos = { x: 0, y: 64, z: 0 }
   const overworldNetherPortalAt: BlockPos = { x: overworldSpawnAt.x - 1, y: overworldSpawnAt.y, z: overworldSpawnAt.z }
@@ -1017,7 +1062,7 @@ export const startMultiplayerServer = async (
       pendingFrameCount += 1
       pendingFrameBytes += frameBytes
       _messageQueue = _messageQueue.then(async () => {
-        if (disconnected) return
+        if (disconnected || persistenceFailed) return
         if (activePlayer !== undefined) {
           const realm = activeRealms.get(clientId)
           if (realm === undefined) {
@@ -1091,7 +1136,9 @@ export const startMultiplayerServer = async (
     const elapsedMs = now - lastTickAt
     lastTickAt = now
     pendingServerTick = pendingServerTick.then(async () => {
+      if (persistenceFailed) return
       const redstoneResult = await Effect.runPromise(redstoneRuntime.tick(elapsedMs))
+      if (persistenceFailed) return
       if (Result.isFailure(redstoneResult)) {
         console.error('Multiplayer redstone tick failed', { failure: redstoneResult.failure })
       }
@@ -1113,7 +1160,7 @@ export const startMultiplayerServer = async (
   }, 50)
   let closing: Promise<void> | undefined
   const signalHandlers = new Map<NodeJS.Signals, () => void>()
-  const close = (): Promise<void> => {
+  function close(): Promise<void> {
     if (closing !== undefined) return closing
     closing = new Promise<void>((resolve, reject) => {
       clearInterval(serverTickTimer)

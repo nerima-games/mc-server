@@ -28,10 +28,10 @@ import {
   SurvivalAuthority,
   type SurvivalEvent,
 } from '@nerima-games/mx-multiplayer'
-import { maxStackCountForStack, BlockStateFacingSchema, type BlockStateFacing, itemStackEqualsIgnoringCount, AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { itemStackFromUnknown, maxStackCountForStack, BlockStateFacingSchema, type BlockStateFacing, itemStackEqualsIgnoringCount, AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { ContainerSlotSchema, applyRedstoneHostEvents, type RedstoneWorldRuntimeService, type RedstoneHostLookup, type RedstoneHostWritePort, PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { blockIndex, readBlock, type Chunk, type ChunkWithBlockStates, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
-import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange, DurabilitySchema, durabilityForItem, type ContainerStoredStack, type Container, type ContainerStorageSnapshot, type ContainerStorageServiceApi, type HopperServiceApi, type ContainerStorageServiceFailure, ContainerStorageSnapshotSchema, containerStorageOwnerRegistration, hopperOwnerRegistration, LegacyItemStackSchema, CONTAINER_STORAGE_REPLICATED_OWNER_ID, type ReplicatedOwnerCandidate, type WorldCommitRequest } from '@nerima-games/mc-sim'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange, type ContainerStoredStack, type Container, type ContainerStorageSnapshot, type ContainerStorageServiceApi, type HopperServiceApi, type ContainerStorageServiceFailure, ContainerStorageSnapshotSchema, containerStorageOwnerRegistration, hopperOwnerRegistration, CONTAINER_STORAGE_REPLICATED_OWNER_ID, type ReplicatedOwnerCandidate } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -144,7 +144,7 @@ import {
   type SurvivalHungerState,
   type StatusEffectApplication,
 } from '@nerima-games/mx-gameplay'
-import { Brand, Effect, Option, Result, Schema } from 'effect'
+import { Brand, Cause, Effect, Exit, Option, Result, Schema } from 'effect'
 import {
   SleepAuthority,
   decodeSleepWireMessage,
@@ -425,6 +425,7 @@ export interface MultiplayerServerCoreParts {
   readonly makeWorldWrite: (options: ServerWorldWriteOptions) => Result.Result<ServerWorldWrite, WorldCommitCoordinatorError>
   readonly generateChunk: (source: ChunkSource, coord: ChunkCoord) => Result.Result<Chunk, ChunkStoreError>
   readonly worldWriteRevisions: (write: ServerWorldWrite, dimension: Dimension) => Readonly<{ world: WorldRevision; dimension: DimensionRevision }>
+  readonly dieUnexpectedRedstoneRequest: () => never
   readonly dieInvalidBlockBatch: (failure: Exclude<WorldWriteInvalidBatch, { reason: 'invalid-block-state' }>) => never
   readonly makeContainerServices: (write: ServerWorldWrite) => Readonly<{ containers: ContainerStorageServiceApi; hoppers: HopperServiceApi }>
   readonly containerStorageSnapshot: (service: ContainerStorageServiceApi) => ContainerStorageSnapshot
@@ -453,7 +454,7 @@ export interface MultiplayerServerOptions {
   readonly parts: MultiplayerServerCoreParts
   readonly staticBlocks?: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null }>>
   readonly spawnAt: BlockPos
-  readonly initialState?: MultiplayerServerInitialState
+  readonly initialState?: MultiplayerServerState
   readonly onStateChanged?: (state: MultiplayerServerState) => void
   readonly maxMoveDistance?: number
   readonly passableBlocks?: ReadonlySet<string>
@@ -477,10 +478,6 @@ export interface WeatherClockState {
 
 export type PersistentContainerState = Omit<AuthoritativeSnapshot['containers'][number], 'slots'> & {
   readonly slots: ReadonlyArray<ContainerStoredStack | null>
-}
-
-export type MultiplayerServerInitialState = Omit<MultiplayerServerState, 'containers'> & {
-  readonly containers: ReadonlyArray<ContainerState | PersistentContainerState>
 }
 
 export interface MultiplayerServerState {
@@ -738,7 +735,7 @@ const isInAddressableCell = (at: Readonly<{ x: number; y: number; z: number }>):
  * mob the tick steps through mx-gameplay's ecosystem rules must have a state mx-gameplay can repair. A corrupt
  * save then fails at load instead of stopping each tick.
  */
-export const validateLoadedServerState = (state: MultiplayerServerInitialState): Result.Result<void, MultiplayerServerCoreFailure> => {
+export const validateLoadedServerState = (state: MultiplayerServerState): Result.Result<void, MultiplayerServerCoreFailure> => {
   const positioned = [
     ...(state.entities ?? []).map((entity) => ({ subject: 'entity' as const, id: String(entity.entityId), at: entity.at })),
     ...(state.playerPositions ?? []).map(({ player, at }) => ({ subject: 'player' as const, id: String(player), at })),
@@ -1027,17 +1024,6 @@ const wireContainerStack = (stack: ContainerStoredStack | null): ItemStack | nul
     item: stack.item, count: stack.count,
     ...(stack.durability === null ? {} : { durability: { ...stack.durability } }),
   }
-
-const canonicalContainerStack = (stack: ItemStack | ContainerStoredStack): Result.Result<ContainerStoredStack, Schema.SchemaError> => {
-  const decoded = Schema.decodeUnknownResult(LegacyItemStackSchema)({
-    item: stack.item, count: stack.count, components: 'components' in stack ? stack.components : null,
-  })
-  if (Result.isFailure(decoded)) return Result.fail(decoded.failure)
-  const durability = Schema.decodeUnknownResult(Schema.NullOr(DurabilitySchema))(
-    !('components' in stack) && !('durability' in stack) ? durabilityForItem(decoded.success.item) : stack.durability,
-  )
-  return Result.map(durability, (durability) => ({ ...decoded.success, durability }))
-}
 
 const hasNondefaultContainerComponents = (stack: ContainerStoredStack): boolean =>
   !itemStackEqualsIgnoringCount({ item: stack.item, count: stack.count, components: stack.components }, Result.getOrThrow(itemStack(stack.item, 1)))
@@ -1386,27 +1372,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const initialContainers: Array<Container> = []
   for (const state of options.initialState?.containers ?? []) {
     const match = /^([\s\S]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(state.containerId)
-    if (match === null || match[0] !== state.containerId || (match[1] !== options.worldId && match[1] !== dimension)) {
+    if (match === null || match[0] !== state.containerId || match[1] !== dimension) {
       return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: state.containerId })
     }
     const at = { x: Number(match[2]), y: Number(match[3]), z: Number(match[4]) }
     const address = Schema.decodeUnknownResult(BlockPositionSchema)(at)
-    if (Result.isFailure(address) || at.y < bounds.minY || at.y > bounds.maxY) {
+    if (Result.isFailure(address) || at.y < bounds.minY || at.y > bounds.maxY
+      || state.containerId !== `${dimension}:${String(at.x)},${String(at.y)},${String(at.z)}`) {
       return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: state.containerId })
     }
-    const slots: Array<ContainerStoredStack | null> = []
-    for (const [slot, stack] of state.slots.entries()) {
-      if (stack === null) { slots.push(null); continue }
-      const canonical = canonicalContainerStack(stack)
-      if (Result.isFailure(canonical)) return Result.fail({ _tag: 'SavedItemStackFailure', path: `containers.${state.containerId}.slots.${String(slot)}`, failure: canonical.failure })
-      slots.push(canonical.success)
-    }
-    const legacy = state.slots.every((stack) => stack === null || !('components' in stack))
-    if (legacy) {
-      const capacity = containerCapacity(state.kind)
-      while (slots.length < capacity) slots.push(null)
-    }
-    initialContainers.push({ id: `${dimension}:${String(at.x)},${String(at.y)},${String(at.z)}`, kind: state.kind, slots })
+    initialContainers.push({ id: state.containerId, kind: state.kind, slots: state.slots })
   }
   const initialStorage = Schema.decodeUnknownResult(ContainerStorageSnapshotSchema)({ version: 3, containers: initialContainers })
   if (Result.isFailure(initialStorage)) return Result.fail({ _tag: 'ContainerStorageFailure', failure: initialStorage.failure })
@@ -2323,8 +2298,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       if (Result.isFailure(facing)) return Result.fail(facing.failure)
       contexts.set(positionKey(event.position), { powered: !hopper.success.enabled, sourceAbove: above.success, destinationFacing: facing.success })
     }
-    const reserved = revisionAfter(1)
-    if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
     const expected = blockRevisions()
     const stagedEdits = new Map<string, WorldWriteBatch['edits'][number]>()
     const preparedCells = new Map<string, Readonly<{ beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
@@ -2350,12 +2323,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       readHopperTransferContext: (at) => Option.getOrThrow(Option.fromUndefinedOr(contexts.get(positionKey(at)))),
       readPistonCell: (at) => Result.getOrThrow(readPistonCell(at)),
     }
+    let ownRevisionFailure: MultiplayerServerCoreFailure | undefined
     let committed: BlockCommitDelta | undefined
     let frame: WireText | undefined
     const port: RedstoneHostWritePort<MultiplayerServerCoreFailure> = {
       coordinator: {
         ...worldWrite.success.coordinator,
         commit: (request) => Effect.gen(function* () {
+          const containers = request.changes.find((change) => change.ownerId === CONTAINER_STORAGE_REPLICATED_OWNER_ID)
+          if (containers !== undefined && JSON.stringify(containers.state) !== JSON.stringify(beforeStorage)) {
+            const reserved = revisionAfter(1)
+            if (Result.isFailure(reserved)) {
+              ownRevisionFailure = reserved.failure
+              // This public port admits only native commit errors; cancellation lets the helper restore its staged events.
+              return yield* Effect.interrupt
+            }
+          }
           let validatedRequest = request
           if (request.blockWrite !== undefined) {
             const edits: Array<WorldWriteBatch['edits'][number]> = []
@@ -2390,41 +2373,19 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: event.position, failure: state.failure })
         return prepare([{ at: event.position, block: 'hopper', state: state.success }], { world: revisions.expectedRevision, dimension: revisions.expectedDimensionRevision })
       },
-      buildCommitRequest: (batch, pistonPlans): Result.Result<WorldCommitRequest, MultiplayerServerCoreFailure> => {
-        const edits = new Map<string, BlockOverride>()
-        for (const event of batch.lamp) edits.set(positionKey(event.position), { at: event.position, block: event.lit ? 'redstone_lamp_lit' : 'redstone_lamp' })
-        for (const event of batch.powered) {
-          if (event.kind !== 'door') continue
-          const current = world.readCell(event.position)
-          if (Result.isFailure(current)) return Result.fail(current.failure)
-          const state = decodeBlockState(current.success.block, current.success.state)
-          if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: event.position, failure: state.failure })
-          const next = { ...state.success }
-          if (event.powered) delete next.open
-          edits.set(positionKey(event.position), { at: event.position, block: event.powered ? 'door_open' : 'door', state: next })
-        }
-        for (const plan of pistonPlans) {
-          if (Result.isFailure(pistonHeadOffsetResult)) return Result.fail({ _tag: 'PistonHeadOffsetFailure', failure: pistonHeadOffsetResult.failure })
-          const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffsetResult.success)
-          for (const move of plan.moves) {
-            const current = world.readCell(move.from)
-            if (Result.isFailure(current)) return Result.fail(current.failure)
-            const state = decodeBlockState(current.success.block, current.success.state)
-            if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: move.from, failure: state.failure })
-            edits.set(positionKey(move.to), { at: move.to, block: move.block, state: state.success })
-          }
-          for (const move of plan.moves) if (!edits.has(positionKey(move.from))) edits.set(positionKey(move.from), { at: move.from, block: null })
-          if (plan.toState === 'extended') edits.set(positionKey(head), { at: head, block: 'piston_head' })
-          else if (plan.moves.length === 0) edits.set(positionKey(head), { at: head, block: null })
-        }
-        const request = { expectedRevision: expected.world, expectedDimensions: [{ dimension, expectedRevision: expected.dimension }], changes: containerChangesFor([...edits.values()]) }
-        if (edits.size === 0) return Result.succeed(request)
-        const blockWrite = prepare([...edits.values()])
-        return Result.map(blockWrite, (blockWrite) => ({ ...request, blockWrite }))
-      },
+      // The host drains every non-hopper queue before this bridge runs.
+      buildCommitRequest: () => options.parts.dieUnexpectedRedstoneRequest(),
     }
     yield* runtime.restoreEvents({ hopper: events, trigger: [], lamp: [], powered: [], piston: [] })
-    const applied = yield* Effect.result(applyRedstoneHostEvents(runtime, [{ dimension: hostDimension, lookup }], port))
+    const attempted = yield* Effect.exit(Effect.result(applyRedstoneHostEvents(runtime, [{ dimension: hostDimension, lookup }], port)))
+    if (Exit.isFailure(attempted)) {
+      if (ownRevisionFailure !== undefined && Cause.hasInterruptsOnly(attempted.cause)) {
+        yield* runtime.drainHopperTransferEvents
+        return Result.fail(ownRevisionFailure)
+      }
+      return yield* Effect.failCause(attempted.cause)
+    }
+    const applied = attempted.value
     if (Result.isFailure(applied)) {
       yield* runtime.drainHopperTransferEvents
       return Result.fail({ _tag: 'HopperFailure', failure: applied.failure })
@@ -3783,7 +3744,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           const stored = container.slots[containerSlot]
           if (stored !== null && stored !== undefined && hasNondefaultContainerComponents(stored)) return { accepted: false, reason: 'invalid-command' }
           const containerSlots = container.slots.map(wireContainerStack)
-          const playerSlots = inventory.slots.map(cloneStack)
+          const playerSlots = inventory.slots.map((stack, index) => {
+            const durability = inventory.durability[index]
+            return stack === null || durability === null || durability === undefined
+              ? cloneStack(stack)
+              : { ...stack, durability: { ...durability } }
+          })
           const reason = moveStack(
             playerIsSource ? playerSlots : containerSlots, message.action.source.slot,
             playerIsSource ? containerSlots : playerSlots, message.action.destination.slot,
@@ -3794,14 +3760,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           const changed = containerSlots[containerSlot]
           if (changed === null || changed === undefined) slots[containerSlot] = null
           else {
-            const stack = canonicalContainerStack(changed)
-            if (Result.isFailure(stack)) return rejectBlockRead({ _tag: 'SavedItemStackFailure', path: `containers.${message.containerId}.slots.${String(containerSlot)}`, failure: stack.failure })
-            slots[containerSlot] = stack.success
+            const stack = itemStackFromUnknown(changed.item, changed.count)
+            if (Result.isFailure(stack)) return rejectBlockRead({ _tag: 'ItemStackFailure', failure: stack.failure })
+            slots[containerSlot] = { ...stack.success, durability: changed.durability === undefined ? null : changed.durability }
           }
           next = { ...container, slots }
           const committed = commitStorage(next)
           if (Result.isFailure(committed)) return rejectBlockRead(committed.failure)
           inventory.slots.splice(0, inventory.slots.length, ...playerSlots)
+          const moved = playerSlots[playerSlot]
+          inventory.durability[playerSlot] = moved === null || moved === undefined || moved.durability === undefined
+            ? null : { ...moved.durability }
           broadcastStorageClock(committed.success)
         }
         return {
@@ -5204,10 +5173,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           if (container !== undefined) {
             for (const [slot, stack] of container.slots.entries()) {
               if (stack === null) continue
-              if (hasNondefaultContainerComponents(stack)) return {
-                accepted: false, reason: 'invalid-mutation',
-                failure: { _tag: 'UnsupportedContainerItemComponents', containerId, slot },
-              }
+              if (hasNondefaultContainerComponents(stack)) return rejectMutation(
+                client, message, 'unauthorized-player', 'invalid-mutation',
+                { _tag: 'UnsupportedContainerItemComponents', containerId, slot },
+              )
               const wire = wireContainerStack(stack)
               if (wire !== null) storedStacks.push(wire)
             }

@@ -82,9 +82,9 @@ const makeFixture = (
         { at: BELOW, block: 'chest' },
       ],
       containers: [
-        { containerId: `${world}:1,65,0`, kind: 'chest', slots: slots(27, stack('apple', 2)) },
-        { containerId: `${world}:1,64,0`, kind: 'hopper', slots: slots(5) },
-        { containerId: `${world}:1,63,0`, kind: 'chest', slots: slots(27) },
+        { containerId: `${dimension}:1,65,0`, kind: 'chest', slots: slots(27, stack('apple', 2)) },
+        { containerId: `${dimension}:1,64,0`, kind: 'hopper', slots: slots(5) },
+        { containerId: `${dimension}:1,63,0`, kind: 'chest', slots: slots(27) },
       ],
       inventories: [{ player: PLAYER, state: { slots: [null, null], selectedSlot: 0 } }],
       vitals: [],
@@ -138,9 +138,9 @@ describe('coordinator-backed hopper runtime', () => {
     const fixture = makeFixture('legacy:hopper-world', 'overworld', {
       inventories: [{ player: PLAYER, state: { slots: [{ item: 'apple', count: 1 }, null], selectedSlot: 0 } }],
       containers: [
-        { containerId: 'legacy:hopper-world:1,65,0', kind: 'chest', slots: slots(27, special) },
-        { containerId: 'legacy:hopper-world:1,64,0', kind: 'hopper', slots: slots(5) },
-        { containerId: 'legacy:hopper-world:1,63,0', kind: 'chest', slots: slots(27) },
+        { containerId: 'overworld:1,65,0', kind: 'chest', slots: slots(27, special) },
+        { containerId: 'overworld:1,64,0', kind: 'hopper', slots: slots(5) },
+        { containerId: 'overworld:1,63,0', kind: 'chest', slots: slots(27) },
       ],
     })
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.core }])
@@ -223,13 +223,13 @@ describe('coordinator-backed hopper runtime', () => {
         { at: { x: 10, y: 64, z: 0 }, block: 'redstone_torch' },
       ],
       containers: [
-        { containerId: 'configured-hopper-world:1,64,0', kind: 'hopper', slots: slots(5, stack('apple', 2)) },
-        { containerId: 'configured-hopper-world:2,64,0', kind: 'chest', slots: slots(27) },
-        { containerId: 'configured-hopper-world:1,63,0', kind: 'chest', slots: slots(27) },
-        { containerId: 'configured-hopper-world:5,64,0', kind: 'hopper', slots: slots(5, stack('apple', 2)) },
-        { containerId: 'configured-hopper-world:5,63,0', kind: 'chest', slots: slots(27) },
-        { containerId: 'configured-hopper-world:9,64,0', kind: 'hopper', slots: slots(5, stack('apple', 2)) },
-        { containerId: 'configured-hopper-world:9,63,0', kind: 'chest', slots: slots(27) },
+        { containerId: 'overworld:1,64,0', kind: 'hopper', slots: slots(5, stack('apple', 2)) },
+        { containerId: 'overworld:2,64,0', kind: 'chest', slots: slots(27) },
+        { containerId: 'overworld:1,63,0', kind: 'chest', slots: slots(27) },
+        { containerId: 'overworld:5,64,0', kind: 'hopper', slots: slots(5, stack('apple', 2)) },
+        { containerId: 'overworld:5,63,0', kind: 'chest', slots: slots(27) },
+        { containerId: 'overworld:9,64,0', kind: 'hopper', slots: slots(5, stack('apple', 2)) },
+        { containerId: 'overworld:9,63,0', kind: 'chest', slots: slots(27) },
       ],
     })
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.core }])
@@ -302,6 +302,65 @@ describe('coordinator-backed hopper runtime', () => {
     }
   })
 
+  it('commits cooldown-only owners at the core revision limit and discards only a transfer that needs another core revision', async () => {
+    const exhausted = makeFixture('exhausted-hopper-world', 'overworld', { revision: Number.MAX_SAFE_INTEGER - 1 })
+    const nextRealm = makeFixture('continuing-hopper-world', 'end')
+    const runtime = await makeMultiplayerRedstoneRuntime([
+      { dimension: 'overworld', core: exhausted.core },
+      { dimension: 'end', core: nextRealm.core },
+    ])
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    Result.getOrThrow(await Effect.runPromise(runtime.tick(100)))
+
+    expect(exhausted.freshSnapshot().revision).toBe(Number.MAX_SAFE_INTEGER)
+    expect((await exhausted.readOwners()).hoppers.hoppers[0]?.cooldownTicks).toBe(8)
+    expect(await exhausted.canonicalSlots(P)).toEqual(slots(5, stack('apple', 1)))
+    const afterTransfer = await exhausted.readOwners()
+    exhausted.sent.length = 0
+
+    Result.getOrThrow(await Effect.runPromise(runtime.tick(100)))
+
+    const afterCooldown = await exhausted.readOwners()
+    expect(afterCooldown.revision).toBe(afterTransfer.revision + 1)
+    expect(afterCooldown.hoppers.hoppers[0]?.cooldownTicks).toBe(6)
+    expect(afterCooldown.containers).toEqual(afterTransfer.containers)
+    expect(exhausted.freshSnapshot().revision).toBe(Number.MAX_SAFE_INTEGER)
+    expect(logged).not.toHaveBeenCalled()
+    expect(messages(exhausted.sent).filter((message) => message._tag === 'ReplicatedWorldDelta')).toEqual([
+      expect.objectContaining({ revision: afterCooldown.revision, changes: [], blockChanges: [] }),
+    ])
+
+    Result.getOrThrow(await Effect.runPromise(runtime.tick(200)))
+
+    expect((await exhausted.readOwners()).hoppers.hoppers[0]?.cooldownTicks).toBe(2)
+    const beforeRefusal = await exhausted.readOwners()
+    const beforeWire = exhausted.freshSnapshot()
+    const beforeSavedCount = exhausted.persisted.length
+    const beforeNextRealm = await nextRealm.readOwners()
+    exhausted.sent.length = 0
+    nextRealm.sent.length = 0
+
+    Result.getOrThrow(await Effect.runPromise(runtime.tick(100)))
+
+    expect(logged).toHaveBeenCalledExactlyOnceWith('Multiplayer hopper transfer failed', {
+      dimension: 'overworld',
+      failure: { _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER },
+    })
+    expect(await exhausted.readOwners()).toEqual(beforeRefusal)
+    expect(exhausted.freshSnapshot()).toEqual(beforeWire)
+    expect(exhausted.persisted).toHaveLength(beforeSavedCount)
+    expect(messages(exhausted.sent).filter((message) =>
+      message._tag === 'ContainerDelta' || message._tag === 'ReplicatedWorldDelta')).toEqual([])
+    expect(await nextRealm.canonicalSlots(P)).toEqual(slots(5))
+    expect(await nextRealm.canonicalSlots(BELOW)).toEqual(slots(27, stack('apple', 1)))
+    expect((await nextRealm.readOwners()).revision).toBe(beforeNextRealm.revision + 1)
+    expect(messages(nextRealm.sent)).toContainEqual(expect.objectContaining({
+      _tag: 'ContainerDelta',
+      state: expect.objectContaining({ containerId: 'continuing-hopper-world:1,63,0' }),
+    }))
+  })
+
   it('refuses lossy player transfers, facility ejections, and block drops without changing canonical data', async () => {
     const special = enchanted()
     const fixture = makeFixture('metadata-boundary-world', 'overworld', {
@@ -313,9 +372,9 @@ describe('coordinator-backed hopper runtime', () => {
         { at: { x: 3, y: 64, z: -1 }, block: 'redstone_torch' },
       ],
       containers: [
-        { containerId: 'metadata-boundary-world:1,64,0', kind: 'chest', slots: slots(27, special) },
-        { containerId: 'metadata-boundary-world:2,64,0', kind: 'dispenser', slots: slots(9, special) },
-        { containerId: 'metadata-boundary-world:3,64,0', kind: 'dropper', slots: slots(9, special) },
+        { containerId: 'overworld:1,64,0', kind: 'chest', slots: slots(27, special) },
+        { containerId: 'overworld:2,64,0', kind: 'dispenser', slots: slots(9, special) },
+        { containerId: 'overworld:3,64,0', kind: 'dropper', slots: slots(9, special) },
       ],
     })
     Result.getOrThrow(fixture.core.readPistonCell(P))
@@ -336,10 +395,17 @@ describe('coordinator-backed hopper runtime', () => {
     expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
       _tag: 'AuthoritativeCommandRejected', commandId: 'take-enchanted', reason: 'invalid-command',
     }))
+    const beforeBreakFrames = fixture.sent.length
     expect(fixture.receive({ _tag: 'BlockBreak', player: PLAYER, world: fixture.world, at: P })).toMatchObject({
       accepted: false, reason: 'invalid-mutation',
       failure: { _tag: 'UnsupportedContainerItemComponents', containerId: 'metadata-boundary-world:1,64,0', slot: 0 },
     })
+    expect(messages(fixture.sent.slice(beforeBreakFrames))).toEqual([{
+      _tag: 'BlockMutationRejected', player: PLAYER, world: fixture.world, at: P,
+      operation: 'break', reason: 'unauthorized-player', revision: before.revision,
+    }])
+    expect(await fixture.readOwners()).toEqual(before)
+    expect(fixture.freshSnapshot()).toEqual(beforeWire)
     for (const result of [
       fixture.core.applyDispenserTrigger({ x: 2, y: 64, z: 0 }),
       fixture.core.applyDropperTrigger({ x: 3, y: 64, z: 0 }),

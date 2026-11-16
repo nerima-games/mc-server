@@ -80,6 +80,7 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
   worldWriteRevisions: (write, dimension) => Effect.runSync(Effect.gen(function* () {
     return { world: yield* write.coordinator.revision, dimension: yield* write.coordinator.dimensionRevision(dimension) }
   })),
+  dieUnexpectedRedstoneRequest: () => Effect.runSync(Effect.die(new Error('Non-hopper events reached the hopper bridge'))),
   dieInvalidBlockBatch: (failure) => Effect.runSync(Effect.die(new Error('c7-adapter: unexpected WorldWriteInvalidBatch', { cause: failure }))),
   makeContainerServices: (write) => Effect.runSync(Effect.gen(function* () {
     const containers = yield* makeContainerStorageService().pipe(Effect.provideService(WorldCommitCoordinator, write.coordinator))
