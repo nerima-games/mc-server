@@ -1,3 +1,4 @@
+import { replicatedOwners } from './codec'
 import { createHash } from 'node:crypto'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -9,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 
 import { generatedChunkSource, NoiseSeed } from '@nerima-games/mc-worldgen'
+import { AIR_BLOCK_ID } from '@nerima-games/mc-kernel'
 
 import { makeTerrainReader } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
@@ -47,7 +49,7 @@ const nextMessage = (socket: WebSocket): Promise<NetworkMessage> => new Promise(
     reject(error)
   }
   const handleMessage = (data: WebSocket.RawData): void => {
-    const decoded = decodeFrame(data.toString())
+    const decoded = decodeFrame(data.toString(), replicatedOwners)
     if (decoded._tag === 'Failure') return
     socket.off('message', handleMessage)
     socket.off('error', handleError)
@@ -63,7 +65,7 @@ const nextMessageWithTag = <Tag extends NetworkMessage['_tag']>(socket: WebSocke
     reject(error)
   }
   const handleMessage = (data: WebSocket.RawData): void => {
-    const decoded = decodeFrame(data.toString())
+    const decoded = decodeFrame(data.toString(), replicatedOwners)
     if (decoded._tag === 'Failure' || decoded.success._tag !== tag) return
     socket.off('message', handleMessage)
     socket.off('error', handleError)
@@ -79,7 +81,7 @@ const nextAuthoritativeSnapshot = (socket: WebSocket): Promise<Extract<NetworkMe
     reject(error)
   }
   const handleMessage = (data: WebSocket.RawData): void => {
-    const decoded = decodeFrame(data.toString())
+    const decoded = decodeFrame(data.toString(), replicatedOwners)
     if (decoded._tag === 'Failure' || decoded.success._tag !== 'AuthoritativeSnapshot') return
     socket.off('message', handleMessage)
     socket.off('error', handleError)
@@ -407,9 +409,12 @@ describe('multiplayer WebSocket runtime', () => {
     }))
     await expect(acceptedMove).resolves.toMatchObject({ _tag: 'PlayerMove', at: fractionalAt })
 
-    const acceptedBreak = nextMessageWithTag(sameProcess, 'BlockBreak')
+    const acceptedBreak = nextMessageWithTag(sameProcess, 'ReplicatedWorldDelta')
     sameProcess.send(encode({ _tag: 'BlockBreak', player: 'persistent-player' as PlayerId, world: authoritativeWorld, at: block }))
-    await expect(acceptedBreak).resolves.toMatchObject({ _tag: 'BlockBreak', at: block })
+    await expect(acceptedBreak).resolves.toMatchObject({
+      _tag: 'ReplicatedWorldDelta',
+      blockChanges: [expect.objectContaining({ dimension: 'overworld', position: block, after: AIR_BLOCK_ID })],
+    })
 
     const rejectedBreak = nextMessageWithTag(sameProcess, 'BlockMutationRejected')
     sameProcess.send(encode({ _tag: 'BlockBreak', player: 'persistent-player' as PlayerId, world: authoritativeWorld, at: block }))

@@ -1,3 +1,4 @@
+import { replicatedOwners } from './codec'
 import {
   decodeFrame,
   encodeFrame,
@@ -92,7 +93,7 @@ const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage
     && decodeBrewingWireMessage(wire) === undefined
     && decodeAnvilWireMessage(wire) === undefined
     && decodeEnchantingWireMessage(wire) === undefined).map((wire) => {
-    const decoded = decodeFrame(wire)
+    const decoded = decodeFrame(wire, replicatedOwners)
     if (decoded._tag === 'Failure') throw decoded.failure
     return decoded.success
   })

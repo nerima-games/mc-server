@@ -5,6 +5,7 @@ import { vi } from 'vitest'
 import { Effect, Exit, Option, Result, Schema } from 'effect'
 
 import { makeMultiplayerServerCore, type MultiplayerServerCoreParts } from '../apps/multiplayer-server/core'
+import type { ServerWorldWrite } from '../apps/multiplayer-server/world-write-port'
 import { makeMultiplayerServerCoreParts } from '../apps/multiplayer-server/entrypoints/core-parts'
 import { airTerrain } from './multiplayer-server/terrain'
 
@@ -14,9 +15,15 @@ const position = blockPosition(BlockAxis(1), BlockAxis(10), BlockAxis(1))
 
 const makeRealms = () => {
   const stores: Array<ChunkStoreApi> = []
+  const writes: Array<ServerWorldWrite> = []
   const realParts = makeMultiplayerServerCoreParts()
   const parts: MultiplayerServerCoreParts = {
     ...realParts,
+    makeWorldWrite: (settings) => {
+      const write = realParts.makeWorldWrite(settings)
+      if (Result.isSuccess(write)) writes.push(write.success)
+      return write
+    },
     openChunkStore: (source) => {
       const opened = realParts.openChunkStore(source)
       stores.push(opened.store)
@@ -40,8 +47,9 @@ const makeRealms = () => {
     }))
     expect(stores).toHaveLength(index + 1)
     const store = Option.getOrThrow(Option.fromUndefinedOr(stores[index]))
+    const worldWrite = Option.getOrThrow(Option.fromUndefinedOr(writes[index]))
     Result.getOrThrow(core.readPistonCell(POSITION))
-    return { core, store, worldId, dimension }
+    return { core, worldWrite, store, worldId, dimension }
   })
 }
 
@@ -49,11 +57,11 @@ describe('multiplayer core world write wiring', () => {
   it.effect('builds an isolated coordinator over each of the three realm ChunkStores', () =>
     Effect.gen(function* () {
       const realms = makeRealms()
-      expect(new Set(realms.map(({ core }) => core.worldWrite.coordinator)).size).toBe(3)
+      expect(new Set(realms.map(({ worldWrite }) => worldWrite.coordinator)).size).toBe(3)
       expect(new Set(realms.map(({ store }) => store)).size).toBe(3)
 
       for (const realm of realms) {
-        expect(realm.core.worldWrite.coordinator.worldId).toBe(realm.worldId)
+        expect(realm.worldWrite.coordinator.worldId).toBe(realm.worldId)
         expect(realm.core.snapshot().world).toBe(realm.worldId)
         const batch = yield* Schema.decodeUnknownEffect(WorldWriteBatchSchema)({
           world: realm.worldId,
@@ -62,16 +70,16 @@ describe('multiplayer core world write wiring', () => {
           expectedDimensionRevision: 0,
           edits: [{ position: POSITION, block: STONE }],
         })
-        expect(yield* realm.core.worldWrite.port.applyBatch(batch))
+        expect(yield* realm.worldWrite.port.applyBatch(batch))
           .toStrictEqual({ worldRevision: 1, dimensionRevision: 1 })
         expect(yield* realm.store.getBlock(position)).toStrictEqual({ _tag: 'Block', block: STONE })
-        expect(yield* realm.core.worldWrite.coordinator.revision).toBe(1)
-        expect(yield* realm.core.worldWrite.coordinator.dimensionRevision(realm.dimension)).toBe(1)
+        expect(yield* realm.worldWrite.coordinator.revision).toBe(1)
+        expect(yield* realm.worldWrite.coordinator.dimensionRevision(realm.dimension)).toBe(1)
 
         const uncommitted = realms.slice(realms.indexOf(realm) + 1)
         for (const other of uncommitted) {
-          expect(yield* other.core.worldWrite.coordinator.revision).toBe(0)
-          expect(yield* other.core.worldWrite.coordinator.dimensionRevision(other.dimension)).toBe(0)
+          expect(yield* other.worldWrite.coordinator.revision).toBe(0)
+          expect(yield* other.worldWrite.coordinator.dimensionRevision(other.dimension)).toBe(0)
           expect(yield* other.store.getBlock(position)).toStrictEqual({ _tag: 'Block', block: AIR_BLOCK_ID })
         }
       }
@@ -81,7 +89,7 @@ describe('multiplayer core world write wiring', () => {
     Effect.gen(function* () {
       for (const realm of makeRealms()) {
         const foreignDimension = realm.dimension === 'overworld' ? 'nether' : 'overworld'
-        const coordinator = realm.core.worldWrite.coordinator
+        const coordinator = realm.worldWrite.coordinator
         const commit = vi.spyOn(coordinator, 'commit')
         const dirty = yield* realm.store.subscribeDirty
         yield* dirty.drain
@@ -103,7 +111,7 @@ describe('multiplayer core world write wiring', () => {
           edits: [{ position: POSITION, block: STONE }],
         })
 
-        const exit = yield* Effect.exit(realm.core.worldWrite.port.applyBatch(batch))
+        const exit = yield* Effect.exit(realm.worldWrite.port.applyBatch(batch))
 
         expect(Exit.hasFails(exit)).toBe(false)
         expect(Result.getOrThrow(Exit.findDefect(exit))).toMatchObject({

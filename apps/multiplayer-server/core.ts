@@ -1,6 +1,8 @@
 import {
   HungerAuthority,
   decodeFrame,
+  createReplicatedOwnerRegistry,
+  type ProtocolError,
   encodeFrame,
   type AuthoritativeCommand,
   type AuthoritativeCommandResult,
@@ -8,7 +10,6 @@ import {
   type AuthoritativeEntityState,
   type AuthoritativeSnapshot,
   type BlockMutationRejected,
-  BlockPlace,
   type BlockPos,
   type CommandId,
   type CommandRejectionReason,
@@ -21,15 +22,16 @@ import {
   type WireText,
   type WorldId,
   type WorldSnapshot,
+  type ReplicatedWorldSnapshot,
   type ContainerKind,
   type HungerActivity,
   SurvivalAuthority,
   type SurvivalEvent,
 } from '@nerima-games/mx-multiplayer'
-import { AIR_BLOCK_ID, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
-import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError } from '@nerima-games/mc-sim'
+import { blockIndex, type Chunk, type ChunkWithBlockStates, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -272,7 +274,23 @@ export type GeneratedBlockReadFailure =
   | Readonly<{ _tag: 'GeneratedBlockIdFailure'; failure: BlockIdFailure }>
   | Readonly<{ _tag: 'GeneratedBlockRegistryFailure'; failure: BlockRegistryFailure }>
 
+type BlockWriteError = WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteChunkUnavailable
+type BlockCommitDelta = ReplicatedWorldDelta<ReplicatedOwnerChange>
+type BlockCommit = Readonly<{ frame: WireText }>
+
+// These are the installed protocol codec's existing frame, depth, and collection caps.
+// This block-only path registers no owner states.
+const replicatedOwners = Result.getOrThrow(createReplicatedOwnerRegistry([], {
+  maxCollectionItems: 31_149, maxDeltaBlockChanges: 31_149, maxSnapshotBlockReads: 31_149,
+  maxDepth: 13, maxDeltaFrameBytes: 4_194_304, maxSnapshotFrameBytes: 4_194_304,
+  maxRegisteredOwners: 0, ownerStates: [],
+}))
+
 export type MultiplayerServerCoreFailure =
+  | Readonly<{ _tag: 'WorldWriteEncodingFailure'; failure: ProtocolError }>
+  | Readonly<{ _tag: 'WorldWriteFailure'; failure: BlockWriteError }>
+  | Readonly<{ _tag: 'SavedBlockStateFailure'; at: BlockPos; failure: Schema.SchemaError | BlockStateCodecFailure }>
+  | Readonly<{ _tag: 'BlockBatchSchemaFailure'; failure: Schema.SchemaError }>
   | Readonly<{ _tag: 'WorldWriteInitializationFailure'; failure: Schema.SchemaError | WorldCommitCoordinatorError }>
   | Readonly<{ _tag: 'WitherRuntimeFailure'; operation: WitherOperation; failure: WitherRuntimeFailure }>
   | Readonly<{ _tag: 'FurnaceAdvanceFailure'; failure: FurnaceAdvanceFailure }>
@@ -394,6 +412,9 @@ export interface MultiplayerServerCoreParts {
   readonly survivalHunger: SurvivalHungerPart
   readonly openChunkStore: (source: ChunkSource) => ChunkStorePart
   readonly makeWorldWrite: (options: ServerWorldWriteOptions) => Result.Result<ServerWorldWrite, WorldCommitCoordinatorError>
+  readonly generateChunk: (source: ChunkSource, coord: ChunkCoord) => Result.Result<Chunk, ChunkStoreError>
+  readonly worldWriteRevisions: (write: ServerWorldWrite, dimension: Dimension) => Readonly<{ world: WorldRevision; dimension: DimensionRevision }>
+  readonly commitWorldWrite: (write: ServerWorldWrite, dimension: Dimension, batch: WorldWriteBatch, rollback?: () => void) => Result.Result<Readonly<{ commit: WorldWriteCommit; delta: BlockCommitDelta }>, BlockWriteError>
 }
 
 /** The block box a core simulates; every bound must be finite and each minimum at most its maximum. */
@@ -441,7 +462,7 @@ export interface WeatherClockState {
 
 export interface MultiplayerServerState {
   readonly revision: number
-  readonly blocks: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null }>>
+  readonly blocks: ReadonlyArray<Readonly<{ at: BlockPos; block: string | null; state?: BlockStateValues }>>
   readonly poweredRails?: ReadonlyArray<Readonly<{ at: BlockPos; powered: boolean }>>
   readonly levers?: ReadonlyArray<Readonly<{ at: BlockPos; active: boolean }>>
   readonly inventories: AuthoritativeSnapshot['inventories']
@@ -841,6 +862,7 @@ type CommandDecision =
       accepted: true
       deltas: (revision: number) => ReadonlyArray<AuthoritativeDelta>
       messages?: (revision: number) => ReadonlyArray<NetworkMessage>
+      frames?: ReadonlyArray<WireText>
       statusEffectDeltas?: (revision: number) => ReadonlyArray<BrewingWireMessage>
       worldSnapshotRequired?: boolean
       snapshotBroadcastRequired?: boolean
@@ -849,8 +871,8 @@ type CommandDecision =
 const DEFAULT_BOUNDS = {
   minX: -30_000_000,
   maxX: 30_000_000,
-  minY: -64,
-  maxY: 319,
+  minY: 0,
+  maxY: CHUNK_HEIGHT - 1,
   minZ: -30_000_000,
   maxZ: 30_000_000,
 } as const
@@ -886,32 +908,18 @@ export const chunkSourceFromBlocks = (
 
 const chunkKeyOf = (cx: number, cz: number): string => `${String(cx)},${String(cz)}`
 
-type BlockOverride = Readonly<{ at: BlockPos; block: string | null }>
+type BlockOverride = Readonly<{ at: BlockPos; block: string | null; state?: BlockStateValues }>
 
 /** The registry id of a block edit, where null is air; none when the registry lacks the name. */
 const overrideBlockId = (block: string | null): Option.Option<BlockId> =>
   block === null ? Option.some(AIR_BLOCK_ID) : isBlockType(block) ? blockIdOf(block) : Option.none()
 
-/** The server's block edits, recording which chunks each write makes stale in the ChunkStore view. */
+/** Saved edits are updated only from committed deltas, then replayed when terrain is regenerated. */
 class BlockOverrides extends Map<string, BlockOverride> {
-  readonly #changedChunks = new Set<string>()
-
-  override set(key: string, value: BlockOverride): this {
-    this.#changedChunks.add(chunkKeyOf(Math.floor(value.at.x / CHUNK_SIZE_XZ), Math.floor(value.at.z / CHUNK_SIZE_XZ)))
-    return super.set(key, value)
-  }
-
-  override delete(key: string): boolean {
-    const value = this.get(key)
-    if (value !== undefined) this.#changedChunks.add(chunkKeyOf(Math.floor(value.at.x / CHUNK_SIZE_XZ), Math.floor(value.at.z / CHUNK_SIZE_XZ)))
-    return super.delete(key)
-  }
-
-  takeChanged(key: string): boolean {
-    return this.#changedChunks.delete(key)
+  record(value: BlockOverride): void {
+    super.set(positionKey(value.at), value)
   }
 }
-
 const survivalActivityInput = (activity: HungerActivity, amount: number): SurvivalActivityInput => {
   switch (activity) {
     case 'walk':
@@ -1103,16 +1111,12 @@ export interface ContainerSlotSnapshot {
 }
 
 export interface MultiplayerServerCore {
-  /**
-   * Mutation callers must not use this port until U6b-2 removes the legacy reload path,
-   * which can erase committed writes.
-   */
-  readonly worldWrite: ServerWorldWrite
   readonly connect: (clientId: ClientId, send: SendFrame) => boolean
   readonly receive: (clientId: ClientId, frame: WireText) => ReceiveResult
   readonly disconnect: (clientId: ClientId) => Result.Result<void, MultiplayerServerCoreFailure>
   readonly detachPlayer: (clientId: ClientId) => Result.Result<RealmTransferPlayer | undefined, MultiplayerServerCoreFailure>
-  readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival) => boolean
+  readonly prepareRealmTransfer: () => Result.Result<WireText, MultiplayerServerCoreFailure>
+  readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText) => boolean
   readonly snapshot: () => WorldSnapshot
   readonly applyHopperTransfer: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
   readonly applyDispenserTrigger: (at: BlockPos) => Result.Result<boolean, MultiplayerServerCoreFailure>
@@ -1154,7 +1158,7 @@ export interface RealmTransferArrival {
 }
 
 
-type ChunkOverlay = ReadonlyArray<Readonly<{ index: number; block: BlockId }>>
+type ChunkOverlay = ReadonlyArray<Readonly<{ index: number; block: BlockId; state: number }>>
 
 /** Reads the world through one path: the chunk column is loaded and its edits validated before any cell is answered. */
 export interface WorldBlockReader {
@@ -1168,48 +1172,89 @@ export interface WorldBlockReader {
 
 const generatedReadFailure = (failure: GeneratedBlockReadFailure): MultiplayerServerCoreFailure => ({ _tag: 'GeneratedBlockReadFailure', failure })
 
-const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts, blocks: BlockOverrides): WorldBlockReader & Readonly<{ chunkStore: ChunkStoreApi }> => {
-  // Block ids of the edits inside the chunk being loaded; loadChunk validates them before generation.
-  const pendingOverlays = new Map<string, ChunkOverlay>()
-  const overlaySource: ChunkSource = (coord) => Effect.map(source(coord), (chunk) => {
-    // loadChunk records this chunk's validated overlay before it asks the store to generate the chunk.
-    const overlay = Option.getOrThrow(Option.fromNullishOr(pendingOverlays.get(chunkKeyOf(coord.cx, coord.cz))))
-    if (overlay.length === 0) return chunk
-    const chunkBlocks = Uint16Array.from(chunk.blocks)
-    for (const { index, block } of overlay) chunkBlocks[index] = block
-    return { coord: chunk.coord, blocks: chunkBlocks, biomes: chunk.biomes }
-  })
-  // Legacy edits stay in `blocks` until mutation callers move to the commit path in U6b-2.
-  const chunkStore = parts.openChunkStore(overlaySource)
+const makeWorldReader = (
+  source: ChunkSource,
+  parts: MultiplayerServerCoreParts,
+  blocks: BlockOverrides,
+  plannedBlocks: ReadonlyMap<string, BlockOverride>,
+): WorldBlockReader & Readonly<{ chunkStore: ChunkStoreApi; isLoaded: (at: BlockPos) => boolean; encodedStateAt: (at: BlockPos) => Result.Result<EncodedBlockState, MultiplayerServerCoreFailure>; readCell: (at: BlockPos) => Result.Result<Readonly<{ block: BlockId; state: EncodedBlockState }>, MultiplayerServerCoreFailure> }> => {
+  const pendingChunks = new Map<string, Chunk>()
+  const chunkStore = parts.openChunkStore((coord) => Effect.sync(() =>
+    Option.getOrThrow(Option.fromNullishOr(pendingChunks.get(chunkKeyOf(coord.cx, coord.cz))))))
 
-  const overlayFor = (coord: ChunkCoord): Result.Result<ChunkOverlay, MultiplayerServerCoreFailure> => {
-    const overlay: Array<Readonly<{ index: number; block: BlockId }>> = []
-    for (const { at, block } of blocks.values()) {
+  const overlayFor = (coord: ChunkCoord, values: Iterable<BlockOverride>): Result.Result<ChunkOverlay, MultiplayerServerCoreFailure> => {
+    const overlay: Array<ChunkOverlay[number]> = []
+    for (const { at, block, state } of values) {
       if (Math.floor(at.x / CHUNK_SIZE_XZ) !== coord.cx || Math.floor(at.z / CHUNK_SIZE_XZ) !== coord.cz) continue
       const id = overrideBlockId(block)
       if (Option.isNone(id)) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at, block: String(block) })
       if (at.y < 0 || at.y >= CHUNK_HEIGHT) continue
-      const local = { x: at.x - coord.cx * CHUNK_SIZE_XZ, z: at.z - coord.cz * CHUNK_SIZE_XZ }
-      overlay.push({ index: blockIndex(local.x, at.y, local.z), block: id.value })
+      const defaults = state === undefined ? defaultBlockState(id.value) : Result.succeed(state)
+      if (Result.isFailure(defaults)) return Result.fail({ _tag: 'SavedBlockStateFailure', at, failure: defaults.failure })
+      const encoded = encodeBlockState(id.value, defaults.success)
+      if (Result.isFailure(encoded)) return Result.fail({ _tag: 'SavedBlockStateFailure', at, failure: encoded.failure })
+      overlay.push({
+        index: blockIndex(at.x - coord.cx * CHUNK_SIZE_XZ, at.y, at.z - coord.cz * CHUNK_SIZE_XZ),
+        block: id.value,
+        state: encoded.success,
+      })
     }
     return Result.succeed(overlay)
   }
 
-  /** The resident chunk, regenerated with the current edits when a write has made it stale. */
-  const loadChunk = (coord: ChunkCoord): Result.Result<ReadonlyChunkWithBlockStates, MultiplayerServerCoreFailure> => {
-    const key = chunkKeyOf(coord.cx, coord.cz)
-    const stale = blocks.takeChanged(key)
-    const resident = chunkStore.peek(coord)
-    if (resident !== undefined && !stale) return Result.succeed(resident)
-    if (resident !== undefined) {
-      const unloaded = chunkStore.unload(coord)
-      if (Result.isFailure(unloaded)) return Result.fail({ _tag: 'ChunkStoreUnloadFailure', failure: unloaded.failure })
+  const project = (chunk: ReadonlyChunkWithBlockStates, overlay: ChunkOverlay): ReadonlyChunkWithBlockStates => {
+    if (overlay.length === 0) return chunk
+    const chunkBlocks = Uint16Array.from(chunk.blocks)
+    const blockStates = Uint32Array.from(chunk.blockStates)
+    for (const edit of overlay) {
+      chunkBlocks[edit.index] = edit.block
+      blockStates[edit.index] = edit.state
     }
-    const overlay = overlayFor(coord)
+    return { coord: chunk.coord, blocks: chunkBlocks, blockStates, biomes: chunk.biomes }
+  }
+
+  // mc-worldgen materializes default states internally but does not export that helper.
+  // Overlay generation needs the same kernel defaults before applying saved states.
+  const materializeStates = (chunk: Chunk): Result.Result<ChunkWithBlockStates, BlockStateCodecFailure> => {
+    if (chunk.blockStates !== undefined) {
+      if (!(chunk.blockStates instanceof Uint32Array)) return Result.fail({ _tag: 'BlockStateCodecFailure', reason: 'invalid-encoded-value' })
+      return Result.succeed({ ...chunk, blockStates: chunk.blockStates })
+    }
+    const blockStates = new Uint32Array(chunk.blocks.length)
+    const defaults = new Map<number, EncodedBlockState>()
+    for (const [index, value] of chunk.blocks.entries()) {
+      let encoded = defaults.get(value)
+      if (encoded === undefined) {
+        // A Uint16Array element is inside BlockId's representable range.
+        const id = Result.getOrThrow(BlockId.result(value))
+        const state = defaultBlockState(id)
+        if (Result.isFailure(state)) return Result.fail(state.failure)
+        const result = encodeBlockState(id, state.success)
+        if (Result.isFailure(result)) return Result.fail(result.failure)
+        encoded = result.success
+        defaults.set(value, encoded)
+      }
+      blockStates[index] = encoded
+    }
+    return Result.succeed({ ...chunk, blockStates })
+  }
+
+  const loadChunk = (coord: ChunkCoord): Result.Result<ReadonlyChunkWithBlockStates, MultiplayerServerCoreFailure> => {
+    const resident = chunkStore.peek(coord)
+    if (resident !== undefined) return Result.succeed(resident)
+    const overlay = overlayFor(coord, blocks.values())
     if (Result.isFailure(overlay)) return Result.fail(overlay.failure)
-    pendingOverlays.set(key, overlay.success)
+    const generated = parts.generateChunk(source, coord)
+    if (Result.isFailure(generated)) return Result.fail({ _tag: 'ChunkStoreLoadFailure', failure: generated.failure })
+    const materialized = materializeStates(generated.success)
+    if (Result.isFailure(materialized)) return Result.fail({ _tag: 'ChunkStoreLoadFailure', failure: materialized.failure })
+    const projected = project(materialized.success, overlay.success)
+    pendingChunks.set(chunkKeyOf(coord.cx, coord.cz), {
+      coord: projected.coord, blocks: Uint16Array.from(projected.blocks),
+      blockStates: Uint32Array.from(projected.blockStates), biomes: projected.biomes,
+    })
     const loaded = chunkStore.load(coord)
-    pendingOverlays.delete(key)
+    pendingChunks.delete(chunkKeyOf(coord.cx, coord.cz))
     return Result.isFailure(loaded) ? Result.fail({ _tag: 'ChunkStoreLoadFailure', failure: loaded.failure }) : Result.succeed(loaded.success)
   }
 
@@ -1220,13 +1265,12 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
     if (Result.isFailure(y)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockAxisFailure', axis: 'y', failure: y.failure }))
     const z = BlockAxis.result(at.z)
     if (Result.isFailure(z)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockAxisFailure', axis: 'z', failure: z.failure }))
+    if (y.success < 0 || y.success >= CHUNK_HEIGHT) return Result.succeed(null)
+    const planned = plannedBlocks.get(positionKey(at))
+    if (planned !== undefined) return Result.succeed(planned.block)
     const position = blockPosition(x.success, y.success, z.success)
     const chunk = loadChunk(chunkCoordOfBlock(position))
     if (Result.isFailure(chunk)) return Result.fail(chunk.failure)
-    // loadChunk validated every edit in this column, so an edited cell answers from the same checked state.
-    const override = blocks.get(positionKey(at))
-    if (override !== undefined) return Result.succeed(override.block)
-    if (y.success < 0 || y.success >= CHUNK_HEIGHT) return Result.succeed(null)
     const local = localCoordOfBlock(position)
     const blockId = BlockId.result(getBlockAt(chunk.success, local.lx, local.ly, local.lz))
     if (Result.isFailure(blockId)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockIdFailure', failure: blockId.failure }))
@@ -1236,22 +1280,36 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
   }
 
   const openWindow = (coords: ReadonlyArray<ChunkCoord>): Result.Result<ChunkWindow, MultiplayerServerCoreFailure> => {
-    // A later load in this loop may evict an earlier chunk from the LRU store; the value already collected stays.
     const chunks: ReadonlyChunkWithBlockStates[] = []
     for (const coord of coords) {
       const loaded = loadChunk(coord)
       if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
-      chunks.push(loaded.success)
+      const overlay = overlayFor(coord, plannedBlocks.values())
+      if (Result.isFailure(overlay)) return Result.fail(overlay.failure)
+      chunks.push(project(loaded.success, overlay.success))
     }
     return Result.succeed(chunkStore.openWindow(chunks))
   }
-
-  return { blockAt, openWindow, chunkStore: chunkStore.store }
+  const isLoaded = (at: BlockPos): boolean =>
+    chunkStore.peek(chunkCoordOfBlock(Result.getOrThrow(Schema.decodeUnknownResult(BlockPositionSchema)(at)))) !== undefined
+  const readCell = (at: BlockPos): Result.Result<Readonly<{ block: BlockId; state: EncodedBlockState }>, MultiplayerServerCoreFailure> => {
+    const position = Schema.decodeUnknownResult(BlockPositionSchema)(at)
+    if (Result.isFailure(position)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: position.failure })
+    const loaded = loadChunk(chunkCoordOfBlock(position.success))
+    if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
+    const local = localCoordOfBlock(position.success)
+    const block = BlockId.result(getBlockAt(loaded.success, local.lx, local.ly, local.lz))
+    if (Result.isFailure(block)) return Result.fail(generatedReadFailure({ _tag: 'GeneratedBlockIdFailure', failure: block.failure }))
+    const encoded = Schema.decodeUnknownResult(EncodedBlockStateSchema)(loaded.success.blockStates[blockIndex(local.lx, local.ly, local.lz)])
+    if (Result.isFailure(encoded)) return Result.fail({ _tag: 'SavedBlockStateFailure', at, failure: encoded.failure })
+    return Result.succeed({ block: block.success, state: encoded.success })
+  }
+  const encodedStateAt = (at: BlockPos) => Result.map(readCell(at), (cell) => cell.state)
+  return { blockAt, openWindow, chunkStore: chunkStore.store, isLoaded, encodedStateAt, readCell }
 }
-
 /** The generated terrain alone, read through the same path the core uses; the entrypoint finds spawn with it. */
 export const makeTerrainReader = (source: ChunkSource, parts: MultiplayerServerCoreParts): WorldBlockReader =>
-  makeWorldReader(source, parts, new BlockOverrides())
+  makeWorldReader(source, parts, new BlockOverrides(), new Map())
 
 export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Result.Result<MultiplayerServerCore, MultiplayerServerCoreFailure> => {
   const decodedWorldId = Schema.decodeUnknownResult(WorldIdSchema)(options.worldId)
@@ -1272,11 +1330,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   )
   const playerClients = new Map<PlayerId, ClientId>()
   const movementBudgets = new Map<PlayerId, MovementBudget>()
-  const blocks = new BlockOverrides()
-  for (const mutation of [...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])]) {
-    blocks.set(positionKey(mutation.at), mutation)
-  }
-  const world = makeWorldReader(options.chunkSource, options.parts, blocks)
+  const blocks = new BlockOverrides([...(options.initialState?.blocks ?? []), ...(options.staticBlocks ?? [])].map((mutation) => [positionKey(mutation.at), mutation]))
+  const plannedBlocks = new Map<string, BlockOverride>()
+  const world = makeWorldReader(options.chunkSource, options.parts, blocks, plannedBlocks)
   const worldWrite = options.parts.makeWorldWrite({
     world: worldId,
     owners: [],
@@ -1285,6 +1341,50 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   })
   if (Result.isFailure(worldWrite)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: worldWrite.failure })
   const blockAt = world.blockAt
+  const blockRevisions = () => options.parts.worldWriteRevisions(worldWrite.success, dimension)
+  const commitBlockEdits = (edits: ReadonlyArray<BlockOverride>, rollback?: () => void): Result.Result<BlockCommit, MultiplayerServerCoreFailure> => {
+    const expected = blockRevisions()
+    const batchEdits: Array<unknown> = []
+    const prepared = new Map<string, Readonly<{ name: string | null; state: BlockStateValues; beforeState: EncodedBlockState; afterState: EncodedBlockState }>>()
+    const previewChanges: Array<Extract<NetworkMessage, { _tag: 'ReplicatedWorldDelta' }>['blockChanges'][number]> = []
+    for (const edit of edits) {
+      const block = overrideBlockId(edit.block)
+      if (Option.isNone(block)) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: edit.at, block: String(edit.block) })
+      const before = world.readCell(edit.at)
+      if (Result.isFailure(before)) return Result.fail(before.failure)
+      const state = edit.state === undefined ? defaultBlockState(block.value) : Result.succeed(edit.state)
+      if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: edit.at, failure: state.failure })
+      const encoded = encodeBlockState(block.value, state.success)
+      if (Result.isFailure(encoded)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: edit.at, failure: encoded.failure })
+      prepared.set(positionKey(edit.at), { name: edit.block, state: state.success, beforeState: before.success.state, afterState: encoded.success })
+      const position = Schema.decodeUnknownResult(BlockPositionSchema)(edit.at)
+      if (Result.isFailure(position)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: position.failure })
+      if (before.success.block !== block.value || before.success.state !== encoded.success) {
+        previewChanges.push({ dimension, position: position.success, before: before.success.block, after: block.value, beforeState: before.success.state, afterState: encoded.success })
+      }
+      const definition = blockStateDefinitionOf(block.value)
+      if (Result.isFailure(definition)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: edit.at, failure: definition.failure })
+      batchEdits.push(definition.success.slots.length === 0
+        ? { position: edit.at, block: block.value }
+        : { position: edit.at, block: block.value, state: state.success })
+    }
+    const batch = Schema.decodeUnknownResult(WorldWriteBatchSchema)({ world: worldId, dimension, expectedWorldRevision: expected.world, expectedDimensionRevision: expected.dimension, edits: batchEdits })
+    if (Result.isFailure(batch)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: batch.failure })
+    const preview = encodeFrame({ _tag: 'ReplicatedWorldDelta', world: worldId, revision: expected.world + 1, changes: [], blockChanges: previewChanges }, replicatedOwners)
+    if (Result.isFailure(preview)) return Result.fail({ _tag: 'WorldWriteEncodingFailure', failure: preview.failure })
+    const committed = options.parts.commitWorldWrite(worldWrite.success, dimension, batch.success, rollback)
+    if (Result.isFailure(committed)) return Result.fail({ _tag: 'WorldWriteFailure', failure: committed.failure })
+    // The coordinator publishes this validated batch; all wire states were encoded before that publication.
+    const changes = committed.success.delta.blockChanges.map((change) => {
+      const cell = Option.getOrThrow(Option.fromNullishOr(prepared.get(positionKey(change.position))))
+      blocks.record({ at: change.position, block: cell.name, state: change.state === undefined ? cell.state : change.state })
+      return { dimension: change.dimension, position: change.position, before: change.before, after: change.after, beforeState: cell.beforeState, afterState: cell.afterState }
+    })
+    const message = { _tag: 'ReplicatedWorldDelta', world: committed.success.delta.world, revision: committed.success.delta.revision, changes: committed.success.delta.changes, blockChanges: changes }
+    // Successful commits increment the expected world revision once and publish the checked cell changes.
+    // The preflight above admitted the same wire fields and bounds; a failure here is a coordinator invariant defect.
+    return Result.succeed({ frame: Result.getOrThrow(encodeFrame(message, replicatedOwners)) })
+  }
   const poweredRails = new Map<string, Readonly<{ at: BlockPos; powered: boolean }>>(
     (options.initialState?.poweredRails ?? []).map(({ at, powered }) => [positionKey(at), {
       at: { ...at },
@@ -1504,7 +1604,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   }))
 
   const sendMessage = (client: ConnectedClient, message: NetworkMessage): void => {
-    const encoded = encodeFrame(message)
+    const encoded = encodeFrame(message, replicatedOwners)
     if (Result.isSuccess(encoded)) client.send(encoded.success)
   }
 
@@ -1512,6 +1612,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     for (const [clientId, client] of clients) {
       if (clientId !== except && client.playerId !== null) sendMessage(client, message)
     }
+  }
+
+  const broadcastFrame = (frame: WireText): void => {
+    for (const client of clients.values()) if (client.playerId !== null) client.send(frame)
   }
 
   const sendSleep = (client: ConnectedClient, message: SleepWireMessage): void => {
@@ -1702,10 +1806,29 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     seed: options.seed,
     revision,
     players: [...players.values()].map((player) => ({ ...player })),
-    blocks: [...blocks.values()].map((mutation) => ({ world: worldId, ...mutation })),
+    blocks: [...blocks.values()].map(({ at, block }) => ({ world: worldId, at, block })),
     poweredRails: poweredRailSnapshot(),
     levers: leverSnapshot(),
   })
+
+  const replicatedSnapshotFrame = (): Result.Result<WireText, MultiplayerServerCoreFailure> => {
+    const reads: Array<ReplicatedWorldSnapshot['blocks'][number]> = []
+    for (const { at } of blocks.values()) {
+      const position = Schema.decodeUnknownResult(BlockPositionSchema)(at)
+      if (Result.isFailure(position)) return Result.fail({ _tag: 'BlockBatchSchemaFailure', failure: position.failure })
+      if (at.y < 0 || at.y >= CHUNK_HEIGHT) {
+        reads.push({ dimension, position: position.success, reading: { _tag: 'OutOfWorld' } })
+      } else if (!world.isLoaded(at)) {
+        reads.push({ dimension, position: position.success, reading: { _tag: 'ChunkNotLoaded' } })
+      } else {
+        const cell = world.readCell(at)
+        if (Result.isFailure(cell)) return Result.fail(cell.failure)
+        reads.push({ dimension, position: position.success, reading: { _tag: 'Block', block: cell.success.block }, state: cell.success.state })
+      }
+    }
+    const encoded = encodeFrame({ _tag: 'ReplicatedWorldSnapshot', world: worldId, revision: blockRevisions().world, owners: [], blocks: reads }, replicatedOwners)
+    return Result.isFailure(encoded) ? Result.fail({ _tag: 'WorldWriteEncodingFailure', failure: encoded.failure }) : Result.succeed(encoded.success)
+  }
 
   const authoritativeSnapshot = (): AuthoritativeSnapshot => ({
     _tag: 'AuthoritativeSnapshot',
@@ -1722,7 +1845,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
 
   const isInBounds = ({ x, y, z }: BlockPos): boolean =>
     x >= bounds.minX && x <= bounds.maxX &&
-    y >= bounds.minY && y <= bounds.maxY &&
+    y >= 0 && y < CHUNK_HEIGHT && y >= bounds.minY && y <= bounds.maxY &&
     z >= bounds.minZ && z <= bounds.maxZ
 
   const isBlockWithinReach = (player: MutablePlayer, at: BlockPos): boolean => {
@@ -1816,7 +1939,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   }
 
   /** The next falling-block moves, planned from current blocks; `commit` applies them and clears their pending cells. */
-  const planPendingFallingBlocks = (): Result.Result<Readonly<{ moved: boolean; commit: () => void }>, MultiplayerServerCoreFailure> => {
+  const planPendingFallingBlocks = (): Result.Result<Readonly<{ moved: boolean; commit: () => Result.Result<BlockCommit | undefined, MultiplayerServerCoreFailure> }>, MultiplayerServerCoreFailure> => {
     const targets = Array.from(fallingPending.values()).slice(0, FALLING_BLOCK_MOVES_PER_TICK)
     let registryLookupFailure: string | undefined
     let blockReadFailure: MultiplayerServerCoreFailure | undefined
@@ -1865,15 +1988,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed({
       moved: resolvedMoves.length > 0,
       commit: () => {
+        const edits = new Map<string, BlockOverride>()
+        for (const move of resolvedMoves) edits.set(positionKey(move.source), { at: move.source, block: null })
+        for (const move of resolvedMoves) edits.set(positionKey(move.target), { at: move.target, block: move.block })
+        const committed = edits.size === 0 ? Result.succeed(undefined) : commitBlockEdits([...edits.values()])
+        if (Result.isFailure(committed)) return Result.fail(committed.failure)
         for (const target of targets) fallingPending.delete(positionKey(target))
         for (const move of resolvedMoves) {
-          blocks.set(positionKey(move.source), { at: move.source, block: null })
-          blocks.set(positionKey(move.target), { at: move.target, block: move.block })
-          disturbFallingBlocks([
-            { x: move.target.x, y: move.target.y - 1, z: move.target.z },
-            move.source,
-          ])
+          disturbFallingBlocks([{ x: move.target.x, y: move.target.y - 1, z: move.target.z }, move.source])
         }
+        return committed
       },
     })
   }
@@ -2081,11 +2205,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     if (Result.isFailure(currentBlock)) return Result.fail(currentBlock.failure)
     if (!isRedstoneStatefulBlock(currentBlock.success) || !expectedBlocks.has(currentBlock.success) || currentBlock.success === nextBlock) return Result.succeed(false)
 
-    const advanced = advanceRevision()
-    if (Result.isFailure(advanced)) return Result.fail(advanced.failure)
-    blocks.set(positionKey(at), { at: { ...at }, block: nextBlock })
+    const reserved = revisionAfter(1)
+    if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
+    const currentId = Option.getOrThrow(overrideBlockId(currentBlock.success))
+    const encoded = world.encodedStateAt(at)
+    if (Result.isFailure(encoded)) return Result.fail(encoded.failure)
+    const state = decodeBlockState(currentId, encoded.success)
+    if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at, failure: state.failure })
+    const committed = commitBlockEdits([{ at, block: nextBlock, state: state.success }])
+    if (Result.isFailure(committed)) return Result.fail(committed.failure)
+    Result.getOrThrow(advanceRevision())
     notifyStateChanged()
-    broadcast(snapshot())
+    broadcastFrame(committed.success.frame)
     return Result.succeed(true)
   }
 
@@ -2147,22 +2278,28 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       if (block.success !== null) return Result.succeed(false)
     }
 
-    const advanced = advanceRevision()
-    if (Result.isFailure(advanced)) return Result.fail(advanced.failure)
+    const edits = new Map<string, BlockOverride>()
     for (const move of plan.moves) {
-      blocks.set(positionKey(move.to), { at: { ...move.to }, block: move.block })
+      const block = overrideBlockId(move.block)
+      if (Option.isNone(block)) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: move.from, block: move.block })
+      const encoded = world.encodedStateAt(move.from)
+      if (Result.isFailure(encoded)) return Result.fail(encoded.failure)
+      const state = decodeBlockState(block.value, encoded.success)
+      if (Result.isFailure(state)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: move.from, failure: state.failure })
+      edits.set(positionKey(move.to), { at: move.to, block: move.block, state: state.success })
     }
     for (const move of plan.moves) {
-      blocks.set(positionKey(move.from), { at: { ...move.from }, block: null })
+      if (!edits.has(positionKey(move.from))) edits.set(positionKey(move.from), { at: move.from, block: null })
     }
-    if (plan.toState === 'extended') {
-      blocks.set(positionKey(head), { at: { ...head }, block: 'piston_head' })
-    } else if (plan.moves.length === 0) {
-      blocks.set(positionKey(head), { at: { ...head }, block: null })
-    }
-
+    if (plan.toState === 'extended') edits.set(positionKey(head), { at: head, block: 'piston_head' })
+    else if (plan.moves.length === 0) edits.set(positionKey(head), { at: head, block: null })
+    const reserved = revisionAfter(1)
+    if (Result.isFailure(reserved)) return Result.fail(reserved.failure)
+    const committed = commitBlockEdits([...edits.values()])
+    if (Result.isFailure(committed)) return Result.fail(committed.failure)
+    Result.getOrThrow(advanceRevision())
     notifyStateChanged()
-    broadcast(snapshot())
+    broadcastFrame(committed.success.frame)
     return Result.succeed(true)
   }
 
@@ -2218,12 +2355,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(undefined)
   }
 
-  // Each core simulates one dimension, so its revision is the dimension revision an intent expects.
-  // simulationTick only grows from zero through tick's safe-integer check, and advanceRevision keeps the core
-  // revision a safe integer, so both brands accept them.
+  // Block intents use the coordinator's clock; command revisions advance independently.
   const intentContext = (): SleepIntentContext => ({
     targetTick: Result.getOrThrow(SimulationTick.result(simulationTick)),
-    expectedDimensionRevision: Result.getOrThrow(Schema.decodeUnknownResult(DimensionRevisionSchema)(revision)),
+    expectedDimensionRevision: blockRevisions().dimension,
   })
 
   // Every damage source writes health to the wire vitals, so each hunger step starts from that health.
@@ -2566,23 +2701,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         const completed = portalFrameBlocks.every(({ at, block }) =>
           positionKey(at) === framePositionKey || block === END_PORTAL_FRAME_FILLED_BLOCK,
         )
+        const edits: BlockOverride[] = [{ at: message.frame, block: END_PORTAL_FRAME_FILLED_BLOCK }]
+        if (completed) {
+          for (let x = -1; x <= 1; x += 1) {
+            for (let z = -1; z <= 1; z += 1) edits.push({ at: { x: center.x + x, y: center.y, z: center.z + z }, block: END_EXIT_PORTAL_BLOCK })
+          }
+        }
+        const committed = commitBlockEdits(edits)
+        if (Result.isFailure(committed)) return rejectBlockRead(committed.failure)
         inventory.slots[inventory.selectedSlot] = selected.count === 1
           ? null
           : { ...selected, count: selected.count - 1 }
         if (selected.count === 1) inventory.durability[inventory.selectedSlot] = null
-        blocks.set(positionKey(message.frame), {
-          at: { ...message.frame },
-          block: END_PORTAL_FRAME_FILLED_BLOCK,
-        })
-
-        if (completed) {
-          for (let x = -1; x <= 1; x += 1) {
-            for (let z = -1; z <= 1; z += 1) {
-              const at = { x: center.x + x, y: center.y, z: center.z + z }
-              blocks.set(positionKey(at), { at, block: END_EXIT_PORTAL_BLOCK })
-            }
-          }
-        }
         return {
           accepted: true,
           deltas: (nextRevision) => [{
@@ -2592,7 +2722,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
             player: message.player,
             state: inventorySnapshot(inventory),
           }],
-          snapshotBroadcastRequired: true,
+          frames: [committed.success.frame],
         }
       }
       case 'EndPortalUseCommand': {
@@ -2702,18 +2832,20 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           burnedSecs: 0,
           owner: message.player,
         }
-        const primed = writePositions([{ _tag: 'entity', entity: tnt }])
-        if (Result.isFailure(primed)) return { accepted: false, reason: 'invalid-command', failure: primed.failure }
+        const outside = firstOutsideAddressableCells(positionsOfWrite({ _tag: 'entity', entity: tnt }))
+        if (outside !== undefined) return { accepted: false, reason: 'invalid-command', failure: outside }
+        const committed = commitBlockEdits([{ at: message.at, block: null }])
+        if (Result.isFailure(committed)) return rejectBlockRead(committed.failure)
+        Result.getOrThrow(writePositions([{ _tag: 'entity', entity: tnt }]))
         if (selected.item === 'fire_charge') {
           inventory.slots[inventory.selectedSlot] = selected.count === 1
             ? null
             : { ...selected, count: selected.count - 1 }
         }
-        blocks.set(positionKey(message.at), { at: message.at, block: null })
         disturbFallingBlocks([message.at])
         return {
           accepted: true,
-          worldSnapshotRequired: true,
+          frames: [committed.success.frame],
           deltas: (nextRevision) => [
             ...(selected.item === 'fire_charge'
               ? [{ _tag: 'PlayerInventoryDelta' as const, world: actor.world, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) }]
@@ -2867,28 +2999,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           replacement = 'bucket'
         }
 
-        let blockMessage: NetworkMessage
-        if (block === null) {
-          blockMessage = { _tag: 'BlockBreak', player: message.player, world: actor.world, at }
-        } else {
-          const placed = Schema.decodeUnknownResult(BlockPlace)({
-            _tag: 'BlockPlace',
-            player: message.player,
-            world: actor.world,
-            at,
-            block,
-            state: 0,
-          })
-          if (Result.isFailure(placed)) {
-            return {
-              accepted: false,
-              reason: 'invalid-command',
-              failure: { _tag: 'BlockPlaceSchemaFailure', failure: placed.failure },
-            }
-          }
-          blockMessage = placed.success
-        }
-
         const nextSlots = inventory.slots.map((stack) => stack === null ? null : { ...stack })
         const nextDurability = inventory.durability.map((state) => state === null ? null : { ...state })
         if (selected.count === 1) {
@@ -2901,9 +3011,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           }
         }
 
+        const committed = commitBlockEdits([{ at, block }])
+        if (Result.isFailure(committed)) return rejectBlockRead(committed.failure)
         inventory.slots.splice(0, inventory.slots.length, ...nextSlots)
         inventory.durability.splice(0, inventory.durability.length, ...nextDurability)
-        blocks.set(positionKey(at), { at, block })
         disturbFallingBlocks([at])
         return {
           accepted: true,
@@ -2914,7 +3025,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
             player: message.player,
             state: inventorySnapshot(inventory),
           }],
-          messages: () => [blockMessage],
+          frames: [committed.success.frame],
         }
       }
       case 'FishingCommand': {
@@ -3651,6 +3762,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       sendEnchanting(client, enchantmentsDelta(message.player))
     }
     for (const outboundMessage of outboundMessages) broadcast(outboundMessage)
+    for (const frame of decision.frames ?? []) broadcastFrame(frame)
     for (const statusEffectDelta of decision.statusEffectDeltas?.(revision) ?? []) broadcastBrewing(statusEffectDelta)
     if (decision.worldSnapshotRequired === true) broadcast(authoritativeSnapshot())
     if (decision.snapshotBroadcastRequired === true) broadcast(snapshot())
@@ -3747,8 +3859,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const blockCommandHeader = (message: Extract<NetworkMessage, { _tag: 'BlockPlace' | 'BlockBreak' }>, context: SleepIntentContext) => ({
     actor: message.player,
     session: String(message.player),
-    requestId: `${String(message.player)}:${message._tag}:${String(revision)}:${positionKey(message.at)}`,
-    expectedRevision: revision,
+    requestId: `${String(message.player)}:${message._tag}:${String(blockRevisions().world)}:${positionKey(message.at)}`,
+    expectedRevision: blockRevisions().world,
     expectedDimensionRevision: context.expectedDimensionRevision,
     // The core's dimension is one of the three dimension ids C2 names.
     dimension: Result.getOrThrow(Schema.decodeUnknownResult(DimensionIdSchema)(dimension)),
@@ -3790,11 +3902,23 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       at: message.at,
       operation: message._tag === 'BlockPlace' ? 'place' : 'break',
       reason,
-      revision,
+      revision: blockRevisions().world,
     })
     return failure === undefined
       ? { accepted: false, reason: receiveReason }
       : { accepted: false, reason: receiveReason, failure }
+  }
+
+  const rejectBlockWrite = (
+    client: ConnectedClient,
+    message: Extract<NetworkMessage, { _tag: 'BlockPlace' | 'BlockBreak' }>,
+    failure: MultiplayerServerCoreFailure,
+  ): ReceiveResult => {
+    const reason = failure._tag === 'WorldWriteFailure'
+      ? failure.failure._tag === 'WorldWriteConflict' ? 'stale-revision'
+        : failure.failure._tag === 'WorldWriteChunkUnavailable' ? 'out-of-bounds' : 'unknown-block'
+      : 'unknown-block'
+    return rejectMutation(client, message, reason, 'invalid-mutation', failure)
   }
 
   const removePlayer = (clientId: ClientId, client: ConnectedClient): void => {
@@ -4386,13 +4510,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         if (Result.isFailure(summonState)) return rejectWitherFailure('summon', summonState.failure)
         const reserved = revisionAfter(1)
         if (Result.isFailure(reserved)) return rejectWitherCoreFailure(reserved.failure)
-        const summoned = writePositions([{ _tag: 'wither', state: summonState.success }])
-        if (Result.isFailure(summoned)) return rejectWitherCoreFailure(summoned.failure)
+        const outside = firstOutsideAddressableCells(positionsOfWrite({ _tag: 'wither', state: summonState.success }))
+        if (outside !== undefined) return rejectWitherCoreFailure(outside)
+        const committed = commitBlockEdits(summon.consumedBlocks.map((at) => ({ at, block: null })))
+        if (Result.isFailure(committed)) return rejectWitherCoreFailure(committed.failure)
+        Result.getOrThrow(writePositions([{ _tag: 'wither', state: summonState.success }]))
         // revisionAfter(1) succeeded above, and writing the wither does not advance the revision.
         Result.getOrThrow(advanceRevision())
-        for (const position of summon.consumedBlocks) blocks.set(positionKey(position), { at: position, block: null })
         disturbFallingBlocks(summon.consumedBlocks)
-        broadcast(snapshot())
+        broadcastFrame(committed.success.frame)
       } else {
         const actor = players.get(command.actor as PlayerId)
         const actorVitals = vitals.get(command.actor as PlayerId)
@@ -4482,6 +4608,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       if (Result.isFailure(reserved)) return rejectEnderDragonFailure(reserved.failure)
       const nextEnderDragonRevision = revisionAfterSteps('ender-dragon', enderDragonRevision, 1)
       if (Result.isFailure(nextEnderDragonRevision)) return rejectEnderDragonFailure(nextEnderDragonRevision.failure)
+      let portalDelta: BlockCommit | undefined
+      if (damage.events.some((event) => event._tag === 'ExitPortalMaterializationRequested')) {
+        const edits: BlockOverride[] = []
+        for (let x = -1; x <= 1; x += 1) {
+          for (let z = -1; z <= 1; z += 1) edits.push({ at: { x, y: 64, z }, block: END_EXIT_PORTAL_BLOCK })
+        }
+        const committed = commitBlockEdits(edits)
+        if (Result.isFailure(committed)) return rejectEnderDragonFailure(committed.failure)
+        portalDelta = committed.success
+      }
       lastEnderDragonAttackMs.set(command.actor as PlayerId, options.now?.() ?? Date.now())
       enderDragonState = damage.state
       // revisionAfter(revisionSteps) succeeded above, and each advancing event below advances the revision once.
@@ -4504,14 +4640,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity: drop })
         }
         if (event._tag === 'ExitPortalMaterializationRequested') {
-          for (let x = -1; x <= 1; x += 1) {
-            for (let z = -1; z <= 1; z += 1) {
-              const at = { x, y: 64, z }
-              blocks.set(positionKey(at), { at, block: END_EXIT_PORTAL_BLOCK })
-            }
-          }
           Result.getOrThrow(advanceRevision())
-          broadcast(snapshot())
+          broadcastFrame(Option.getOrThrow(Option.fromNullishOr(portalDelta)).frame)
         }
       }
       enderDragonRevision = nextEnderDragonRevision.success
@@ -4550,7 +4680,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       Result.getOrThrow(publishSleepEvents(result.revision, result.events))
       return { accepted: true, message: sleepMessage }
     }
-    const decoded = decodeFrame(frame)
+    const decoded = decodeFrame(frame, replicatedOwners)
     if (Result.isFailure(decoded)) return { accepted: false, reason: 'malformed-frame' }
     const message = decoded.success
 
@@ -4559,6 +4689,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         return { accepted: false, reason: 'identity-spoof' }
       }
       if (playerClients.has(message.player)) return { accepted: false, reason: 'duplicate-player' }
+      const blockSnapshot = replicatedSnapshotFrame()
+      if (Result.isFailure(blockSnapshot)) return { accepted: false, reason: 'invalid-command', failure: blockSnapshot.failure }
       const persistedPosition = playerPositions.get(message.player)
       const authoritativeAt = persistedPosition?.at ?? options.spawnAt
       const authoritativeFacing = persistedPosition?.facing ?? DEFAULT_FACING
@@ -4584,6 +4716,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       ensurePlayerState(message.player)
       notifyStateChanged()
       sendMessage(client, snapshot())
+      client.send(blockSnapshot.success)
       sendMessage(client, {
         _tag: 'PlayerMove',
         player: message.player,
@@ -4712,12 +4845,16 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         if (inventory === undefined || sourceStack == null || sourceStack.item !== placedBlock) {
           return rejectMutation(client, message, 'unknown-block')
         }
-        const advanced = advanceRevision()
-        if (Result.isFailure(advanced)) return rejectMutation(client, message, 'stale-revision', 'invalid-mutation', advanced.failure)
+        const reserved = revisionAfter(1)
+        if (Result.isFailure(reserved)) return rejectMutation(client, message, 'stale-revision', 'invalid-mutation', reserved.failure)
+        const state = decodeBlockState(blockId.value, message.state)
+        if (Result.isFailure(state)) return rejectBlockWrite(client, message, { _tag: 'SavedBlockStateFailure', at, failure: state.failure })
+        const committed = commitBlockEdits([{ at, block: placedBlock, state: state.success }])
+        if (Result.isFailure(committed)) return rejectBlockWrite(client, message, committed.failure)
+        Result.getOrThrow(advanceRevision())
         inventory.slots[sourceSlot] = sourceStack.count === 1
           ? null
           : { ...sourceStack, count: sourceStack.count - 1 }
-        blocks.set(positionKey(at), { at, block: placedBlock })
         disturbFallingBlocks([at])
         const containerKind = containerKindForBlock(placedBlock)
         if (containerKind !== undefined) {
@@ -4738,7 +4875,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           brewingStands.set(positionKey(at), { at: { ...at }, state: emptyBrewingStandState() })
         }
         notifyStateChanged()
-        broadcast({ ...message, world: worldId })
+        broadcastFrame(committed.success.frame)
         broadcast({
           _tag: 'PlayerInventoryDelta',
           world: worldId,
@@ -4831,11 +4968,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           stack,
         }))
         const drops = [...blockDrops, ...contentsDrops]
-        const dropped = writePositions(drops.map((drop) => ({ _tag: 'entity', entity: drop })))
-        if (Result.isFailure(dropped)) return rejectMutation(client, message, 'out-of-bounds', 'invalid-mutation', dropped.failure)
+        const outside = firstOutsideAddressableCells(drops.flatMap((entity) => positionsOfWrite({ _tag: 'entity', entity })))
+        if (outside !== undefined) return rejectMutation(client, message, 'out-of-bounds', 'invalid-mutation', outside)
+        const committed = commitBlockEdits([{ at, block: null }])
+        if (Result.isFailure(committed)) return rejectBlockWrite(client, message, committed.failure)
+        Result.getOrThrow(writePositions(drops.map((drop) => ({ _tag: 'entity', entity: drop }))))
         // revisionAfter(2) succeeded above, and writing the drops does not advance the revision.
         Result.getOrThrow(advanceRevision())
-        blocks.set(positionKey(at), { at, block: null })
         poweredRails.delete(positionKey(at))
         levers.delete(positionKey(at))
         disturbFallingBlocks([at])
@@ -4843,7 +4982,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         else if (brokenBlock === 'furnace') furnaces.delete(furnaceId)
         else if (brokenBlock === 'brewing_stand') brewingStands.delete(brewingKey)
         notifyStateChanged()
-        broadcast({ ...message, world: worldId })
+        broadcastFrame(committed.success.frame)
         for (const drop of drops) broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity: drop })
         if (brokenBlock === 'brewing_stand') {
           broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: emptyBrewingStandState() })
@@ -4856,10 +4995,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       }
       case 'Pong':
         return { accepted: true, message }
-      case 'AuthoritativeResyncRequest':
+      case 'AuthoritativeResyncRequest': {
         if (message.world !== worldId) return { accepted: false, reason: 'wrong-world' }
+        const blockSnapshot = replicatedSnapshotFrame()
+        if (Result.isFailure(blockSnapshot)) return { accepted: false, reason: 'invalid-command', failure: blockSnapshot.failure }
         sendMessage(client, authoritativeSnapshot())
+        client.send(blockSnapshot.success)
         return { accepted: true, message }
+      }
       // Everything below is a tag a legitimate client never sends here: broadcast-only
       // deltas/snapshots/results, or — for anvil/crafting/enchanting/brewing/damage/wither/
       // dragon — a command whose own wire format is decoded earlier in this function, so
@@ -4971,7 +5114,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(transfer)
   }
 
-  const acceptRealmTransfer = (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival): boolean => {
+  const acceptRealmTransfer = (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText): boolean => {
     const client = clients.get(clientId)
     if (client === undefined || client.playerId !== null || playerClients.has(transfer.player)) return false
     const player: MutablePlayer = {
@@ -5015,6 +5158,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       worldSnapshot: snapshot(),
       authoritativeSnapshot: authoritativeSnapshot(),
     })
+    client.send(preparedBlockSnapshot)
     sendAnvil(client, anvilNamesDelta(transfer.player))
     sendEnchanting(client, enchantmentsDelta(transfer.player))
     sendBrewing(client, {
@@ -5137,39 +5281,46 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
      * Records what the entity and Wither steps can change, for steps whose later reads see earlier changes and so
      * cannot read everything first. `undo` puts every recorded map back as the step found it.
      */
-    const beginStepUndo = (): Readonly<{ destroyBlock: (at: BlockPos) => void; undo: () => void }> => {
+    const beginStepUndo = (): Readonly<{
+      destroyBlock: (at: BlockPos) => void
+      commit: () => Result.Result<void, MultiplayerServerCoreFailure>
+      undo: () => void
+    }> => {
       const savedEntities = new Map(entities)
       const savedRecoveries = new Map(eyeOfEnderRecoveries)
       const savedVitals = new Map([...vitals].map(([player, state]) => [player, { ...state }]))
       const savedFallingPending = new Map(fallingPending)
       const savedMobMovements = new Map(mobMovements)
-      const replacedBlocks: Array<Readonly<{ key: string; previous: BlockOverride | undefined }>> = []
+      const undo = (): void => {
+        plannedBlocks.clear()
+        entities.clear()
+        for (const [id, entity] of savedEntities) entities.set(id, entity)
+        eyeOfEnderRecoveries.clear()
+        for (const [key, recovery] of savedRecoveries) eyeOfEnderRecoveries.set(key, recovery)
+        for (const [player, state] of savedVitals) {
+          const current = vitals.get(player)
+          if (current !== undefined) Object.assign(current, state)
+        }
+        fallingPending.clear()
+        for (const [key, at] of savedFallingPending) fallingPending.set(key, at)
+        mobMovements.clear()
+        for (const [id, movement] of savedMobMovements) mobMovements.set(id, movement)
+      }
       return {
         destroyBlock: (at) => {
-          const key = positionKey(at)
-          replacedBlocks.push({ key, previous: blocks.get(key) })
-          blocks.set(key, { at, block: null })
+          plannedBlocks.set(positionKey(at), { at, block: null })
           disturbFallingBlocks([at])
         },
-        undo: () => {
-          entities.clear()
-          for (const [id, entity] of savedEntities) entities.set(id, entity)
-          eyeOfEnderRecoveries.clear()
-          for (const [key, recovery] of savedRecoveries) eyeOfEnderRecoveries.set(key, recovery)
-          for (const [player, state] of savedVitals) {
-            const current = vitals.get(player)
-            if (current !== undefined) Object.assign(current, state)
-          }
-          fallingPending.clear()
-          for (const [key, at] of savedFallingPending) fallingPending.set(key, at)
-          mobMovements.clear()
-          for (const [id, movement] of savedMobMovements) mobMovements.set(id, movement)
-          // Both set and delete mark the chunk stale, so the next read regenerates it with the restored edits.
-          for (const { key, previous } of [...replacedBlocks].reverse()) {
-            if (previous === undefined) blocks.delete(key)
-            else blocks.set(key, previous)
-          }
+        commit: () => {
+          if (plannedBlocks.size === 0) return Result.succeed(undefined)
+          const committed = commitBlockEdits([...plannedBlocks.values()], undo)
+          if (Result.isFailure(committed)) return Result.fail(committed.failure)
+          plannedBlocks.clear()
+          const delta = committed.success
+          postPersistenceSends.push(() => broadcastFrame(delta.frame))
+          return Result.succeed(undefined)
         },
+        undo,
       }
     }
     const elapsedSecs = elapsedMs / 1_000
@@ -5442,12 +5593,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       const fallingBlocksResult = planPendingFallingBlocks()
       if (Result.isFailure(fallingBlocksResult)) return failStep(fallingBlocksResult.failure)
       if (fallingBlocksResult.success.moved) {
-        const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
-        stateChanged = true
-        worldSnapshotRequired = true
+        const reserved = revisionAfter(1)
+        if (Result.isFailure(reserved)) return failStep(reserved.failure)
       }
-      fallingBlocksResult.success.commit()
+      const fallingCommit = fallingBlocksResult.success.commit()
+      if (Result.isFailure(fallingCommit)) return failStep(fallingCommit.failure)
+      if (fallingCommit.success !== undefined) {
+        Result.getOrThrow(advanceRevision())
+        stateChanged = true
+        const delta = fallingCommit.success
+        postPersistenceSends.push(() => broadcastFrame(delta.frame))
+      }
 
       const agedEntities: AuthoritativeDelta[] = []
       const agingCommits: Array<() => void> = []
@@ -5529,7 +5685,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         const centerPosition = Result.getOrThrow(positionFromNumbers(center.x, center.y, center.z))
         let blockReadFailure: MultiplayerServerCoreFailure | undefined
         const blockReader = (position: BlockPos) => {
-          if (!isInBounds(position)) return undefined
+          if (!isInBounds(position) || !world.isLoaded(position)) return undefined
           const block = blockAt(position)
           if (Result.isFailure(block)) {
             blockReadFailure ??= block.failure
@@ -5921,6 +6077,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       }
       // A despawned or slain mob leaves no movement behind.
       for (const id of mobMovements.keys()) if (!entities.has(id)) mobMovements.delete(id)
+      const blockCommit = stepUndo.commit()
+      if (Result.isFailure(blockCommit)) return failEntityStep(blockCommit.failure)
       if (movedEntities.length > 0 || damagedPlayers.size > 0 || worldChanged) {
         // revisionAfter(1) succeeded before this step changed anything, and nothing in it advances the revision.
         Result.getOrThrow(advanceRevision())
@@ -6075,7 +6233,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         for (const explosion of advanceResult.success.explosions) {
           let explosionBlockReadFailure: MultiplayerServerCoreFailure | undefined
           const blockReader = (position: BlockPos) => {
-            if (!isInBounds(position)) return undefined
+            if (!isInBounds(position) || !world.isLoaded(position)) return undefined
             const block = blockAt(position)
             if (Result.isFailure(block)) {
               explosionBlockReadFailure ??= block.failure
@@ -6118,6 +6276,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           }
         }
       }
+      const blockCommit = stepUndo.commit()
+      if (Result.isFailure(blockCommit)) return failWitherStep(blockCommit.failure)
       if (worldChanged || damagedPlayers.size > 0) {
         // revisionAfter(1) succeeded before the first melee or explosion, and nothing in this step advanced since.
         Result.getOrThrow(advanceRevision())
@@ -6210,5 +6370,5 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(true)
   }
 
-  return Result.succeed({ worldWrite: worldWrite.success, connect, receive, disconnect, detachPlayer, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
+  return Result.succeed({ connect, receive, disconnect, detachPlayer, prepareRealmTransfer: replicatedSnapshotFrame, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
 }

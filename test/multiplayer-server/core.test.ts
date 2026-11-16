@@ -1,3 +1,4 @@
+import { replicatedOwners } from './codec'
 import {
   PROTOCOL_VERSION,
   TransferIdSchema,
@@ -12,8 +13,8 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import type { Dimension } from '@nerima-games/mc-worldgen'
-import { EncodedBlockStateSchema } from '@nerima-games/mc-kernel'
-import { Result, Schema } from 'effect'
+import { AIR_BLOCK_ID, blockIdOf, EncodedBlockStateSchema } from '@nerima-games/mc-kernel'
+import { Option, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
 import { makeMultiplayerServerCore, type MultiplayerServerOptions, type MultiplayerServerState, type ReceiveResult } from '../../apps/multiplayer-server/core'
@@ -28,6 +29,7 @@ import { decodeWitherWireMessage, type WitherWireMessage } from '../../apps/mult
 
 // Zero is the default block state; the kernel codec validates it.
 const DEFAULT_BLOCK_STATE = Result.getOrThrow(Schema.decodeUnknownResult(EncodedBlockStateSchema)(0))
+const STONE_BLOCK = Option.getOrThrow(blockIdOf('stone'))
 
 const playerId = (value: string): PlayerId => value as PlayerId
 const playerName = (value: string): PlayerName => value as PlayerName
@@ -41,7 +43,7 @@ const frame = (message: NetworkMessage): WireText => {
 
 const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage> =>
   frames.filter((wire) => decodeSleepWireMessage(wire) === undefined && decodeWitherWireMessage(wire) === undefined && decodeEnderDragonWireMessage(wire) === undefined && decodeBrewingWireMessage(wire) === undefined && decodeAnvilWireMessage(wire) === undefined && decodeEnchantingWireMessage(wire) === undefined).map((wire) => {
-    const result = decodeFrame(wire)
+    const result = decodeFrame(wire, replicatedOwners)
     if (result._tag === 'Failure') throw result.failure
     return result.success
   })
@@ -411,13 +413,19 @@ describe('authoritative multiplayer server core', () => {
     expect(fixture.receive('socket-a', {
       _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at, block: 'stone', state: DEFAULT_BLOCK_STATE,
     }).accepted).toBe(true)
-    expect(messages(bobFrames)).toContainEqual(expect.objectContaining({ _tag: 'BlockPlace', at, block: 'stone' }))
+    expect(messages(bobFrames)).toContainEqual({
+      _tag: 'ReplicatedWorldDelta', world: worldId('world-1'), revision: 1, changes: [],
+      blockChanges: [{ dimension: 'overworld', position: at, before: AIR_BLOCK_ID, after: STONE_BLOCK, beforeState: DEFAULT_BLOCK_STATE, afterState: DEFAULT_BLOCK_STATE }],
+    })
     expect(fixture.server.snapshot()).toMatchObject({ revision: 1, blocks: [{ at, block: 'stone' }] })
 
     expect(fixture.receive('socket-a', {
       _tag: 'BlockBreak', player: playerId('alice'), world: worldId('world-1'), at,
     }).accepted).toBe(true)
-    expect(messages(bobFrames)).toContainEqual(expect.objectContaining({ _tag: 'BlockBreak', at }))
+    expect(messages(bobFrames)).toContainEqual({
+      _tag: 'ReplicatedWorldDelta', world: worldId('world-1'), revision: 2, changes: [],
+      blockChanges: [{ dimension: 'overworld', position: at, before: STONE_BLOCK, after: AIR_BLOCK_ID, beforeState: DEFAULT_BLOCK_STATE, afterState: DEFAULT_BLOCK_STATE }],
+    })
     expect(fixture.server.snapshot()).toMatchObject({ revision: 2, blocks: [{ at, block: null }] })
   })
 
@@ -1049,12 +1057,13 @@ describe('authoritative multiplayer server core', () => {
     const transfer = Result.getOrThrow(source.server.detachPlayer('socket-a'))
     expect(transfer).toBeDefined()
     if (transfer === undefined) throw new Error('alice was not detached')
+    const prepared = Result.getOrThrow(destination.server.prepareRealmTransfer())
     expect(destination.server.acceptRealmTransfer('socket-b', transfer, {
       commandId: CommandId.make('far-transfer'),
       fromWorld: worldId('world-1'),
       at: { x: far, y: 65, z: 0 },
       facing: { yawRadians: 0, pitchRadians: 0 },
-    })).toBe(false)
+    }, prepared)).toBe(false)
     expect(destination.server.snapshot().players).toEqual([])
   })
 
@@ -1086,12 +1095,13 @@ describe('authoritative multiplayer server core', () => {
     const transfer = Result.getOrThrow(source.server.detachPlayer('socket-a'))
     if (transfer === undefined) throw new Error('alice was not detached')
     expect(source.server.snapshot().players).toEqual([])
+    const prepared = Result.getOrThrow(destination.prepareRealmTransfer())
     expect(destination.acceptRealmTransfer('socket-a', transfer, {
       commandId: 'end-transfer' as CommandId,
       fromWorld: worldId('world-1'),
       at: { x: 0, y: 65, z: 0 },
       facing: { yawRadians: 1, pitchRadians: 0 },
-    })).toBe(true)
+    }, prepared)).toBe(true)
 
     expect(messages(destinationFrames)).toContainEqual(expect.objectContaining({
       _tag: 'RealmTransferSnapshot',
