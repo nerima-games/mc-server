@@ -26,7 +26,7 @@ import {
   SurvivalAuthority,
   type SurvivalEvent,
 } from '@nerima-games/mx-multiplayer'
-import { AIR_BLOCK_ID, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
@@ -104,6 +104,12 @@ import {
   resolveSafeEndermanTeleport,
   stepCreeperFuse,
   stepEcosystemMob,
+  chunkCoordsAround,
+  mobMovementWorldFromChunkWindow,
+  planMobMovementRoster,
+  type ChunkWindow,
+  type MobMovementRosterFault,
+  type MobRoster,
   TNT_EXPLOSION_POWER,
   weatherExpires,
   type CreeperFuse,
@@ -300,6 +306,7 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'BlockOverrideNotInRegistry'; at: BlockPos; block: string }>
   | Readonly<{ _tag: 'SavedFurnaceInvalid'; furnaceId: string; failure: FurnaceAdvanceFailure }>
   | Readonly<{ _tag: 'WitherSkullOutsideProjectileRules'; id: string }>
+  | Readonly<{ _tag: 'MobMovementFailure'; fault: MobMovementRosterFault }>
   | Readonly<{ _tag: 'InvalidServerBounds'; bounds: ServerBounds }>
   | Readonly<{ _tag: 'RevisionExhausted'; counter: RevisionCounter; revision: number }>
   | Readonly<{ _tag: 'SimulationTickExhausted'; simulationTick: number; elapsedTicks: number }>
@@ -372,6 +379,8 @@ export interface ChunkStorePart {
   readonly peek: (coord: ChunkCoord) => ReadonlyChunkWithBlockStates | undefined
   readonly load: (coord: ChunkCoord) => Result.Result<ReadonlyChunkWithBlockStates, ChunkStoreError>
   readonly unload: (coord: ChunkCoord) => Result.Result<boolean, ChunkPersistenceError>
+  /** A synchronous view over the named resident chunks; it peeks only, so the caller loads them first. */
+  readonly openWindow: (coords: ReadonlyArray<ChunkCoord>) => ChunkWindow
 }
 
 /** Effect-backed services the core uses synchronously; `entrypoints/core-parts.ts` builds them. */
@@ -544,6 +553,15 @@ type TimeWeatherState = AuthoritativeSnapshot['timeWeather']
 type ContainerState = AuthoritativeSnapshot['containers'][number]
 type FurnaceState = AuthoritativeSnapshot['furnaces'][number]
 type MobWireState = NonNullable<Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>['mobState']>
+
+/** A passive mob between game ticks of one tick: its stored entity, AI state, and planned feet. */
+type PassiveMob = Readonly<{
+  entity: Extract<AuthoritativeEntityState, { readonly _tag: 'living' }>
+  kind: NonNullable<ReturnType<typeof supportedPassiveMobKind>>
+  mobState: MobWireState
+  ecosystem: EcosystemMobState
+  feet: Position
+}>
 const containerKindForBlock = (block: string): ContainerKind | undefined => {
   switch (block) {
     case 'chest':
@@ -1124,6 +1142,8 @@ type ChunkOverlay = ReadonlyArray<Readonly<{ index: number; block: BlockId }>>
 /** Reads the world through one path: the chunk column is loaded and its edits validated before any cell is answered. */
 export interface WorldBlockReader {
   readonly blockAt: (at: BlockPos) => Result.Result<string | null, MultiplayerServerCoreFailure>
+  /** A ChunkWindow over the named chunks, each first loaded or regenerated with the current edits like blockAt's. */
+  readonly openWindow: (coords: ReadonlyArray<ChunkCoord>) => Result.Result<ChunkWindow, MultiplayerServerCoreFailure>
 }
 
 const generatedReadFailure = (failure: GeneratedBlockReadFailure): MultiplayerServerCoreFailure => ({ _tag: 'GeneratedBlockReadFailure', failure })
@@ -1195,7 +1215,15 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
     return Result.succeed(block.success === undefined || block.success === 'air' ? null : block.success)
   }
 
-  return { blockAt }
+  const openWindow = (coords: ReadonlyArray<ChunkCoord>): Result.Result<ChunkWindow, MultiplayerServerCoreFailure> => {
+    for (const coord of coords) {
+      const loaded = loadChunk(coord)
+      if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
+    }
+    return Result.succeed(chunkStore.openWindow(coords))
+  }
+
+  return { blockAt, openWindow }
 }
 
 /** The generated terrain alone, read through the same path the core uses; the entrypoint finds spawn with it. */
@@ -1248,6 +1276,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const entities = new Map<string, AuthoritativeEntityState>(
     (options.initialState?.entities ?? []).map((entity) => [entity.entityId, entity]),
   )
+  // A passive mob's body and path between ticks. The wire mob state has no field for it, so it is not persisted, and
+  // a mob loaded from a save starts its movement at rest.
+  const mobMovements = new Map<string, NonNullable<EcosystemMobState['movement']>>()
   const eyeOfEnderRecoveries = new Map<string, EyeOfEnderRecoveryState>(
     (options.initialState?.eyeOfEnderRecoveries ?? []).map((recovery) => [
       recovery.entityId,
@@ -4967,6 +4998,58 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return true
   }
 
+  /**
+   * Steps passive mobs for `elapsedTicks` game ticks: each game tick advances every mob's AI with stepEcosystemMob, then
+   * moves the whole roster once with planMobMovementRoster over a ChunkWindow of the core's ChunkStore, which reads the
+   * same edited cells as blockAt. A planner fault fails the step rather than leaving one mob behind silently.
+   */
+  const planPassiveMobs = (
+    mobs: ReadonlyArray<PassiveMob>,
+    elapsedTicks: number,
+  ): Result.Result<ReadonlyArray<PassiveMob>, MultiplayerServerCoreFailure> => {
+    if (mobs.length === 0 || elapsedTicks === 0) return Result.succeed(mobs)
+    // mx-gameplay's entities stage opens its movement window one chunk width around each mob.
+    const coords = new Map<string, ChunkCoord>()
+    for (const { feet } of mobs) {
+      for (const coord of chunkCoordsAround(feet, CHUNK_SIZE_XZ)) coords.set(chunkKeyOf(coord.cx, coord.cz), coord)
+    }
+    const window = world.openWindow([...coords.values()])
+    if (Result.isFailure(window)) return Result.fail(window.failure)
+    const movementWorld = mobMovementWorldFromChunkWindow(window.success)
+    let current = mobs
+    for (let gameTick = 0; gameTick < elapsedTicks; gameTick += 1) {
+      // stepEcosystemMob advances exactly one game tick per call and leaves a passive mob's feet in place.
+      const stepped = current.map((mob) => ({ ...mob, ecosystem: stepEcosystemMob(mob.kind, mob.ecosystem, mob.feet, undefined, GAME_TICK_SECS).state }))
+      // The roster lives for one plan, so it mints no serials. Health is the wire value, finite and positive.
+      const roster: MobRoster = {
+        nextSerial: EntitySerial(0),
+        entities: stepped.map((mob) => ({
+          id: mob.entity.entityId,
+          kind: EntityKind(mob.kind),
+          feetPosition: mob.feet,
+          healthPoints: EntityHealthPoints(mob.entity.health),
+          behaviour: mob.ecosystem,
+          dimension,
+        })),
+      }
+      // simulationTick already counts this tick's game ticks, so this game tick is the matching earlier one.
+      const plannedTick = SimulationTick(simulationTick - elapsedTicks + gameTick + 1)
+      const planned = Result.getOrThrow(planMobMovementRoster(roster, undefined, movementWorld, plannedTick, dimension))
+      const [fault] = planned.faults
+      if (fault !== undefined) return Result.fail({ _tag: 'MobMovementFailure', fault })
+      const plannedById = new Map(planned.roster.entities.map((entity) => [String(entity.id), entity]))
+      current = stepped.map((mob) => {
+        // planMobMovementRoster maps every roster entity to its planned entity under the same id, and writes an
+        // ecosystem mob's behaviour back as its ecosystem state with the planned movement.
+        const entity = Option.getOrThrow(Option.fromNullishOr(plannedById.get(mob.entity.entityId)))
+        const behaviour = entity.behaviour
+        const ecosystem = Option.getOrThrow(Option.fromNullishOr(behaviour?._tag === 'EcosystemMob' ? behaviour : undefined))
+        return { ...mob, feet: entity.feetPosition, ecosystem }
+      })
+    }
+    return Result.succeed(current)
+  }
+
   const tick = (elapsedMs: number): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
       return Result.fail({ _tag: 'InvalidServerTickDuration', elapsedMs })
@@ -5015,6 +5098,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       const savedRecoveries = new Map(eyeOfEnderRecoveries)
       const savedVitals = new Map([...vitals].map(([player, state]) => [player, { ...state }]))
       const savedFallingPending = new Map(fallingPending)
+      const savedMobMovements = new Map(mobMovements)
       const replacedBlocks: Array<Readonly<{ key: string; previous: BlockOverride | undefined }>> = []
       return {
         destroyBlock: (at) => {
@@ -5034,6 +5118,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           }
           fallingPending.clear()
           for (const [key, at] of savedFallingPending) fallingPending.set(key, at)
+          mobMovements.clear()
+          for (const [id, movement] of savedMobMovements) mobMovements.set(id, movement)
           // Both set and delete mark the chunk stale, so the next read regenerates it with the restored edits.
           for (const { key, previous } of [...replacedBlocks].reverse()) {
             if (previous === undefined) blocks.delete(key)
@@ -5369,6 +5455,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
       let worldChanged = false
+      const passiveMobs: PassiveMob[] = []
       for (const [key, recovery] of eyeOfEnderRecoveries) {
         const remainingSecs = recovery.remainingSecs - elapsedSecs
         if (remainingSecs > 0) {
@@ -5727,15 +5814,26 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           continue
         }
         const passiveKind = supportedPassiveMobKind(entity.entityType)
-        const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
-        const kind = passiveKind ?? hostileKind
-        if (kind === undefined) continue
-        const target = hostileKind === undefined ? undefined : targetEntry?.[1].at
         // validateEcosystemMobStates checked loaded and spawned mobs, and the tick only writes mx-gameplay results back.
         const state = Result.getOrThrow(ecosystemMobStateForSimulation(entity.mobState)) ?? initialEcosystemMobState()
         // The mob and its target player are stored positions, which writePositions or load validation kept in
         // addressable cells, so each axis is finite.
         const selfPosition = Result.getOrThrow(positionFromNumbers(entity.at.x, entity.at.y, entity.at.z))
+        if (passiveKind !== undefined) {
+          const movement = mobMovements.get(entity.entityId)
+          passiveMobs.push({
+            entity,
+            kind: passiveKind,
+            mobState: initialMobState,
+            ecosystem: movement === undefined ? state : { ...state, movement },
+            feet: selfPosition,
+          })
+          continue
+        }
+        const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
+        if (hostileKind === undefined) continue
+        const kind = hostileKind
+        const target = targetEntry?.[1].at
         const targetPosition = target === undefined ? undefined : Result.getOrThrow(positionFromNumbers(target.x, target.y, target.z))
         // stepEcosystemMob advances exactly one game tick per call.
         let ecosystem = state
@@ -5753,7 +5851,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           z: Math.min(bounds.maxZ, Math.max(bounds.minZ, feetPosition.z)),
         }
         const mobState = {
-          ...(hostileKind === undefined ? initialMobState : hostileMobState),
+          ...hostileMobState,
           attackCooldownSecs: ecosystem.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
           motionPhase: ecosystem.motionPhase,
           provoked: ecosystem.provoked,
@@ -5776,6 +5874,37 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           }
         }
       }
+      // Passive mobs move as one roster after the loop: mx-gameplay plans the whole roster once per game tick.
+      const plannedPassiveMobs = planPassiveMobs(passiveMobs, elapsedTicks)
+      if (Result.isFailure(plannedPassiveMobs)) return failEntityStep(plannedPassiveMobs.failure)
+      for (const { entity, mobState, ecosystem, feet } of plannedPassiveMobs.success) {
+        const at = {
+          ...feet,
+          x: Math.min(bounds.maxX, Math.max(bounds.minX, feet.x)),
+          z: Math.min(bounds.maxZ, Math.max(bounds.minZ, feet.z)),
+        }
+        const updated = {
+          ...entity,
+          at,
+          mobState: {
+            ...mobState,
+            attackCooldownSecs: ecosystem.attackCooldownTicks * MINECRAFT_TICK_MS / 1_000,
+            motionPhase: ecosystem.motionPhase,
+            provoked: ecosystem.provoked,
+          },
+        }
+        const walked = writePositions([{ _tag: 'entity', entity: updated }])
+        if (Result.isFailure(walked)) {
+          // A refused mob keeps its position and the movement it had before this step.
+          refuse(walked.failure, entity.entityType, 'kept')
+          continue
+        }
+        if (ecosystem.movement === undefined) mobMovements.delete(entity.entityId)
+        else mobMovements.set(entity.entityId, ecosystem.movement)
+        movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
+      }
+      // A despawned or slain mob leaves no movement behind.
+      for (const id of mobMovements.keys()) if (!entities.has(id)) mobMovements.delete(id)
       if (movedEntities.length > 0 || damagedPlayers.size > 0 || worldChanged) {
         // revisionAfter(1) succeeded before this step changed anything, and nothing in it advances the revision.
         Result.getOrThrow(advanceRevision())

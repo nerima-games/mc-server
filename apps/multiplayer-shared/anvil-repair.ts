@@ -1,4 +1,4 @@
-import { Brand, Result } from 'effect'
+import { Brand, Option, Result } from 'effect'
 import { ITEM_TYPES, type ItemType } from '@nerima-games/mc-kernel'
 import {
   ENCHANTMENT_IDS,
@@ -34,26 +34,15 @@ import {
 const isGameplayEnchantmentId = (value: string): value is EnchantmentId =>
   ENCHANTMENT_IDS.some((id) => id === value)
 
-export type AnvilRuleConfigurationFailure = {
-  readonly _tag: 'AnvilRuleConfigurationFailure'
-  readonly enchantmentId: EnchantmentId
-}
-
 export type AnvilOperationFailure =
   | AnvilPrimitiveFailure
-  | AnvilRuleConfigurationFailure
   | ItemStackFailure
 
 const buildAnvilEnchantmentRule = (
   id: EnchantmentId,
-): Result.Result<
-  AnvilRuleSet['enchantments'][number],
-  AnvilRuleConfigurationFailure | AnvilPrimitiveFailure
-> => {
-  const sourceRule = enchantmentRuleFor(id)
-  if (sourceRule === undefined) {
-    return Result.fail({ _tag: 'AnvilRuleConfigurationFailure', enchantmentId: id })
-  }
+): Result.Result<AnvilRuleSet['enchantments'][number], AnvilPrimitiveFailure> => {
+  // mc-sim defines an enchantment rule for every id in mx-gameplay's ENCHANTMENT_IDS, the only ids passed here.
+  const sourceRule = Option.getOrThrow(Option.fromNullishOr(enchantmentRuleFor(id)))
 
   const definition = ENCHANTMENT_REGISTRY[id]
   return Result.map(Result.all(definition.incompatibleWith.map(AnvilEnchantmentId)), (incompatibleWith) => ({
@@ -81,10 +70,10 @@ export const spendExperienceLevels = (
   const progress = (
     checkedExperience.success - totalExperienceAtLevel(currentLevel)
   ) / experienceCostOfLevel(currentLevel)
-  const nextLevel = ExperienceLevel.result(currentLevel - checkedLevels.success)
-  if (Result.isFailure(nextLevel)) return Result.fail(nextLevel.failure)
-  return Result.succeed(totalExperienceAtLevel(nextLevel.success)
-    + Math.floor(progress * experienceCostOfLevel(nextLevel.success)))
+  // Both levels are non-negative safe integers and the current one is at least the spent one, so the difference is too.
+  const nextLevel = Result.getOrThrow(ExperienceLevel.result(currentLevel - checkedLevels.success))
+  return Result.succeed(totalExperienceAtLevel(nextLevel)
+    + Math.floor(progress * experienceCostOfLevel(nextLevel)))
 }
 
 export type AnvilOperationRequest = {
@@ -122,10 +111,7 @@ const anvilRepairMaterials = ITEM_TYPES.flatMap((item) => {
     : [{ target: item, material: 'iron_ingot' as const, durabilityPerUnit: durability.max }]
 })
 
-export const ANVIL_RULES: Result.Result<
-  AnvilRuleSet,
-  AnvilRuleConfigurationFailure | AnvilPrimitiveFailure
-> = Result.map(
+export const ANVIL_RULES: Result.Result<AnvilRuleSet, AnvilPrimitiveFailure> = Result.map(
   Result.all(ENCHANTMENT_IDS.map(buildAnvilEnchantmentRule)),
   (enchantments) => Object.freeze({
     enchantments: Object.freeze(enchantments),
@@ -153,7 +139,7 @@ const anvilPayload = (
 
 export const planAnvilOperation = (
   input: AnvilOperationInput,
-): Result.Result<AnvilPlan, AnvilPrimitiveFailure | AnvilRuleConfigurationFailure> => {
+): Result.Result<AnvilPlan, AnvilPrimitiveFailure> => {
   if (typeof input.name !== 'string') return Result.succeed(invalidInput('name', 'must be a string'))
 
   const requestedName = input.name.trim()

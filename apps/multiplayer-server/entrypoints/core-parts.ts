@@ -2,6 +2,7 @@ import { DeltaTimeSecs } from '@nerima-games/mc-kernel'
 import { ChunkCapacity, makeChunkStore } from '@nerima-games/mc-worldgen'
 import {
   makeInMemoryVitals,
+  openChunkWindow,
   makeSurvivalHungerRuntime,
   SPAWN_PLAYER_VITALS,
   SURVIVAL_HUNGER_STATE_VERSION,
@@ -54,6 +55,7 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
       peek: (coord) => Effect.runSync(store.peek(coord)),
       load: (coord) => Effect.runSync(Effect.result(store.load(coord))),
       unload: (coord) => Effect.runSync(Effect.result(store.unload(coord))),
+      openWindow: (coords) => Effect.runSync(openChunkWindow(store, coords)),
     }
   },
 })

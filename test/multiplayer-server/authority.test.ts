@@ -10,9 +10,16 @@ import {
   type WireText,
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
-import { EncodedBlockStateSchema, PositionAxis } from '@nerima-games/mc-kernel'
+import {
+  CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
+  PositionAxis, SimulationTick, position, type Position,
+} from '@nerima-games/mc-kernel'
 import { DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
-import { SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS } from '@nerima-games/mx-gameplay'
+import type { ChunkSource } from '@nerima-games/mc-worldgen'
+import {
+  chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, planMobMovementRoster,
+  SKELETON_ATTACK_DAMAGE, SKELETON_ATTACK_INTERVAL_TICKS, stepEcosystemMob, type EcosystemMobState,
+} from '@nerima-games/mx-gameplay'
 import { Effect, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
@@ -3349,34 +3356,124 @@ describe('multiplayer server authoritative state', () => {
     }))
   })
 
+  // A stone floor under y = 64, so the cow stands on a walkable cell. The cow starts at z = 8, clear of the chest and
+  // furnace that initialState places at z = 0, and alice stands two blocks behind it.
+  const pastureTerrain = terrainFrom((at) => at.y === 63 ? 'stone' : null)
+  const cowStart = { x: 0, y: 64, z: 8 }
+  const pastureJoinAt = { x: -2, y: 64, z: 8 }
+  const pastureState = (): MultiplayerServerState => ({
+    ...initialState(),
+    entities: [{ _tag: 'living', entityId: entityId('cow-1'), entityType: 'cow', at: cowStart, health: 10, maxHealth: 10 }],
+  })
+  // The core reads the save's block edits over the terrain, so the independent plan reads them too.
+  const pastureWithEdits = terrainFrom((at) =>
+    initialState().blocks.find((edit) => edit.at.x === at.x && edit.at.y === at.y && edit.at.z === at.z)?.block
+      ?? (at.y === 63 ? 'stone' : null))
+
+  /**
+   * A lone cow planned through the published mx-gameplay API with the inputs the core gives it: a ChunkWindow over
+   * the same terrain, then per game tick one stepEcosystemMob and one planMobMovementRoster, with no target, at
+   * simulation ticks 1 to `gameTicks` in the overworld.
+   */
+  const plannedCowFeet = (terrain: ChunkSource, start: Position, gameTicks: number): Position => {
+    const store = makeMultiplayerServerCoreParts().openChunkStore(terrain)
+    const coords = chunkCoordsAround(start, CHUNK_SIZE_XZ)
+    for (const coord of coords) Result.getOrThrow(store.load(coord))
+    const world = mobMovementWorldFromChunkWindow(store.openWindow(coords))
+    let ecosystem: EcosystemMobState = initialEcosystemMobState()
+    let feet = start
+    for (let gameTick = 0; gameTick < gameTicks; gameTick += 1) {
+      ecosystem = stepEcosystemMob(EntityKind('cow'), ecosystem, feet, undefined, DeltaTimeSecs(Number(DEFAULT_TICK_DURATION))).state
+      const planned = Result.getOrThrow(planMobMovementRoster({
+        nextSerial: EntitySerial(0),
+        entities: [{
+          id: KernelEntityId('cow-1'), kind: EntityKind('cow'), feetPosition: feet, healthPoints: EntityHealthPoints(10),
+          behaviour: ecosystem, dimension: 'overworld',
+        }],
+      }, undefined, world, SimulationTick(gameTick + 1), 'overworld'))
+      expect(planned.faults).toEqual([])
+      const [cow] = planned.roster.entities
+      if (cow === undefined || cow.behaviour?._tag !== 'EcosystemMob') throw new Error('the planner keeps the cow as an ecosystem mob')
+      feet = cow.feetPosition
+      ecosystem = cow.behaviour
+    }
+    return feet
+  }
+
   it('advances passive mob movement and persists its AI state authoritatively', () => {
-    const fixture = makeFixture({
-      ...initialState(),
-      entities: [{
-        _tag: 'living', entityId: entityId('cow-1'), entityType: 'cow',
-        at: { x: 0, y: 64, z: 0 }, health: 10, maxHealth: 10,
-      }],
-    })
+    const fixture = makeFixture(pastureState(), pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
     fixture.sent.length = 0
     fixture.persisted.length = 0
-    // mx-gameplay 0.11 stepEcosystemMob adds one to motionPhase per call, and the core calls it once per game tick,
+    // mx-gameplay's stepEcosystemMob adds one to motionPhase per call, and the core calls it once per game tick,
     // so a 1000 ms tick advances the phase by 1000 ms / DEFAULT_TICK_DURATION = 20 ticks.
     const ticksPerSecond = 1_000 / (Number(DEFAULT_TICK_DURATION) * 1_000)
+    const expectedFeet = plannedCowFeet(
+      pastureWithEdits,
+      position(PositionAxis(cowStart.x), PositionAxis(cowStart.y), PositionAxis(cowStart.z)),
+      ticksPerSecond,
+    )
 
     fixture.server.tick(1_000)
 
     const update = messages(fixture.sent).find((message) => message._tag === 'EntityUpdateDelta')
-    expect(update).toMatchObject({
-      entity: {
-        entityId: 'cow-1',
-        at: { x: expect.closeTo(Math.cos(1) * 1, 10), z: expect.closeTo(Math.sin(1) * 1, 10) },
-        mobState: expect.objectContaining({ motionPhase: ticksPerSecond, attackCooldownSecs: 0, provoked: false }),
-      },
-    })
-    expect(fixture.persisted.at(-1)?.entities).toContainEqual(expect.objectContaining({
+    if (update?._tag !== 'EntityUpdateDelta' || update.entity._tag !== 'living') throw new Error('the cow update is sent')
+    expect(update.entity).toMatchObject({
       entityId: 'cow-1',
+      at: { x: expectedFeet.x, y: expectedFeet.y, z: expectedFeet.z },
       mobState: { motionPhase: ticksPerSecond, attackCooldownSecs: 0, provoked: false },
-    }))
+    })
+    // Properties the planner guarantees on its own: the cow walked, and it still stands on the floor's top face.
+    expect(Math.hypot(update.entity.at.x - cowStart.x, update.entity.at.z - cowStart.z)).toBeGreaterThan(0)
+    expect(update.entity.at.y).toBe(64)
+    expect(fixture.persisted.at(-1)?.entities).toEqual([update.entity])
+  })
+
+  it('fails the entity step without changing state when the cow\'s movement window cannot load a chunk', () => {
+    // A saved block name the registry lacks, in a chunk inside the cow's movement window. Load validation rejects
+    // such a save, so the core is built from initialState directly to reach the runtime path.
+    const unreadable = { at: { x: 20, y: 64, z: 8 }, block: 'legacy_unknown' }
+    const state: MultiplayerServerState = { ...pastureState(), blocks: [...initialState().blocks, unreadable] }
+    const untouched = makeFixture(state, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+    const fixture = makeFixture(state, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+    fixture.sent.length = 0
+
+    // One game tick: the time step completes, then opening the cow's window fails.
+    expect(fixture.server.tick(50)).toEqual(Result.fail({ _tag: 'BlockOverrideNotInRegistry', ...unreadable }))
+    expect(messages(fixture.sent)).toEqual([expect.objectContaining({ _tag: 'WorldTimeWeatherDelta', state: { timeOfDay: 6_001, weather: 'clear' } })])
+    const expected = wholeStateAfterObserverJoins(untouched)
+    const { weatherClock } = expected
+    if (weatherClock === undefined) throw new Error('the core persists its weather clock')
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual({
+      ...expected,
+      timeWeather: { timeOfDay: 6_001, weather: 'clear' },
+      weatherClock: { ...weatherClock, remainingSecs: weatherClock.remainingSecs - 0.05 },
+    })
+  })
+
+  it('plans passive movement over the player-edited cells the core reads', () => {
+    const run = (placeWall: boolean) => {
+      const fixture = makeFixture(pastureState(), pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+      // The first tick loads the cow's chunks, so the placed block below makes a resident chunk stale.
+      expect(fixture.server.tick(50)).toEqual(Result.succeed({ refusals: [] }))
+      if (placeWall) {
+        expect(fixture.receive({
+          _tag: 'BlockPlace', player: playerId('alice'), world: worldId('world-1'), at: { x: 1, y: 64, z: 8 }, block: 'stone',
+          state: DEFAULT_BLOCK_STATE,
+        }).accepted).toBe(true)
+      }
+      expect(fixture.server.tick(3_000)).toEqual(Result.succeed({ refusals: [] }))
+      const [cow] = fixture.persisted.at(-1)?.entities ?? []
+      if (cow === undefined) throw new Error('the cow is persisted')
+      return cow.at
+    }
+    const open = run(false)
+    const walled = run(true)
+
+    // The cow wanders toward +x. On the unedited floor it stays at y = 64; with the player's stone at x = 1 in its
+    // way it steps up onto that block, which only the edit overlay can show the planner.
+    expect(open.y).toBe(64)
+    expect(walled.y).toBe(65)
+    expect(walled).not.toEqual(open)
   })
 
   it('applies hostile mob attacks to the nearest player and preserves cooldown state', () => {
