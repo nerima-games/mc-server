@@ -13,9 +13,9 @@ import {
 } from '@nerima-games/mx-multiplayer'
 import {
   AIR_BLOCK_ID, BlockAxis, blockIdOf, defaultBlockState, CHUNK_SIZE_XZ, DeltaTimeSecs, EncodedBlockStateSchema, type ChunkCoord, EntityHealthPoints, EntityId as KernelEntityId, EntityKind, EntitySerial,
-  PositionAxis, SimulationTick, position, type Position,
+  PositionAxis, SimulationTick, position, itemStackFromUnknown, type Position,
 } from '@nerima-games/mc-kernel'
-import { DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
+import { CHEST_CONTAINER_CAPACITY, HOPPER_CONTAINER_CAPACITY, containerCapacity, DEFAULT_TICK_DURATION, WitherChargeRemainingSecs, WitherHealthPoints } from '@nerima-games/mc-sim'
 import { CHUNK_VOLUME, type ChunkSource, type ChunkStoreApi, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import {
   chunkCoordsAround, initialEcosystemMobState, mobMovementWorldFromChunkWindow, openChunkWindow, planMobMovementRoster,
@@ -3186,7 +3186,10 @@ describe('multiplayer server authoritative state', () => {
     expect(output).toContainEqual(expect.objectContaining({
       _tag: 'ContainerDelta',
       revision: 5,
-      state: { containerId: 'world-1:1,64,0', kind: 'chest', slots: [{ item: 'stone', count: 2 }, { item: 'apple', count: 2 }] },
+      state: { containerId: 'world-1:1,64,0', kind: 'chest', slots: [
+        { item: 'stone', count: 2 }, { item: 'apple', count: 2 },
+        ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 2 }, () => null),
+      ] },
     }))
     expect(output).toContainEqual(expect.objectContaining({
       _tag: 'FurnaceDelta',
@@ -3200,7 +3203,11 @@ describe('multiplayer server authoritative state', () => {
         player: 'alice',
         state: { slots: [{ item: 'stone', count: 3 }, { item: 'coal', count: 2 }, { item: 'iron_ingot', count: 1 }] },
       }],
-      containers: [{ containerId: 'world-1:1,64,0', kind: 'chest', slots: [{ item: 'stone', count: 2 }, { item: 'apple', count: 2 }] }],
+      containers: [{ containerId: 'overworld:1,64,0', kind: 'chest', slots: [
+        { ...Result.getOrThrow(itemStackFromUnknown('stone', 2)), durability: null },
+        { ...Result.getOrThrow(itemStackFromUnknown('apple', 2)), durability: null },
+        ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 2 }, () => null),
+      ] }],
       furnaces: [{ furnaceId: '["world-1",2,64,0]', fuel: { item: 'coal', count: 1 }, output: { item: 'iron_ingot', count: 1 } }],
     })
   })
@@ -4314,7 +4321,7 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted.at(-1)).toMatchObject({
       revision: 7,
       inventories: [{ player: 'alice', state: { slots: [null, null] } }],
-      containers: [{ containerId: 'world-1:1,64,0', kind: 'chest', slots: Array.from({ length: 27 }, () => null) }],
+      containers: [{ containerId: 'overworld:1,64,0', kind: 'chest', slots: Array.from({ length: CHEST_CONTAINER_CAPACITY }, () => null) }],
       furnaces: [{
         furnaceId: '["world-1",2,64,0]',
         input: null,
@@ -4389,8 +4396,14 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted[0]).toMatchObject({
       revision: 5,
       containers: expect.arrayContaining([
-        { containerId: 'world-1:1,65,0', kind: 'chest', slots: [{ item: 'apple', count: 1 }] },
-        { containerId: 'world-1:1,64,0', kind: 'hopper', slots: [{ item: 'apple', count: 1 }, null, null, null, null] },
+        { containerId: 'overworld:1,65,0', kind: 'chest', slots: [
+          { ...Result.getOrThrow(itemStackFromUnknown('apple', 1)), durability: null },
+          ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null),
+        ] },
+        { containerId: 'overworld:1,64,0', kind: 'hopper', slots: [
+          { ...Result.getOrThrow(itemStackFromUnknown('apple', 1)), durability: null },
+          ...Array.from({ length: HOPPER_CONTAINER_CAPACITY - 1 }, () => null),
+        ] },
       ]),
     })
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
@@ -4405,8 +4418,11 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted[1]).toMatchObject({
       revision: 6,
       containers: expect.arrayContaining([
-        { containerId: 'world-1:1,64,0', kind: 'hopper', slots: [null, null, null, null, null] },
-        { containerId: 'world-1:1,63,0', kind: 'chest', slots: [{ item: 'apple', count: 1 }, ...Array.from({ length: 26 }, () => null)] },
+        { containerId: 'overworld:1,64,0', kind: 'hopper', slots: Array.from({ length: HOPPER_CONTAINER_CAPACITY }, () => null) },
+        { containerId: 'overworld:1,63,0', kind: 'chest', slots: [
+          { ...Result.getOrThrow(itemStackFromUnknown('apple', 1)), durability: null },
+          ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null),
+        ] },
       ]),
     })
     expect(messages(fixture.sent)).toEqual(expect.arrayContaining([
@@ -4435,7 +4451,10 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
       revision: 5,
-      containers: [{ containerId: 'world-1:1,64,0', kind: 'dispenser', slots: [{ item: 'apple', count: 1 }, ...Array.from({ length: 8 }, () => null)] }],
+      containers: [{ containerId: 'overworld:1,64,0', kind: 'dispenser', slots: [
+        { ...Result.getOrThrow(itemStackFromUnknown('apple', 1)), durability: null },
+        ...Array.from({ length: containerCapacity('dispenser') - 1 }, () => null),
+      ] }],
       entities: [expect.objectContaining({
         _tag: 'item-drop',
         at: { x: 1.5, y: 64.5, z: -0.25 },
@@ -4472,7 +4491,10 @@ describe('multiplayer server authoritative state', () => {
     expect(fixture.persisted).toHaveLength(1)
     expect(fixture.persisted[0]).toMatchObject({
       revision: 5,
-      containers: [{ containerId: 'world-1:1,64,0', kind: 'dropper', slots: [{ item: 'apple', count: 1 }, ...Array.from({ length: 8 }, () => null)] }],
+      containers: [{ containerId: 'overworld:1,64,0', kind: 'dropper', slots: [
+        { ...Result.getOrThrow(itemStackFromUnknown('apple', 1)), durability: null },
+        ...Array.from({ length: containerCapacity('dropper') - 1 }, () => null),
+      ] }],
       entities: [expect.objectContaining({
         _tag: 'item-drop',
         at: { x: 1.5, y: 64.5, z: -0.25 },

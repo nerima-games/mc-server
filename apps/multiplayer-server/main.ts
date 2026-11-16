@@ -290,14 +290,14 @@ const transformSavedItems = (
     if (selector === '*' && Array.isArray(value)) {
       const entries: Array<unknown> = []
       for (const [index, entry] of value.entries()) {
-        const transformed = visit(entry, rest, path + '.' + String(index))
+        const transformed = visit(entry, rest, `${path}.${String(index)}`)
         if (Result.isFailure(transformed)) return transformed
         entries.push(transformed.success)
       }
       return Result.succeed(entries)
     }
     if (!isRecord(value) || !Object.hasOwn(value, selector)) return Result.succeed(value)
-    const transformed = visit(value[selector], rest, path === '' ? selector : path + '.' + selector)
+    const transformed = visit(value[selector], rest, path === '' ? selector : `${path}.${selector}`)
     return Result.map(transformed, (entry) => ({ ...value, [selector]: entry }))
   }
   let state = value
@@ -519,7 +519,7 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
           id: container['containerId'], kind: container['kind'],
           slots: Array.isArray(container['slots'])
             ? container['slots'].map((slot, slotIndex) => slot === null ? null
-              : items.success.containerItems.get('containers.' + String(containerIndex) + '.slots.' + String(slotIndex)))
+              : items.success.containerItems.get(`containers.${String(containerIndex)}.slots.${String(slotIndex)}`))
             : container['slots'],
         }))
       : migratedContainers,

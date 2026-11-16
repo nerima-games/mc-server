@@ -1040,7 +1040,7 @@ const canonicalContainerStack = (stack: ItemStack | ContainerStoredStack): Resul
 }
 
 const hasNondefaultContainerComponents = (stack: ContainerStoredStack): boolean =>
-  !itemStackEqualsIgnoringCount(stack, Result.getOrThrow(itemStack(stack.item, stack.count)))
+  !itemStackEqualsIgnoringCount({ item: stack.item, count: stack.count, components: stack.components }, Result.getOrThrow(itemStack(stack.item, 1)))
 
 const furnaceSnapshot = (state: MutableFurnaceState): FurnaceState => ({
   furnaceId: state.furnaceId,
