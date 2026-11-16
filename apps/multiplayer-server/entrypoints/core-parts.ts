@@ -56,6 +56,7 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
       load: (coord) => Effect.runSync(Effect.result(store.load(coord))),
       unload: (coord) => Effect.runSync(Effect.result(store.unload(coord))),
       openWindow: (coords) => Effect.runSync(openChunkWindow(store, coords)),
+      capacity: CHUNK_STORE_CAPACITY,
     }
   },
 })

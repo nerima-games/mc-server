@@ -381,6 +381,8 @@ export interface ChunkStorePart {
   readonly unload: (coord: ChunkCoord) => Result.Result<boolean, ChunkPersistenceError>
   /** A synchronous view over the named resident chunks; it peeks only, so the caller loads them first. */
   readonly openWindow: (coords: ReadonlyArray<ChunkCoord>) => ChunkWindow
+  /** How many chunks the store keeps resident at once; loading more evicts the least recently used. */
+  readonly capacity: number
 }
 
 /** Effect-backed services the core uses synchronously; `entrypoints/core-parts.ts` builds them. */
@@ -1142,8 +1144,13 @@ type ChunkOverlay = ReadonlyArray<Readonly<{ index: number; block: BlockId }>>
 /** Reads the world through one path: the chunk column is loaded and its edits validated before any cell is answered. */
 export interface WorldBlockReader {
   readonly blockAt: (at: BlockPos) => Result.Result<string | null, MultiplayerServerCoreFailure>
-  /** A ChunkWindow over the named chunks, each first loaded or regenerated with the current edits like blockAt's. */
+  /**
+   * A ChunkWindow over the named chunks, each first loaded or regenerated with the current edits like blockAt's. The
+   * window keeps the chunks it was opened over, so a later load that evicts them from the store does not change it.
+   */
   readonly openWindow: (coords: ReadonlyArray<ChunkCoord>) => Result.Result<ChunkWindow, MultiplayerServerCoreFailure>
+  /** The most chunks one window can name: the store's capacity. */
+  readonly windowCapacity: number
 }
 
 const generatedReadFailure = (failure: GeneratedBlockReadFailure): MultiplayerServerCoreFailure => ({ _tag: 'GeneratedBlockReadFailure', failure })
@@ -1220,10 +1227,13 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
       const loaded = loadChunk(coord)
       if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
     }
+    // openChunkWindow reads an evicted chunk as unloaded, which would leave a mob standing without a failure. Every
+    // named chunk is still resident: planPassiveMobs, the only caller, sizes each group to the store's capacity.
+    for (const coord of coords) Option.getOrThrow(Option.fromNullishOr(chunkStore.peek(coord)))
     return Result.succeed(chunkStore.openWindow(coords))
   }
 
-  return { blockAt, openWindow }
+  return { blockAt, openWindow, windowCapacity: chunkStore.capacity }
 }
 
 /** The generated terrain alone, read through the same path the core uses; the entrypoint finds spawn with it. */
@@ -5009,38 +5019,85 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   ): Result.Result<ReadonlyArray<PassiveMob>, MultiplayerServerCoreFailure> => {
     if (mobs.length === 0 || elapsedTicks === 0) return Result.succeed(mobs)
     // mx-gameplay's entities stage opens its movement window one chunk width around each mob.
-    const coords = new Map<string, ChunkCoord>()
-    for (const { feet } of mobs) {
-      for (const coord of chunkCoordsAround(feet, CHUNK_SIZE_XZ)) coords.set(chunkKeyOf(coord.cx, coord.cz), coord)
+    const windows: Array<Readonly<{ id: string; coords: ReadonlyMap<string, ChunkCoord> }>> = []
+    for (const { entity, feet } of mobs) {
+      // One mob's window is 9 chunks, and only makeMultiplayerServerCoreParts builds parts, with a capacity of 256.
+      const coords = Option.getOrThrow(Option.liftPredicate(
+        new Map(chunkCoordsAround(feet, CHUNK_SIZE_XZ).map((coord) => [chunkKeyOf(coord.cx, coord.cz), coord])),
+        (window) => window.size <= world.windowCapacity,
+      ))
+      windows.push({ id: entity.entityId, coords })
     }
-    const window = world.openWindow([...coords.values()])
-    if (Result.isFailure(window)) return Result.fail(window.failure)
-    const movementWorld = mobMovementWorldFromChunkWindow(window.success)
+    // One window cannot name more chunks than the store keeps resident, so the roster is planned in groups.
+    // planMobMovementRoster steps each mob alone against the terrain, so mobs never interact; the roster only orders
+    // the mobs and shares one path-search budget per call. Mobs whose windows share a chunk stay in one group, and
+    // groups with no chunk in common get a budget each. A group whose chunks exceed the capacity is split in mob
+    // order, which changes only that order and budget.
+    // Union-find over mob indices: mobs whose windows share a chunk end with one root.
+    const parent = windows.map((_, index) => index)
+    const root = (index: number): number => {
+      let current = index
+      for (let next = parent[current]; next !== undefined && next !== current; next = parent[current]) current = next
+      return current
+    }
+    const chunkOwner = new Map<string, number>()
+    for (const [index, window] of windows.entries()) {
+      for (const key of window.coords.keys()) {
+        const owner = chunkOwner.get(key)
+        if (owner === undefined) chunkOwner.set(key, index)
+        else parent[root(index)] = root(owner)
+      }
+    }
+    const groups: Array<Readonly<{ ids: Set<string>; coords: Map<string, ChunkCoord> }>> = []
+    const openGroupOf = new Map<number, Readonly<{ ids: Set<string>; coords: Map<string, ChunkCoord> }>>()
+    for (const [index, window] of windows.entries()) {
+      const component = root(index)
+      const group = openGroupOf.get(component)
+      if (group === undefined || new Set([...group.coords.keys(), ...window.coords.keys()]).size > world.windowCapacity) {
+        const opened = { ids: new Set([window.id]), coords: new Map(window.coords) }
+        groups.push(opened)
+        openGroupOf.set(component, opened)
+        continue
+      }
+      group.ids.add(window.id)
+      for (const [key, coord] of window.coords) group.coords.set(key, coord)
+    }
+    // Each group's window holds its chunks from the moment it opens, so opening the next group's window may evict
+    // them from the store without changing what this one reads.
+    const groupWorlds: Array<Readonly<{ ids: ReadonlySet<string>; movementWorld: ReturnType<typeof mobMovementWorldFromChunkWindow> }>> = []
+    for (const group of groups) {
+      const window = world.openWindow([...group.coords.values()])
+      if (Result.isFailure(window)) return Result.fail(window.failure)
+      groupWorlds.push({ ids: group.ids, movementWorld: mobMovementWorldFromChunkWindow(window.success) })
+    }
     let current = mobs
     for (let gameTick = 0; gameTick < elapsedTicks; gameTick += 1) {
       // stepEcosystemMob advances exactly one game tick per call and leaves a passive mob's feet in place.
       const stepped = current.map((mob) => ({ ...mob, ecosystem: stepEcosystemMob(mob.kind, mob.ecosystem, mob.feet, undefined, GAME_TICK_SECS).state }))
-      // The roster lives for one plan, so it mints no serials. Health is the wire value, finite and positive.
-      const roster: MobRoster = {
-        nextSerial: EntitySerial(0),
-        entities: stepped.map((mob) => ({
-          id: mob.entity.entityId,
-          kind: EntityKind(mob.kind),
-          feetPosition: mob.feet,
-          healthPoints: EntityHealthPoints(mob.entity.health),
-          behaviour: mob.ecosystem,
-          dimension,
-        })),
-      }
       // simulationTick already counts this tick's game ticks, so this game tick is the matching earlier one.
       const plannedTick = SimulationTick(simulationTick - elapsedTicks + gameTick + 1)
-      const planned = Result.getOrThrow(planMobMovementRoster(roster, undefined, movementWorld, plannedTick, dimension))
-      const [fault] = planned.faults
-      if (fault !== undefined) return Result.fail({ _tag: 'MobMovementFailure', fault })
-      const plannedById = new Map(planned.roster.entities.map((entity) => [String(entity.id), entity]))
+      const plannedById = new Map<string, MobRoster['entities'][number]>()
+      for (const { ids, movementWorld } of groupWorlds) {
+        // The roster lives for one plan, so it mints no serials. Health is the wire value, finite and positive.
+        const roster: MobRoster = {
+          nextSerial: EntitySerial(0),
+          entities: stepped.filter((mob) => ids.has(mob.entity.entityId)).map((mob) => ({
+            id: mob.entity.entityId,
+            kind: EntityKind(mob.kind),
+            feetPosition: mob.feet,
+            healthPoints: EntityHealthPoints(mob.entity.health),
+            behaviour: mob.ecosystem,
+            dimension,
+          })),
+        }
+        const planned = Result.getOrThrow(planMobMovementRoster(roster, undefined, movementWorld, plannedTick, dimension))
+        const [fault] = planned.faults
+        if (fault !== undefined) return Result.fail({ _tag: 'MobMovementFailure', fault })
+        for (const entity of planned.roster.entities) plannedById.set(String(entity.id), entity)
+      }
       current = stepped.map((mob) => {
-        // planMobMovementRoster maps every roster entity to its planned entity under the same id, and writes an
-        // ecosystem mob's behaviour back as its ecosystem state with the planned movement.
+        // Every mob is in exactly one group, and planMobMovementRoster maps every roster entity to its planned entity
+        // under the same id, writing an ecosystem mob's behaviour back as its ecosystem state with the planned movement.
         const entity = Option.getOrThrow(Option.fromNullishOr(plannedById.get(mob.entity.entityId)))
         const behaviour = entity.behaviour
         const ecosystem = Option.getOrThrow(Option.fromNullishOr(behaviour?._tag === 'EcosystemMob' ? behaviour : undefined))
@@ -5814,7 +5871,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           continue
         }
         const passiveKind = supportedPassiveMobKind(entity.entityType)
-        // validateEcosystemMobStates checked loaded and spawned mobs, and the tick only writes mx-gameplay results back.
+        const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
+        // Only supported kinds are repaired below; load and spawn validation skip the others, so they are left as they are.
+        if (passiveKind === undefined && hostileKind === undefined) continue
+        // validateEcosystemMobStates checked loaded and spawned mobs of supported kinds, and the tick only writes
+        // mx-gameplay results back.
         const state = Result.getOrThrow(ecosystemMobStateForSimulation(entity.mobState)) ?? initialEcosystemMobState()
         // The mob and its target player are stored positions, which writePositions or load validation kept in
         // addressable cells, so each axis is finite.
@@ -5830,7 +5891,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           })
           continue
         }
-        const hostileKind = supportedHostileEcosystemMobKind(entity.entityType)
         if (hostileKind === undefined) continue
         const kind = hostileKind
         const target = targetEntry?.[1].at

@@ -32,7 +32,7 @@ import {
   type ReceiveResult,
 } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerRedstoneRuntime } from '../../apps/multiplayer-server/redstone-runtime'
-import { airTerrain, terrainFrom } from './terrain'
+import { airTerrain, floorTerrain, terrainFrom } from './terrain'
 import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
 import {
   decodePlayerDamageWireMessage,
@@ -3358,7 +3358,7 @@ describe('multiplayer server authoritative state', () => {
 
   // A stone floor under y = 64, so the cow stands on a walkable cell. The cow starts at z = 8, clear of the chest and
   // furnace that initialState places at z = 0, and alice stands two blocks behind it.
-  const pastureTerrain = terrainFrom((at) => at.y === 63 ? 'stone' : null)
+  const pastureTerrain = floorTerrain(63, 'stone')
   const cowStart = { x: 0, y: 64, z: 8 }
   const pastureJoinAt = { x: -2, y: 64, z: 8 }
   const pastureState = (): MultiplayerServerState => ({
@@ -3366,9 +3366,7 @@ describe('multiplayer server authoritative state', () => {
     entities: [{ _tag: 'living', entityId: entityId('cow-1'), entityType: 'cow', at: cowStart, health: 10, maxHealth: 10 }],
   })
   // The core reads the save's block edits over the terrain, so the independent plan reads them too.
-  const pastureWithEdits = terrainFrom((at) =>
-    initialState().blocks.find((edit) => edit.at.x === at.x && edit.at.y === at.y && edit.at.z === at.z)?.block
-      ?? (at.y === 63 ? 'stone' : null))
+  const pastureWithEdits = floorTerrain(63, 'stone', initialState().blocks)
 
   /**
    * A lone cow planned through the published mx-gameplay API with the inputs the core gives it: a ChunkWindow over
@@ -3448,6 +3446,52 @@ describe('multiplayer server authoritative state', () => {
       timeWeather: { timeOfDay: 6_001, weather: 'clear' },
       weatherClock: { ...weatherClock, remainingSecs: weatherClock.remainingSecs - 0.05 },
     })
+  })
+
+  it('moves every cow as the planner computes for it when their windows together exceed the chunk store', () => {
+    // R-SV3b's layout: 29 cows 64 blocks apart need 9 chunks each, 261 in all, more than the store keeps resident.
+    const starts = Array.from({ length: 29 }, (_, index) => ({ x: 64 * index, y: 64, z: 8 }))
+    const fixture = makeFixture({
+      ...initialState(),
+      entities: starts.map((at, index) => ({
+        _tag: 'living', entityId: entityId(`cow-${String(index)}`), entityType: 'cow', at, health: 10, maxHealth: 10,
+      })),
+    }, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
+    const gameTicks = 1_000 / (Number(DEFAULT_TICK_DURATION) * 1_000)
+
+    expect(fixture.server.tick(1_000)).toEqual(Result.succeed({ refusals: [] }))
+
+    const persisted = fixture.persisted.at(-1)?.entities ?? []
+    expect(persisted).toHaveLength(starts.length)
+    for (const [index, start] of starts.entries()) {
+      // No two cows share a chunk, so each is planned as the lone member of its roster.
+      const expected = plannedCowFeet(pastureWithEdits, position(PositionAxis(start.x), PositionAxis(start.y), PositionAxis(start.z)), gameTicks)
+      expect(persisted[index]).toEqual(expect.objectContaining({
+        entityId: `cow-${String(index)}`,
+        at: { x: expected.x, y: expected.y, z: expected.z },
+      }))
+      expect(Math.hypot(expected.x - start.x, expected.z - start.z)).toBeGreaterThan(0)
+    }
+  })
+
+  it('leaves a living entity of an unsupported kind untouched instead of repairing its state', () => {
+    // R-SV3b's input: state decoding admits any entity type and any finite motion phase, and load validation skips
+    // kinds mx-gameplay does not simulate, so this phase never meets the repair that rejects it.
+    const state: MultiplayerServerState = {
+      ...initialState(),
+      entities: [{
+        _tag: 'living', entityId: entityId('custom-1'), entityType: 'custom-mob', at: { x: 0, y: 64, z: 0 },
+        health: 20, maxHealth: 20, mobState: { attackCooldownSecs: 0, motionPhase: 2 ** 60, provoked: false },
+      }],
+    }
+    const untouched = makeFixture(state)
+    const fixture = makeFixture(state)
+    fixture.sent.length = 0
+
+    // 40 ms is less than a game tick, so no other step changes anything.
+    expect(fixture.server.tick(40)).toEqual(Result.succeed({ refusals: [] }))
+    expect(fixture.sent).toEqual([])
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
   })
 
   it('plans passive movement over the player-edited cells the core reads', () => {
