@@ -285,6 +285,7 @@ export type MultiplayerServerCoreFailure =
   | Readonly<{ _tag: 'AnvilPlanFailure'; failure: AnvilPlanFailure }>
   | Readonly<{ _tag: 'AnvilExperienceSpendFailure'; failure: AnvilExperienceSpendFailure }>
   | Readonly<{ _tag: 'MobStateRepairFailure'; entityId: string; failure: MobStateRepairFailure }>
+  | Readonly<{ _tag: 'PositionOutsideAddressableCells'; subject: 'entity' | 'player' | 'wither' | 'wither-skull'; id: string; at: Readonly<{ x: number; y: number; z: number }> }>
   | Readonly<{ _tag: 'PistonHeadOffsetFailure'; failure: PistonHeadOffsetFailure }>
   | Readonly<{ _tag: 'GeneratedBlockReadFailure'; failure: GeneratedBlockReadFailure }>
   | Readonly<{ _tag: 'InvalidServerTickDuration'; elapsedMs: number }>
@@ -581,10 +582,34 @@ const ecosystemMobStateForSimulation = (value: unknown): Result.Result<Ecosystem
 }
 
 /**
- * Checks the saved state of every mob the tick steps through mx-gameplay's ecosystem rules, so a corrupt save
- * fails when it is loaded instead of stopping each tick.
+ * True when every floored axis is a BlockAxis, so the position lies in a cell C2 can address. Coordinate
+ * differences between such positions, and their hypot, stay finite.
  */
-export const validateEcosystemMobStates = (
+const isInAddressableCell = (at: Readonly<{ x: number; y: number; z: number }>): boolean =>
+  [at.x, at.y, at.z].every((axis) => Result.isSuccess(BlockAxis.result(Math.floor(axis))))
+
+/**
+ * Checks a loaded state before a core uses it: every saved position must lie in an addressable cell, and every
+ * mob the tick steps through mx-gameplay's ecosystem rules must have a state mx-gameplay can repair. A corrupt
+ * save then fails at load instead of stopping each tick.
+ */
+export const validateLoadedServerState = (state: MultiplayerServerState): Result.Result<void, MultiplayerServerCoreFailure> => {
+  const positioned = [
+    ...(state.entities ?? []).map((entity) => ({ subject: 'entity' as const, id: String(entity.entityId), at: entity.at })),
+    ...(state.playerPositions ?? []).map(({ player, at }) => ({ subject: 'player' as const, id: String(player), at })),
+    ...(state.wither?.withers ?? []).map((wither) => ({ subject: 'wither' as const, id: wither.id, at: wither.snapshot.state.feetPosition })),
+    ...(state.wither?.skulls ?? []).flatMap((skull) => [
+      { subject: 'wither-skull' as const, id: skull.id, at: skull.position },
+      { subject: 'wither-skull' as const, id: skull.id, at: skull.descriptor.origin },
+    ]),
+  ]
+  for (const { subject, id, at } of positioned) {
+    if (!isInAddressableCell(at)) return Result.fail({ _tag: 'PositionOutsideAddressableCells', subject, id, at: { x: at.x, y: at.y, z: at.z } })
+  }
+  return validateEcosystemMobStates(state.entities ?? [])
+}
+
+const validateEcosystemMobStates = (
   entities: ReadonlyArray<AuthoritativeEntityState>,
 ): Result.Result<void, MultiplayerServerCoreFailure> => {
   for (const entity of entities) {
@@ -4621,6 +4646,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
   const acceptRealmTransfer = (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival): boolean => {
     const client = clients.get(clientId)
     if (client === undefined || client.playerId !== null || playerClients.has(transfer.player)) return false
+    if (!isInAddressableCell(arrival.at)) return false
     const player: MutablePlayer = {
       player: transfer.player,
       name: transfer.name,
@@ -5024,7 +5050,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             presence.at.y + 0.9 - center.y,
             presence.at.z - center.z,
           )
-          // The power is a TNT, creeper, or wither constant and the distance is a hypot of finite coordinates.
+          // The power is a TNT, creeper, or wither constant. The centre and the player lie in addressable cells
+          // (see despawnVerdict below for the boundaries that keep them there), so the distance is finite.
           const damage = Result.getOrThrow(explosionDamageAt(explosion, distance))
           if (damage.amount > 0) damageSteps.push({ player, playerVitals, amount: damage.amount })
         }
@@ -5218,7 +5245,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           ? { ...initialMobState, ageTicks: (initialMobState.ageTicks ?? 0) + elapsedTicks }
           : initialMobState
         if (isAuthoritativeHostileMob(entity.entityType)) {
-          // mobWireState validated every field, the distance is finite, and the roll is in [0, 1).
+          // mobWireState validated every field and the roll is in [0, 1). The distance is finite because
+          // validateLoadedServerState, spawnEntity, and acceptRealmTransfer keep entity and player positions in
+          // addressable cells, and movement, ender pearls, and respawn only move a player a bounded step from one.
           const verdict = Result.getOrThrow(despawnVerdict({
             distanceToPlayerBlocks: targetEntry?.[2],
             persistent: hostileMobState.persistent === true,
@@ -5491,7 +5520,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               presence.at.y + 0.9 - explosion.position.y,
               presence.at.z - explosion.position.z,
             )
-            // The power is a TNT, creeper, or wither constant and the distance is a hypot of finite coordinates.
+            // The power is a wither constant. Wither skulls start at a loaded or stepped wither, and the player lies
+            // in an addressable cell (see despawnVerdict below), so the distance is finite.
             const damageAmount = Result.getOrThrow(explosionDamageAmount(explosion.power, distance))
             if (damageAmount > 0) damageSteps.push({ player, playerVitals, amount: damageAmount })
           }
@@ -5571,7 +5601,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
   const spawnEntity = (entity: AuthoritativeEntityState): boolean => {
     if (entities.has(entity.entityId)) return false
-    if (Result.isFailure(validateEcosystemMobStates([entity]))) return false
+    if (!isInAddressableCell(entity.at) || Result.isFailure(validateEcosystemMobStates([entity]))) return false
     entities.set(entity.entityId, entity)
     revision += 1
     notifyStateChanged()

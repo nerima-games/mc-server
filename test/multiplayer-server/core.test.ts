@@ -3,8 +3,8 @@ import {
   TransferIdSchema,
   decodeFrame,
   encodeFrame,
-  type CommandId,
-  type EntityId,
+  CommandId,
+  EntityId,
   type NetworkMessage,
   type PlayerId,
   type PlayerName,
@@ -973,6 +973,30 @@ describe('authoritative multiplayer server core', () => {
       portal: { x: 2, y: 64, z: 0 },
     })).toEqual({ accepted: false, reason: 'invalid-command' })
     expect(usedPortals).toEqual([valid])
+  })
+
+  it('refuses spawned entities and realm arrivals outside addressable cells', () => {
+    const far = 1.7976931348623157e308
+    const source = makeFixture()
+    source.connect('socket-a')
+    source.receive('socket-a', join('alice'))
+    expect(source.server.spawnEntity({
+      _tag: 'living', entityId: EntityId.make('creeper-far'), entityType: 'creeper', at: { x: far, y: 64, z: far }, health: 20, maxHealth: 20,
+    })).toBe(false)
+    expect(source.server.snapshot().revision).toBe(0)
+
+    const destination = makeFixture()
+    destination.connect('socket-b')
+    const transfer = source.server.detachPlayer('socket-a')
+    expect(transfer).toBeDefined()
+    if (transfer === undefined) throw new Error('alice was not detached')
+    expect(destination.server.acceptRealmTransfer('socket-b', transfer, {
+      commandId: CommandId.make('far-transfer'),
+      fromWorld: worldId('world-1'),
+      at: { x: far, y: 65, z: 0 },
+      facing: { yawRadians: 0, pitchRadians: 0 },
+    })).toBe(false)
+    expect(destination.server.snapshot().players).toEqual([])
   })
 
   it('moves player authority between realms and sends an arrival snapshot', () => {

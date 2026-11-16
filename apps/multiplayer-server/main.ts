@@ -44,7 +44,7 @@ import {
   chunkSourceFromBlocks,
   makeMultiplayerServerCore,
   makeTerrainReader,
-  validateEcosystemMobStates,
+  validateLoadedServerState,
   type MultiplayerServerCoreFailure,
   type WorldBlockReader,
   type MultiplayerServerCore,
@@ -439,8 +439,8 @@ export const loadServerState = async (
   if (state === undefined) {
     throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
   }
-  // A saved mob state mx-gameplay cannot repair would otherwise stop every tick of this dimension.
-  return Result.map(validateEcosystemMobStates(state.entities ?? []), () => state)
+  // An unaddressable position or a mob state mx-gameplay cannot repair would otherwise stop every tick of this dimension.
+  return Result.map(validateLoadedServerState(state), () => state)
 }
 
 export const writeServerState = async (

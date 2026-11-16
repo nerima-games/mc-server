@@ -13,7 +13,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { MultiplayerServerState } from '../../apps/multiplayer-server/core'
 import { createLatestStatePersistence, loadServerState, writeServerState } from '../../apps/multiplayer-server/main'
-import { initialWitherRuntimeState, snapshotWitherRuntime } from '../../apps/multiplayer-shared/wither-runtime'
+import { initialWitherRuntimeState, snapshotWitherRuntime, summonRuntimeWither } from '../../apps/multiplayer-shared/wither-runtime'
 
 const playerId = (value: string): PlayerId => value as PlayerId
 
@@ -184,6 +184,46 @@ describe('multiplayer state file round trip', () => {
   it('fails to load a mob whose saved motion phase exceeds the safe integer range', async () => {
     const loaded = await loadServerState(await writeStateWithCow({ attackCooldownSecs: 0, motionPhase: 2 ** 60, provoked: false }), worldId, seed)
     expect(loaded).toMatchObject(Result.fail({ _tag: 'MobStateRepairFailure', entityId: 'cow-1' }))
+  })
+
+  describe('rejects saved positions outside addressable cells', () => {
+    // Finite, but far enough apart that coordinate differences overflow to Infinity.
+    const far = 1.7976931348623157e308
+    const loadWith = async (state: MultiplayerServerState) => {
+      const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-round-trip-')), 'state.json')
+      await writeServerState(stateFile, worldId, seed, state)
+      return loadServerState(stateFile, worldId, seed)
+    }
+
+    it('for an entity', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        entities: [{
+          _tag: 'living', entityId: EntityId.make('creeper-1'), entityType: 'creeper', at: { x: far, y: 64, z: far }, health: 20, maxHealth: 20,
+        }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'entity', id: 'creeper-1', at: { x: far, y: 64, z: far },
+      }))
+    })
+
+    it('for a player', async () => {
+      const loaded = await loadWith({
+        ...fullyPopulatedState(),
+        playerPositions: [{ player: alice, at: { x: far, y: 64, z: 0 }, facing: { yawRadians: 0, pitchRadians: 0 } }],
+      })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'player', id: 'alice', at: { x: far, y: 64, z: 0 },
+      }))
+    })
+
+    it('for a wither', async () => {
+      const wither = Result.getOrThrow(summonRuntimeWither(initialWitherRuntimeState(), worldId, { x: far, y: 64, z: 0 }))
+      const loaded = await loadWith({ ...fullyPopulatedState(), wither: snapshotWitherRuntime(wither) })
+      expect(loaded).toEqual(Result.fail({
+        _tag: 'PositionOutsideAddressableCells', subject: 'wither', id: 'wither-1', at: { x: far, y: 64, z: 0 },
+      }))
+    })
   })
 
   it('still loads a state file predating these fields, leaving the new categories empty', async () => {
