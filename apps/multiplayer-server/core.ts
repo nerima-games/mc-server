@@ -376,7 +376,7 @@ export interface SurvivalHungerPart {
   ) => Result.Result<Readonly<{ state: SurvivalHungerState; died: boolean }>, SurvivalHungerError>
 }
 
-/** The read operations of an mc-worldgen ChunkStore, made synchronous by the server entrypoint. */
+/** A raw ChunkStore and synchronous access operations built by the server entrypoint. */
 export interface ChunkStorePart {
   readonly store: ChunkStoreApi
   readonly peek: (coord: ChunkCoord) => ReadonlyChunkWithBlockStates | undefined
@@ -1103,6 +1103,10 @@ export interface ContainerSlotSnapshot {
 }
 
 export interface MultiplayerServerCore {
+  /**
+   * Mutation callers must not use this port until U6b-2 removes the legacy reload path,
+   * which can erase committed writes.
+   */
   readonly worldWrite: ServerWorldWrite
   readonly connect: (clientId: ClientId, send: SendFrame) => boolean
   readonly receive: (clientId: ClientId, frame: WireText) => ReceiveResult
@@ -1175,7 +1179,7 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
     for (const { index, block } of overlay) chunkBlocks[index] = block
     return { coord: chunk.coord, blocks: chunkBlocks, biomes: chunk.biomes }
   })
-  // The store is the read side of the world only; edits stay in `blocks` until block writes move to the commit path.
+  // Legacy edits stay in `blocks` until mutation callers move to the commit path in U6b-2.
   const chunkStore = parts.openChunkStore(overlaySource)
 
   const overlayFor = (coord: ChunkCoord): Result.Result<ChunkOverlay, MultiplayerServerCoreFailure> => {
@@ -1250,7 +1254,9 @@ export const makeTerrainReader = (source: ChunkSource, parts: MultiplayerServerC
   makeWorldReader(source, parts, new BlockOverrides())
 
 export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Result.Result<MultiplayerServerCore, MultiplayerServerCoreFailure> => {
-  const worldId = options.worldId as WorldId
+  const decodedWorldId = Schema.decodeUnknownResult(WorldIdSchema)(options.worldId)
+  if (Result.isFailure(decodedWorldId)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: decodedWorldId.failure })
+  const worldId = decodedWorldId.success
   const dimension = options.dimension ?? 'overworld'
   // Bounds come from the caller's configuration; a non-finite bound would fail every lightning strike and bounds test.
   const validBounds = validateServerBounds(options.bounds ?? DEFAULT_BOUNDS)
@@ -1271,12 +1277,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     blocks.set(positionKey(mutation.at), mutation)
   }
   const world = makeWorldReader(options.chunkSource, options.parts, blocks)
-  const commitWorldId = Schema.decodeUnknownResult(WorldIdSchema)(options.worldId)
-  if (Result.isFailure(commitWorldId)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: commitWorldId.failure })
   const worldWrite = options.parts.makeWorldWrite({
-    world: commitWorldId.success,
+    world: worldId,
     owners: [],
-    dimensions: [dimension],
+    dimension,
     chunkStores: { forDimension: () => world.chunkStore },
   })
   if (Result.isFailure(worldWrite)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: worldWrite.failure })

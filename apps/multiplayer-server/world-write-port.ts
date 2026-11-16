@@ -18,7 +18,7 @@ import {
   type ReplicatedWorldDelta,
   type ReplicatedOwnerChange,
 } from '@nerima-games/mc-sim'
-import { CHUNK_HEIGHT, type ChunkStoreRegistryApi } from '@nerima-games/mc-worldgen'
+import { CHUNK_HEIGHT, type ChunkStoreRegistryApi, type Dimension } from '@nerima-games/mc-worldgen'
 import { Effect, Result, Schema } from 'effect'
 
 // Failures listed as invariant violations in the C7 ruling (section 3). The
@@ -54,16 +54,16 @@ const commitRequestOf = (batch: WorldWriteBatch) => ({
 
 export const commitBlockBatch = (
   coordinator: WorldCommitCoordinatorApi,
+  expectedDimension: Dimension,
   batch: WorldWriteBatch,
 ): Effect.Effect<Readonly<{ commit: WorldWriteCommit; delta: ReplicatedWorldDelta<ReplicatedOwnerChange> }>,
   WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteChunkUnavailable> => Effect.gen(function* () {
     yield* validateBeforeCommit(batch)
-    if (batch.world !== coordinator.worldId) {
-      return yield* Effect.die(new Error('c7-adapter: world mismatch', {
-        cause: { batch: batch.world, coordinator: coordinator.worldId },
-      }))
-    }
-    const outOfWorld = batch.edits.find(({ position }) => position.y < 0 || position.y >= CHUNK_HEIGHT)
+    // This port cannot serve a target outside its world and dimension, even when
+    // the coordinator's registry returns a store for that dimension.
+    const outOfWorld = batch.edits.find(({ position }) =>
+      batch.world !== coordinator.worldId || batch.dimension !== expectedDimension
+      || position.y < 0 || position.y >= CHUNK_HEIGHT)
     if (outOfWorld !== undefined) {
       return yield* Effect.fail(new WorldWriteChunkUnavailable({
         dimension: batch.dimension,
@@ -108,11 +108,13 @@ export const commitBlockBatch = (
 
 export const makeWorldWritePortFromCoordinator = (
   coordinator: WorldCommitCoordinatorApi,
+  expectedDimension: Dimension,
 ): WorldWritePort['Service'] => ({
-  applyBatch: (batch) => Effect.map(commitBlockBatch(coordinator, batch), ({ commit }) => commit),
+  applyBatch: (batch) => Effect.map(commitBlockBatch(coordinator, expectedDimension, batch), ({ commit }) => commit),
 })
 
-export type ServerWorldWriteOptions = Omit<WorldCommitCoordinatorOptions, 'chunkStores'> & {
+export type ServerWorldWriteOptions = Omit<WorldCommitCoordinatorOptions, 'chunkStores' | 'dimensions'> & {
+  readonly dimension: Dimension
   readonly chunkStores: ChunkStoreRegistryApi
 }
 
@@ -121,15 +123,13 @@ export type ServerWorldWrite = {
   readonly port: WorldWritePort['Service']
 }
 
-/**
- * Build the coordinator with the host's ChunkStore registry and the port over
- * it. Requiring `chunkStores` here keeps `WorldCommitChunkStoreUnavailable`
- * out of every write the port makes.
- */
+/** Build a coordinator and scope-checked port for one server core. */
 export const makeServerWorldWrite = (
   options: ServerWorldWriteOptions,
-): Effect.Effect<ServerWorldWrite, WorldCommitCoordinatorError> =>
-  Effect.map(makeWorldCommitCoordinator(options), (coordinator) => ({
+): Effect.Effect<ServerWorldWrite, WorldCommitCoordinatorError> => {
+  const { dimension, ...coordinatorOptions } = options
+  return Effect.map(makeWorldCommitCoordinator({ ...coordinatorOptions, dimensions: [dimension] }), (coordinator) => ({
     coordinator,
-    port: makeWorldWritePortFromCoordinator(coordinator),
+    port: makeWorldWritePortFromCoordinator(coordinator, dimension),
   }))
+}

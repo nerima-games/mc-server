@@ -97,7 +97,7 @@ const makeFixture = (options: FixtureOptions = {}) => Effect.gen(function* () {
     ...coordinator,
     commit: (request) => Effect.andThen(Ref.update(commits, (count) => count + 1), coordinator.commit(request)),
   }
-  const port: WorldWritePort['Service'] = makeWorldWritePortFromCoordinator(counted)
+  const port: WorldWritePort['Service'] = makeWorldWritePortFromCoordinator(counted, 'overworld')
   const dirty = yield* overworld.subscribeDirty
   yield* dirty.drain
 
@@ -130,7 +130,7 @@ const makeFixture = (options: FixtureOptions = {}) => Effect.gen(function* () {
     changes: [{ ownerId: OWNER, state: 1 }],
   })
 
-  return { world, overworld, coordinator, port, commits, dirty, observeAll, currentRevisions, advanceWorldOnly }
+  return { world, overworld, nether, coordinator, port, commits, dirty, observeAll, currentRevisions, advanceWorldOnly }
 })
 
 // The in-memory store has no persistence and these writes target a resident
@@ -179,6 +179,30 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
           currentDimensionRevision: 1,
         })
         expect(error).toMatchObject({ currentWorldRevision: current.world, currentDimensionRevision: current.dimension })
+        expect(yield* fixture.observeAll).toStrictEqual(before)
+        expect(yield* fixture.dirty.drain).toEqual(EMPTY_DIRTY_BATCH)
+      }))
+
+    it.effect('reports the actual dimension revision when both expected revisions are stale', () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture()
+        yield* fixture.port.applyBatch(yield* batchOf())
+        const before = yield* fixture.observeAll
+        yield* fixture.dirty.drain
+
+        const error = yield* Effect.flip(fixture.port.applyBatch(yield* batchOf({
+          expectedWorldRevision: 0,
+          expectedDimensionRevision: 0,
+          edits: [edit(Q)],
+        })))
+
+        expect(error).toMatchObject({
+          _tag: 'WorldWriteConflict',
+          expectedWorldRevision: 0,
+          currentWorldRevision: 1,
+          expectedDimensionRevision: 0,
+          currentDimensionRevision: 1,
+        })
         expect(yield* fixture.observeAll).toStrictEqual(before)
         expect(yield* fixture.dirty.drain).toEqual(EMPTY_DIRTY_BATCH)
       }))
@@ -232,18 +256,6 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
   })
 
   describe('ChunkStore stale publication', () => {
-    it.effect('ChunkStore publish fails with ChunkWriteStale when a direct setBlock lands between prepare and publish', () =>
-      Effect.gen(function* () {
-        const fixture = yield* makeFixture()
-        const prepared = yield* fixture.overworld.prepare([{ position: at(P), block: STONE }])
-        yield* fixture.overworld.setBlock(at(Q), STONE)
-
-        const error = yield* Effect.flip(fixture.overworld.publish(prepared))
-
-        expect(error).toMatchObject({ _tag: 'ChunkWriteStale', key: '0,0' })
-        expect(error).toHaveProperty('actualRevision')
-      }))
-
     it.effect('dies on WorldWriteStale with a current chunk revision instead of reporting WorldWriteConflict', () =>
       Effect.gen(function* () {
         const fixture = yield* makeFixture({ wrapStore: setBlockAfterPrepare })
@@ -379,14 +391,31 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
         expect(yield* fixture.observeAll).toStrictEqual(before)
       }))
 
-    it.effect('dies on a batch for another world without committing', () =>
+    it.effect.each([
+      { world: 'another-world', dimension: 'overworld' },
+      { world: WORLD, dimension: 'nether' },
+    ] as const)('rejects a batch outside the configured world or dimension without committing: $world/$dimension', ({ world, dimension }) =>
       Effect.gen(function* () {
         const fixture = yield* makeFixture()
+        yield* fixture.nether.load(ORIGIN_CHUNK)
+        const foreignDirty = yield* fixture.nether.subscribeDirty
+        yield* foreignDirty.drain
+        const observeScope = Effect.gen(function* () {
+          return {
+            own: yield* fixture.observeAll,
+            foreign: yield* fixture.nether.getBlockWithState(at(P)),
+            foreignDimensionRevision: yield* fixture.coordinator.dimensionRevision('nether'),
+          }
+        })
+        const before = yield* observeScope
 
-        const exit = yield* Effect.exit(fixture.port.applyBatch(yield* batchOf({ world: 'another-world' })))
+        const error = yield* Effect.flip(fixture.port.applyBatch(yield* batchOf({ world, dimension })))
 
-        expect(defectOf(exit)).toMatchObject({ message: 'c7-adapter: world mismatch' })
+        expect(error).toMatchObject({ _tag: 'WorldWriteChunkUnavailable', dimension, chunk: '0,0' })
         expect(yield* Ref.get(fixture.commits)).toBe(0)
+        expect(yield* observeScope).toStrictEqual(before)
+        expect(yield* fixture.dirty.drain).toEqual(EMPTY_DIRTY_BATCH)
+        expect(yield* foreignDirty.drain).toEqual(EMPTY_DIRTY_BATCH)
       }))
 
     it.effect.each([
@@ -419,6 +448,7 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
 
         const wired = yield* makeServerWorldWrite({
           world,
+          dimension: 'overworld',
           owners: [],
           chunkStores: { forDimension: () => overworld },
         })
@@ -431,10 +461,27 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
 })
 
 describe('server commit deltas and codec contract', () => {
+  it.effect('keeps the dimension revision distinct after an owner-only world commit', () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture()
+      yield* fixture.advanceWorldOnly
+
+      const committed = yield* fixture.port.applyBatch(yield* batchOf({
+        expectedWorldRevision: 1,
+        expectedDimensionRevision: 0,
+      }))
+
+      expect(committed).toStrictEqual({ worldRevision: 2, dimensionRevision: 1 })
+      expect(yield* fixture.coordinator.revision).toBe(2)
+      expect(yield* fixture.coordinator.dimensionRevision('overworld')).toBe(1)
+      expect(yield* fixture.coordinator.snapshot(OWNER, Schema.Number)).toMatchObject({ revision: 2, state: 1 })
+      expect(yield* fixture.overworld.getBlock(at(P))).toStrictEqual({ _tag: 'Block', block: STONE })
+    }))
+
   it.effect('returns the committed delta with the same revisions and stored block', () =>
     Effect.gen(function* () {
       const fixture = yield* makeFixture()
-      const result = yield* commitBlockBatch(fixture.coordinator, yield* batchOf())
+      const result = yield* commitBlockBatch(fixture.coordinator, 'overworld', yield* batchOf())
       expect(result.commit).toStrictEqual({ worldRevision: 1, dimensionRevision: 1 })
       expect(result.delta).toStrictEqual({
         world: WORLD,

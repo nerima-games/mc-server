@@ -16,7 +16,7 @@ import { Effect, Result } from 'effect'
 import type { MultiplayerServerCoreParts } from '../core.js'
 import { makeServerWorldWrite } from '../world-write-port.js'
 
-// Bounds resident terrain. The core never writes a chunk, so evicting one only costs regeneration.
+// Bounds resident terrain. Evicted chunks regenerate through the source and its saved block overrides.
 const CHUNK_STORE_CAPACITY = Result.getOrThrow(ChunkCapacity.result(256))
 
 /** Runs one mx-gameplay hunger operation on a runtime restored from `state` and returns the next state. */
