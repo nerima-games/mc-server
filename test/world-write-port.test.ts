@@ -343,6 +343,8 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
         const before = yield* fixture.observeAll
 
         const error = yield* Effect.flip(fixture.port.applyBatch(yield* batchOf({
+          world: 'another-world',
+          dimension: 'nether',
           expectedWorldRevision: 5,
           expectedDimensionRevision: 5,
           edits: [],
@@ -392,9 +394,23 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
       }))
 
     it.effect.each([
-      { world: 'another-world', dimension: 'overworld' },
-      { world: WORLD, dimension: 'nether' },
-    ] as const)('rejects a batch outside the configured world or dimension without committing: $world/$dimension', ({ world, dimension }) =>
+      {
+        world: 'another-world', dimension: 'overworld', y: 10,
+        message: 'c7-adapter: world mismatch', cause: { batch: 'another-world', coordinator: WORLD },
+      },
+      {
+        world: WORLD, dimension: 'nether', y: 10,
+        message: 'c7-adapter: dimension mismatch', cause: { batch: 'nether', port: 'overworld' },
+      },
+      {
+        world: 'another-world', dimension: 'overworld', y: -1,
+        message: 'c7-adapter: world mismatch', cause: { batch: 'another-world', coordinator: WORLD },
+      },
+      {
+        world: WORLD, dimension: 'nether', y: CHUNK_HEIGHT,
+        message: 'c7-adapter: dimension mismatch', cause: { batch: 'nether', port: 'overworld' },
+      },
+    ] as const)('dies on a world or dimension mismatch before height checks or commit: $world/$dimension/y=$y', ({ world, dimension, y, message, cause }) =>
       Effect.gen(function* () {
         const fixture = yield* makeFixture()
         yield* fixture.nether.load(ORIGIN_CHUNK)
@@ -409,9 +425,11 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
         })
         const before = yield* observeScope
 
-        const error = yield* Effect.flip(fixture.port.applyBatch(yield* batchOf({ world, dimension })))
+        const exit = yield* Effect.exit(fixture.port.applyBatch(yield* batchOf({
+          world, dimension, edits: [edit({ x: 1, y, z: 1 })],
+        })))
 
-        expect(error).toMatchObject({ _tag: 'WorldWriteChunkUnavailable', dimension, chunk: '0,0' })
+        expect(defectOf(exit)).toMatchObject({ message, cause })
         expect(yield* Ref.get(fixture.commits)).toBe(0)
         expect(yield* observeScope).toStrictEqual(before)
         expect(yield* fixture.dirty.drain).toEqual(EMPTY_DIRTY_BATCH)

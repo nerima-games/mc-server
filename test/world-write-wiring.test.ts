@@ -2,7 +2,7 @@ import { describe, expect, it } from '@effect/vitest'
 import { AIR_BLOCK_ID, BlockAxis, blockIdOf, blockPosition, WorldWriteBatchSchema, type Dimension } from '@nerima-games/mc-kernel'
 import { EMPTY_DIRTY_BATCH, type ChunkStoreApi } from '@nerima-games/mc-worldgen'
 import { vi } from 'vitest'
-import { Effect, Option, Result, Schema } from 'effect'
+import { Effect, Exit, Option, Result, Schema } from 'effect'
 
 import { makeMultiplayerServerCore, type MultiplayerServerCoreParts } from '../apps/multiplayer-server/core'
 import { makeMultiplayerServerCoreParts } from '../apps/multiplayer-server/entrypoints/core-parts'
@@ -77,7 +77,7 @@ describe('multiplayer core world write wiring', () => {
       }
     }))
 
-  it.effect('rejects foreign-dimension writes through each core port before commit', () =>
+  it.effect('dies on foreign-dimension writes through each core port before commit', () =>
     Effect.gen(function* () {
       for (const realm of makeRealms()) {
         const foreignDimension = realm.dimension === 'overworld' ? 'nether' : 'overworld'
@@ -103,10 +103,12 @@ describe('multiplayer core world write wiring', () => {
           edits: [{ position: POSITION, block: STONE }],
         })
 
-        const error = yield* Effect.flip(realm.core.worldWrite.port.applyBatch(batch))
+        const exit = yield* Effect.exit(realm.core.worldWrite.port.applyBatch(batch))
 
-        expect(error).toMatchObject({
-          _tag: 'WorldWriteChunkUnavailable', dimension: foreignDimension, chunk: '0,0',
+        expect(Exit.hasFails(exit)).toBe(false)
+        expect(Result.getOrThrow(Exit.findDefect(exit))).toMatchObject({
+          message: 'c7-adapter: dimension mismatch',
+          cause: { batch: foreignDimension, port: realm.dimension },
         })
         expect(commit).not.toHaveBeenCalled()
         expect(yield* observe).toStrictEqual(before)

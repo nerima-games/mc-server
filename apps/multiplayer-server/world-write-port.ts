@@ -59,11 +59,17 @@ export const commitBlockBatch = (
 ): Effect.Effect<Readonly<{ commit: WorldWriteCommit; delta: ReplicatedWorldDelta<ReplicatedOwnerChange> }>,
   WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteChunkUnavailable> => Effect.gen(function* () {
     yield* validateBeforeCommit(batch)
-    // This port cannot serve a target outside its world and dimension, even when
-    // the coordinator's registry returns a store for that dimension.
-    const outOfWorld = batch.edits.find(({ position }) =>
-      batch.world !== coordinator.worldId || batch.dimension !== expectedDimension
-      || position.y < 0 || position.y >= CHUNK_HEIGHT)
+    if (batch.world !== coordinator.worldId) {
+      return yield* Effect.die(new Error('c7-adapter: world mismatch', {
+        cause: { batch: batch.world, coordinator: coordinator.worldId },
+      }))
+    }
+    if (batch.dimension !== expectedDimension) {
+      return yield* Effect.die(new Error('c7-adapter: dimension mismatch', {
+        cause: { batch: batch.dimension, port: expectedDimension },
+      }))
+    }
+    const outOfWorld = batch.edits.find(({ position }) => position.y < 0 || position.y >= CHUNK_HEIGHT)
     if (outOfWorld !== undefined) {
       return yield* Effect.fail(new WorldWriteChunkUnavailable({
         dimension: batch.dimension,

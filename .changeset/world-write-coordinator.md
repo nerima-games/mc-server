@@ -6,4 +6,4 @@ Add a WorldWritePort adapter backed by WorldCommitCoordinator and wire a separat
 
 Reject server startup with WorldWriteInitializationFailure when the world identifier is empty.
 
-Reject writes targeting another world or dimension with WorldWriteChunkUnavailable, leaving ChunkStores unchanged.
+Fail mismatched world or dimension batches with Effect.die before commit, leaving ChunkStores unchanged.
