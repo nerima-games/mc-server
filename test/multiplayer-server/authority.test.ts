@@ -148,6 +148,42 @@ const witherState = (
   skulls: [],
 })
 
+/** A player cell next to the largest safe x: a wither there that moves 2 blocks toward +x leaves addressable cells. */
+const edgeAt = { x: Number.MAX_SAFE_INTEGER - 1, y: 64, z: 0 }
+
+/**
+ * A wither on the player's cell at `edgeAt`, ready to melee and below full health. mc-sim keeps its speed when the
+ * player gives it no acceleration, and its melee reaches 2.25 blocks from the stepped feet, so a 0.4 s step at speed 5
+ * moves it 2 blocks and still hits.
+ */
+const edgeWitherState = (velocityX: number): MultiplayerServerState => ({
+  ...initialState(),
+  vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
+  wither: {
+    nextWitherId: 1,
+    nextSkullId: 0,
+    withers: [{
+      id: 'wither-1',
+      dimension: 'world-1',
+      snapshot: {
+        kind: 'wither',
+        version: 1,
+        state: {
+          phase: 'airborne',
+          healthPoints: WitherHealthPoints(250),
+          chargeRemainingSecs: WitherChargeRemainingSecs(0),
+          feetPosition: { x: PositionAxis(edgeAt.x), y: PositionAxis(edgeAt.y), z: PositionAxis(edgeAt.z) },
+          velocity: { x: PositionAxis(velocityX), y: PositionAxis(0), z: PositionAxis(0) },
+        },
+      },
+      rangedCooldownSecs: 100,
+      meleeCooldownSecs: 0,
+      shotsFired: 0,
+    }],
+    skulls: [],
+  },
+})
+
 const makeFixture = (
   state: MultiplayerServerState = initialState(),
   joinAt: Readonly<{ x: number; y: number; z: number }> = { x: 0, y: 64, z: 0 },
@@ -194,6 +230,21 @@ const makeFixture = (
   persisted.length = 0
   timeline.length = 0
   return { sent, persisted, timeline, receive, receiveDamage, receiveCrafting, receiveAnvil, receiveEnchanting, server }
+}
+
+/**
+ * The whole state the core holds in memory. A join persists all of it, so an observer joining reads it without a
+ * core getter; compare two fixtures that both had the observer join.
+ */
+const wholeStateAfterObserverJoins = (fixture: ReturnType<typeof makeFixture>): MultiplayerServerState => {
+  fixture.persisted.length = 0
+  expect(fixture.server.connect('socket-observer', () => undefined)).toBe(true)
+  expect(fixture.server.receive('socket-observer', frame({
+    _tag: 'PlayerJoin', player: playerId('observer'), name: playerName('Observer'), at: { x: 0, y: 64, z: 0 },
+  })).accepted).toBe(true)
+  const [state, ...rest] = fixture.persisted
+  if (state === undefined || rest.length > 0) throw new Error('an observer join persists the state exactly once')
+  return state
 }
 
 describe('multiplayer server authoritative state', () => {
@@ -754,7 +805,10 @@ describe('multiplayer server authoritative state', () => {
 
   it('rejects commands without throwing once the revision reaches the largest safe integer', () => {
     const slots = [{ item: 'stone', count: 5 }, { item: 'coal', count: 3 }, null] as const
-    const fixture = makeFixture({ ...initialState(), revision: Number.MAX_SAFE_INTEGER })
+    const state = { ...initialState(), revision: Number.MAX_SAFE_INTEGER }
+    const untouched = makeFixture(state)
+    const fixture = makeFixture(state)
+    const before = fixture.server.snapshot()
     fixture.sent.length = 0
     const exhausted = { _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER }
 
@@ -777,6 +831,7 @@ describe('multiplayer server authoritative state', () => {
     ])
 
     expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
     expect(fixture.server.snapshot()).toEqual(expect.objectContaining({
       revision: Number.MAX_SAFE_INTEGER,
       blocks: initialState().blocks.map((block) => ({ ...block, world: 'world-1' })),
@@ -788,25 +843,234 @@ describe('multiplayer server authoritative state', () => {
       revision: Number.MAX_SAFE_INTEGER,
       inventories: [{ player: 'alice', state: expect.objectContaining({ selectedSlot: 0, slots }) }],
     })])
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
+  })
+
+  it('refuses a player leave without changing state when the night skip it may take cannot advance the revision', () => {
+    const state = { ...initialState(), revision: Number.MAX_SAFE_INTEGER }
+    const untouched = makeFixture(state)
+    const fixture = makeFixture(state)
+    const before = fixture.server.snapshot()
+    fixture.sent.length = 0
+
+    expect(fixture.receive({ _tag: 'PlayerLeave', player: playerId('alice') })).toEqual({
+      accepted: false,
+      reason: 'invalid-command',
+      failure: { _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER },
+    })
+    expect(fixture.sent).toEqual([])
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
   })
 
   it('fails a tick with a typed failure when it cannot advance the revision or the simulation tick', () => {
-    const fixture = makeFixture({
+    const state: MultiplayerServerState = {
       ...initialState(),
       revision: Number.MAX_SAFE_INTEGER,
       entities: [{
         _tag: 'item-drop', entityId: entityId('last-tick-drop'), at: { x: 2, y: 65, z: 3 },
         stack: { item: 'stone', count: 1 }, ageTicks: 5_999,
       }],
-    })
+    }
+    const untouched = makeFixture(state)
+    const fixture = makeFixture(state)
+    const before = fixture.server.snapshot()
 
     expect(fixture.server.tick(Number.MAX_VALUE)).toEqual(Result.fail({
       _tag: 'SimulationTickExhausted',
       simulationTick: 0,
       elapsedTicks: Math.floor(Number.MAX_VALUE / 50),
     }))
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
+
+    // Two game ticks pass: the time step completes and is persisted, and the drop's despawn step, which needs a
+    // revision advance, applies none of its changes.
     expect(fixture.server.tick(100)).toEqual(Result.fail({ _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER }))
-    expect(fixture.server.snapshot().revision).toBe(Number.MAX_SAFE_INTEGER)
+    expect(fixture.server.snapshot()).toEqual(before)
+    const after = fixture.persisted.at(-1)
+    const expected = wholeStateAfterObserverJoins(untouched)
+    const { weatherClock } = expected
+    if (weatherClock === undefined) throw new Error('the core persists its weather clock')
+    const timeAdvanced = {
+      ...expected,
+      timeWeather: { timeOfDay: 6_002, weather: 'clear' },
+      weatherClock: { ...weatherClock, remainingSecs: weatherClock.remainingSecs - 0.1 },
+    }
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(timeAdvanced)
+    expect(after?.timeWeather).toEqual(timeAdvanced.timeWeather)
+  })
+
+  it('leaves positions and health unchanged when the entity step cannot advance the revision', () => {
+    const state = (revision: number): MultiplayerServerState => ({
+      ...initialState(),
+      revision,
+      vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
+      entities: [
+        {
+          _tag: 'arrow', entityId: entityId('hitting-arrow'), at: { x: 0, y: 65, z: -1 }, velocity: { x: 0, y: 0, z: 30 },
+          damage: 2, owner: null, ageTicks: 0,
+        },
+        {
+          _tag: 'arrow', entityId: entityId('flying-arrow'), at: { x: 5, y: 100, z: 5 }, velocity: { x: 10, y: 0, z: 0 },
+          damage: 2, owner: null, ageTicks: 0,
+        },
+      ],
+    })
+    // At an ordinary revision the same tick moves one arrow and hits the player with the other.
+    const accepted = makeFixture(state(4))
+    expect(accepted.server.tick(40)).toEqual(Result.succeed({ refusals: [] }))
+    expect(accepted.persisted.at(-1)).toEqual(expect.objectContaining({
+      revision: 5,
+      vitals: [{ player: 'alice', state: expect.objectContaining({ health: 18 }) }],
+      entities: [expect.objectContaining({ entityId: 'flying-arrow', at: { x: 5.4, y: 100, z: 5 } })],
+    }))
+
+    const untouched = makeFixture(state(Number.MAX_SAFE_INTEGER))
+    const fixture = makeFixture(state(Number.MAX_SAFE_INTEGER))
+    const before = fixture.server.snapshot()
+    fixture.sent.length = 0
+
+    // 40 ms is less than a game tick, so no step before the entity step changes anything.
+    expect(fixture.server.tick(40)).toEqual(Result.fail({ _tag: 'RevisionExhausted', counter: 'core', revision: Number.MAX_SAFE_INTEGER }))
+    expect(fixture.sent).toEqual([])
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
+  })
+
+  // Coordinator ruling: a position computed in a tick that leaves addressable cells is refused for that entity
+  // alone and reported, and the rest of the tick goes on.
+  it('keeps a mob whose tick move would leave addressable cells while the rest of the tick advances', () => {
+    const edge = Number.MAX_SAFE_INTEGER - 1
+    const fixture = makeFixture({
+      ...initialState(),
+      entities: [{
+        _tag: 'arrow', entityId: entityId('nearby-arrow'), at: { x: 0, y: 100, z: 0 }, velocity: { x: 1, y: 0, z: 0 },
+        damage: 2, owner: null, ageTicks: 0,
+      }],
+      wither: {
+        nextWitherId: 1,
+        nextSkullId: 0,
+        withers: [{
+          id: 'wither-1',
+          dimension: 'world-1',
+          snapshot: {
+            kind: 'wither',
+            version: 1,
+            state: {
+              phase: 'airborne',
+              healthPoints: WitherHealthPoints(300),
+              chargeRemainingSecs: WitherChargeRemainingSecs(0),
+              feetPosition: { x: PositionAxis(edge), y: PositionAxis(64), z: PositionAxis(0) },
+              velocity: { x: PositionAxis(10), y: PositionAxis(0), z: PositionAxis(0) },
+            },
+          },
+          rangedCooldownSecs: 100,
+          meleeCooldownSecs: 0,
+          shotsFired: 0,
+        }],
+        skulls: [],
+      },
+    })
+    fixture.sent.length = 0
+
+    expect(fixture.server.tick(1_000)).toEqual(Result.succeed({
+      refusals: [{
+        _tag: 'PositionWriteRefused', subject: 'wither', id: 'wither-1', kind: 'wither',
+        at: expect.objectContaining({ x: expect.any(Number) }), action: 'kept',
+      }],
+    }))
+    const saved = fixture.persisted.at(-1)
+    expect(saved?.wither?.withers[0]?.snapshot.state.feetPosition).toEqual({ x: edge, y: 64, z: 0 })
+    expect(saved?.entities).toContainEqual(expect.objectContaining({ entityId: 'nearby-arrow', at: expect.objectContaining({ x: 1 }) }))
+    expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
+      _tag: 'EntityUpdateDelta', entity: expect.objectContaining({ entityId: 'nearby-arrow' }),
+    }))
+  })
+
+  it('removes an arrow whose tick flight would leave addressable cells and reports the refusal', () => {
+    const fixture = makeFixture({
+      ...initialState(),
+      entities: [{
+        _tag: 'arrow', entityId: entityId('edge-arrow'), at: { x: Number.MAX_SAFE_INTEGER - 1, y: 100, z: 0 },
+        velocity: { x: 30, y: 0, z: 0 }, damage: 2, owner: null, ageTicks: 0,
+      }],
+    })
+    fixture.sent.length = 0
+
+    expect(fixture.server.tick(100)).toEqual(Result.succeed({
+      refusals: [{
+        _tag: 'PositionWriteRefused', subject: 'entity', id: 'edge-arrow', kind: 'arrow',
+        at: expect.objectContaining({ y: 100, z: 0 }), action: 'removed',
+      }],
+    }))
+    expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
+      _tag: 'EntityDespawnDelta', entityId: 'edge-arrow', revision: 5,
+    }))
+    expect(fixture.persisted.at(-1)?.entities).not.toContainEqual(expect.objectContaining({ entityId: 'edge-arrow' }))
+    expect(fixture.persisted.at(-1)?.revision).toBe(5)
+  })
+
+  /** The whole state after a 0.4 s tick that only advanced the time, read from a fixture that never ticked. */
+  const afterTimeOnlyTick = (untouched: ReturnType<typeof makeFixture>): MultiplayerServerState => {
+    const expected = wholeStateAfterObserverJoins(untouched)
+    const { weatherClock } = expected
+    if (weatherClock === undefined) throw new Error('the core persists its weather clock')
+    return {
+      ...expected,
+      timeWeather: { timeOfDay: 6_008, weather: 'clear' },
+      weatherClock: { ...weatherClock, remainingSecs: weatherClock.remainingSecs - 0.4 },
+    }
+  }
+
+  it('applies a wither step beside the edge of addressable cells, including its melee hit', () => {
+    const untouched = makeFixture(edgeWitherState(-5), edgeAt)
+    const fixture = makeFixture(edgeWitherState(-5), edgeAt)
+
+    expect(fixture.server.tick(400)).toEqual(Result.succeed({ refusals: [] }))
+    const timeOnly = afterTimeOnlyTick(untouched)
+    const [wither] = timeOnly.wither?.withers ?? []
+    if (wither === undefined) throw new Error('the fixture holds one wither')
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual({
+      ...timeOnly,
+      revision: 5,
+      vitals: timeOnly.vitals.map((entry) => entry.player === playerId('alice')
+        ? { ...entry, state: { ...entry.state, health: 12 } }
+        : entry),
+      wither: {
+        ...timeOnly.wither,
+        withers: [{
+          ...wither,
+          snapshot: {
+            ...wither.snapshot,
+            state: {
+              ...wither.snapshot.state,
+              healthPoints: 250.4,
+              feetPosition: { ...wither.snapshot.state.feetPosition, x: edgeAt.x - 2 },
+            },
+          },
+          rangedCooldownSecs: 99.6,
+          meleeCooldownSecs: 1,
+        }],
+      },
+    })
+  })
+
+  it('applies none of a wither step that would leave addressable cells, including its melee hit', () => {
+    const untouched = makeFixture(edgeWitherState(5), edgeAt)
+    const fixture = makeFixture(edgeWitherState(5), edgeAt)
+    fixture.sent.length = 0
+
+    expect(fixture.server.tick(400)).toEqual(Result.succeed({
+      refusals: [{
+        _tag: 'PositionWriteRefused', subject: 'wither', id: 'wither-1', kind: 'wither',
+        at: { x: edgeAt.x + 2, y: edgeAt.y, z: edgeAt.z }, action: 'kept',
+      }],
+    }))
+    expect(messages(fixture.sent)).not.toContainEqual(expect.objectContaining({ _tag: 'PlayerVitalsDelta' }))
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(afterTimeOnlyTick(untouched))
   })
 
   it('resolves bucket collection and placement from the authoritative player pose', () => {

@@ -153,6 +153,9 @@ import {
   snapshotWitherRuntime,
   summonRuntimeWither,
   type WitherRuntimeSnapshot,
+  type RuntimeWither,
+  type RuntimeWitherSkull,
+  type WitherRuntimeAdvance,
   type WitherRuntimeState,
 } from '../multiplayer-shared/wither-runtime.js'
 import {
@@ -481,11 +484,30 @@ type PositionWrite =
   | Readonly<{ _tag: 'wither'; state: WitherRuntimeState }>
   | Readonly<{ _tag: 'eye-of-ender-recovery'; recovery: EyeOfEnderRecoveryState }>
 
-type SavedPosition = Readonly<{
-  subject: 'entity' | 'player' | 'wither' | 'wither-skull' | 'eye-of-ender-recovery'
+type PositionOutsideAddressableCells = Extract<MultiplayerServerCoreFailure, { readonly _tag: 'PositionOutsideAddressableCells' }>
+
+type SavedPosition = Omit<PositionOutsideAddressableCells, '_tag'>
+
+/** A tick step whose position writePositions refused; the tick applies everything else. */
+export type PositionWriteRefused = Readonly<{
+  _tag: 'PositionWriteRefused'
+  subject: SavedPosition['subject']
   id: string
+  kind: string
   at: Readonly<{ x: number; y: number; z: number }>
+  /** `kept`: the entity stays as it was. `removed`: an in-flight projectile is despawned. `skipped`: a drop is not spawned. */
+  action: 'kept' | 'removed' | 'skipped'
 }>
+
+export type TickReport = Readonly<{ refusals: ReadonlyArray<PositionWriteRefused> }>
+
+const witherPositions = (wither: RuntimeWither): ReadonlyArray<SavedPosition> =>
+  [{ subject: 'wither', id: wither.id, at: wither.state.feetPosition }]
+
+const witherSkullPositions = (skull: RuntimeWitherSkull): ReadonlyArray<SavedPosition> => [
+  { subject: 'wither-skull', id: skull.id, at: skull.position },
+  { subject: 'wither-skull', id: skull.id, at: skull.descriptor.origin },
+]
 
 const positionsOfWrite = (write: PositionWrite): ReadonlyArray<SavedPosition> => {
   switch (write._tag) {
@@ -494,16 +516,16 @@ const positionsOfWrite = (write: PositionWrite): ReadonlyArray<SavedPosition> =>
     case 'entity':
       return [{ subject: 'entity', id: String(write.entity.entityId), at: write.entity.at }]
     case 'wither':
-      return [
-        ...write.state.withers.map((wither): SavedPosition => ({ subject: 'wither', id: wither.id, at: wither.state.feetPosition })),
-        ...write.state.skulls.flatMap((skull): ReadonlyArray<SavedPosition> => [
-          { subject: 'wither-skull', id: skull.id, at: skull.position },
-          { subject: 'wither-skull', id: skull.id, at: skull.descriptor.origin },
-        ]),
-      ]
+      return [...write.state.withers.flatMap(witherPositions), ...write.state.skulls.flatMap(witherSkullPositions)]
     case 'eye-of-ender-recovery':
       return [{ subject: 'eye-of-ender-recovery', id: String(write.recovery.entityId), at: write.recovery.at }]
   }
+}
+
+/** The first position outside addressable cells; writePositions refuses a write that has one. */
+const firstOutsideAddressableCells = (positions: ReadonlyArray<SavedPosition>): PositionOutsideAddressableCells | undefined => {
+  const outside = positions.find(({ at }) => !isInAddressableCell(at))
+  return outside === undefined ? undefined : { _tag: 'PositionOutsideAddressableCells', ...outside }
 }
 
 interface MovementBudget {
@@ -1008,7 +1030,7 @@ export interface MultiplayerServerCore {
   readonly readContainerSlots: (at: BlockPos) => Result.Result<ReadonlyArray<ContainerSlotSnapshot> | undefined, MultiplayerServerCoreFailure>
   readonly readPistonCell: (at: BlockPos) => Result.Result<PistonCellRead, MultiplayerServerCoreFailure>
   readonly applyPistonPlan: (plan: PistonMovementPlan) => Result.Result<boolean, MultiplayerServerCoreFailure>
-  readonly tick: (elapsedMs: number) => Result.Result<void, MultiplayerServerCoreFailure>
+  readonly tick: (elapsedMs: number) => Result.Result<TickReport, MultiplayerServerCoreFailure>
   readonly spawnEntity: (entity: AuthoritativeEntityState) => Result.Result<boolean, MultiplayerServerCoreFailure>
 }
 
@@ -1668,7 +1690,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
   }
 
-  const applyPendingFallingBlocks = (): Result.Result<boolean, MultiplayerServerCoreFailure> => {
+  /** The next falling-block moves, planned from current blocks; `commit` applies them and clears their pending cells. */
+  const planPendingFallingBlocks = (): Result.Result<Readonly<{ moved: boolean; commit: () => void }>, MultiplayerServerCoreFailure> => {
     const targets = Array.from(fallingPending.values()).slice(0, FALLING_BLOCK_MOVES_PER_TICK)
     let registryLookupFailure: string | undefined
     let blockReadFailure: MultiplayerServerCoreFailure | undefined
@@ -1714,16 +1737,20 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
       resolvedMoves.push({ source: move.source, target: move.target, block: blockResult.success })
     }
-    for (const target of targets) fallingPending.delete(positionKey(target))
-    for (const move of resolvedMoves) {
-      blocks.set(positionKey(move.source), { at: move.source, block: null })
-      blocks.set(positionKey(move.target), { at: move.target, block: move.block })
-      disturbFallingBlocks([
-        { x: move.target.x, y: move.target.y - 1, z: move.target.z },
-        move.source,
-      ])
-    }
-    return Result.succeed(resolvedMoves.length > 0)
+    return Result.succeed({
+      moved: resolvedMoves.length > 0,
+      commit: () => {
+        for (const target of targets) fallingPending.delete(positionKey(target))
+        for (const move of resolvedMoves) {
+          blocks.set(positionKey(move.source), { at: move.source, block: null })
+          blocks.set(positionKey(move.target), { at: move.target, block: move.block })
+          disturbFallingBlocks([
+            { x: move.target.x, y: move.target.y - 1, z: move.target.z },
+            move.source,
+          ])
+        }
+      },
+    })
   }
 
   const containerIdAt = (at: BlockPos): string =>
@@ -2042,9 +2069,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
    * The only writer of player and entity positions after load. Every write must land in an addressable cell; the
    * writes are all checked before any is applied, so a rejected batch leaves state unchanged.
    */
-  const writePositions = (writes: ReadonlyArray<PositionWrite>): Result.Result<void, MultiplayerServerCoreFailure> => {
-    const outside = writes.flatMap(positionsOfWrite).find(({ at }) => !isInAddressableCell(at))
-    if (outside !== undefined) return Result.fail({ _tag: 'PositionOutsideAddressableCells', ...outside })
+  const writePositions = (writes: ReadonlyArray<PositionWrite>): Result.Result<void, PositionOutsideAddressableCells> => {
+    const outside = firstOutsideAddressableCells(writes.flatMap(positionsOfWrite))
+    if (outside !== undefined) return Result.fail(outside)
     for (const write of writes) {
       if (write._tag === 'entity') {
         entities.set(write.entity.entityId, write.entity)
@@ -4374,6 +4401,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     if (sleepMessage?._tag === 'SleepCommand') {
       if (client.playerId === null) return { accepted: false, reason: 'join-required' }
       if (sleepMessage.command.actor !== client.playerId) return { accepted: false, reason: 'identity-spoof' }
+      // An accepted sleep command can skip the night, which advances the revision after the sleep state changed.
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return { accepted: false, reason: 'invalid-command', failure: reserved.failure }
       sleepBlockReadFailure = undefined
       const result = sleepAuthority.execute(sleepMessage.command, intentContext())
       sendSleep(client, { _tag: 'SleepCommandResult', result })
@@ -4383,10 +4413,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         return { accepted: false, reason: 'invalid-command', failure }
       }
       if (!result.accepted) return { accepted: false, reason: 'invalid-command' }
-      const published = publishSleepEvents(result.revision, result.events)
-      return Result.isFailure(published)
-        ? { accepted: false, reason: 'invalid-command', failure: published.failure }
-        : { accepted: true, message: sleepMessage }
+      // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
+      Result.getOrThrow(publishSleepEvents(result.revision, result.events))
+      return { accepted: true, message: sleepMessage }
     }
     const decoded = decodeFrame(frame)
     if (Result.isFailure(decoded)) return { accepted: false, reason: 'malformed-frame' }
@@ -4468,12 +4497,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
     switch (message._tag) {
       case 'PlayerLeave': {
+        // Leaving can skip the night, so the player stays unless that advance fits; disconnect still removes them.
+        const reserved = revisionAfter(1)
+        if (Result.isFailure(reserved)) return { accepted: false, reason: 'invalid-command', failure: reserved.failure }
         const events = sleepAuthority.disconnect(message.player)
-        const published = publishSleepEvents(sleepAuthority.snapshot().revision, events)
+        // revisionAfter(1) succeeded above, and nothing has advanced the revision since.
+        Result.getOrThrow(publishSleepEvents(sleepAuthority.snapshot().revision, events))
         removePlayer(clientId, client)
-        return Result.isFailure(published)
-          ? { accepted: false, reason: 'invalid-command', failure: published.failure }
-          : { accepted: true, message }
+        return { accepted: true, message }
       }
       case 'PlayerMove': {
         if (message.world !== undefined && message.world !== worldId) return { accepted: false, reason: 'wrong-world' }
@@ -4866,14 +4897,31 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     return true
   }
 
-  const tick = (elapsedMs: number): Result.Result<void, MultiplayerServerCoreFailure> => {
+  const tick = (elapsedMs: number): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
       return Result.fail({ _tag: 'InvalidServerTickDuration', elapsedMs })
+    }
+    // A step computed in this tick that leaves addressable cells is refused for that entity alone, so one entity
+    // cannot stop the world; each refusal is reported to the caller.
+    const refusals: PositionWriteRefused[] = []
+    const refuse = (outside: PositionOutsideAddressableCells, kind: string, action: PositionWriteRefused['action']): void => {
+      refusals.push({ _tag: 'PositionWriteRefused', subject: outside.subject, id: outside.id, kind, at: outside.at, action })
     }
     let stateChanged = false
     let worldSnapshotRequired = false
     const postPersistenceDeltas: AuthoritativeDelta[] = []
     const changedFurnaces: MutableFurnaceState[] = []
+    const publish = (): void => {
+      if (stateChanged) notifyStateChanged()
+      for (const delta of postPersistenceDeltas) broadcast(delta)
+      if (worldSnapshotRequired) broadcast(snapshot())
+    }
+    // Each step below checks its revision advance before it changes any state, so a step that cannot advance is
+    // left wholly unapplied. The steps before it are complete, so they are published before the failure returns.
+    const failUnadvancedStep = (failure: MultiplayerServerCoreFailure): Result.Result<TickReport, MultiplayerServerCoreFailure> => {
+      publish()
+      return Result.fail(failure)
+    }
     const elapsedSecs = elapsedMs / 1_000
     const validElapsedMs = elapsedMs
     const elapsedTicks = Math.floor((timeTickRemainderMs + validElapsedMs) / MINECRAFT_TICK_MS)
@@ -4884,11 +4932,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     const timeChanged = elapsedTicks > 0
     if (elapsedSecs > 0) {
       const fishingDeltas: Array<Omit<Extract<AuthoritativeDelta, { readonly _tag: 'PlayerFishingDelta' }>, 'revision'>> = []
+      const fishingCommits: Array<() => void> = []
       for (const [player, active] of fishingSessions) {
         const actor = players.get(player)
         const inventory = inventories.get(player)
         if (actor === undefined || inventory?.slots[active.slot]?.item !== 'fishing_rod') {
-          fishingSessions.delete(player)
+          fishingCommits.push(() => fishingSessions.delete(player))
           if (actor !== undefined) fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'idle', result: 'cancelled' } })
           continue
         }
@@ -4896,22 +4945,25 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (Result.isFailure(water)) return Result.fail(water.failure)
         const advanced = advanceFishing(active.session, elapsedSecs, { hasWater: water.success === 'water' })
         if (advanced._tag === 'Cancelled') {
-          fishingSessions.delete(player)
+          fishingCommits.push(() => fishingSessions.delete(player))
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'idle', result: 'lost-water' } })
-        } else if (advanced._tag === 'Bite') {
-          active.session = advanced.session
+          continue
+        }
+        const session = advanced.session
+        fishingCommits.push(() => { active.session = session })
+        if (advanced._tag === 'Bite') {
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'bite', result: 'bite' } })
         } else if (advanced._tag === 'Escaped') {
-          active.session = advanced.session
           fishingDeltas.push({ _tag: 'PlayerFishingDelta', world: actor.world, player, state: { phase: 'escaped', result: 'escaped' } })
-        } else if (advanced._tag === 'Waiting') active.session = advanced.session
+        }
       }
       if (fishingDeltas.length > 0) {
         const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
         stateChanged = true
         postPersistenceDeltas.push(...fishingDeltas.map((delta) => ({ ...delta, revision })))
       }
+      for (const commit of fishingCommits) commit()
     }
     if (timeChanged) {
       const elapsedGameSecs = (elapsedTicks * MINECRAFT_TICK_MS) / 1_000
@@ -4929,21 +4981,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
       // Same inputs as weatherExpires, plus rolls from nextRoll or LOWEST_WEATHER_ROLLS.
       const nextWeather = Result.getOrThrow(advanceWeather(weatherState, elapsedGameSecs, rolls))
-      timeWeather = {
+      const nextTimeWeather = {
         timeOfDay: (timeWeather.timeOfDay + elapsedTicks) % MINECRAFT_DAY_TICKS,
         weather: nextWeather.weather,
       }
+      const nextThunderStrikeSequence = Math.floor(nextTimeWeather.timeOfDay / THUNDER_STRIKE_INTERVAL_TICKS)
+      const strikes = nextTimeWeather.weather === 'thunder' && nextThunderStrikeSequence !== thunderStrikeSequence
+      if (strikes) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
+      }
+      timeWeather = nextTimeWeather
       weatherClock = {
         remainingSecs: nextWeather.remainingSecs,
         seed: nextWeatherSeed,
       }
-      const nextThunderStrikeSequence = Math.floor(timeWeather.timeOfDay / THUNDER_STRIKE_INTERVAL_TICKS)
-      if (
-        timeWeather.weather === 'thunder'
-        && nextThunderStrikeSequence !== thunderStrikeSequence
-      ) {
-        const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+      if (strikes) {
         stateChanged = true
         const target = [...players.values()][0]
         const at = target === undefined
@@ -4980,6 +5033,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       thunderStrikeSequence = nextThunderStrikeSequence
     }
     if (elapsedSecs > 0) {
+      const furnaceSteps: Array<Readonly<{ furnace: MutableFurnaceState; state: SimFurnaceState }>> = []
       for (const furnace of furnaces.values()) {
         const current = furnaceSimulationState(furnace)
         if (Result.isFailure(current)) {
@@ -4990,15 +5044,18 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           return Result.fail({ _tag: 'FurnaceAdvanceFailure', failure: advanced.failure })
         }
         if (!furnaceSimulationStateChanged(current.success, advanced.success.state)) continue
-        applyFurnaceSimulationState(furnace, advanced.success.state)
+        furnaceSteps.push({ furnace, state: advanced.success.state })
+      }
+      // Time is replicated state but does not invalidate gameplay commands; only furnace changes advance.
+      if (furnaceSteps.length > 0) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
+      }
+      for (const { furnace, state } of furnaceSteps) {
+        applyFurnaceSimulationState(furnace, state)
         changedFurnaces.push(furnace)
       }
       if (timeChanged || changedFurnaces.length > 0) {
-        // Time is replicated state but does not invalidate gameplay commands.
-        if (changedFurnaces.length > 0) {
-          const advancedRevision = advanceRevision()
-          if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
-        }
         stateChanged = true
         if (timeChanged) postPersistenceDeltas.push({ _tag: 'WorldTimeWeatherDelta', world: worldId, revision, state: { ...timeWeather } })
         for (const furnace of changedFurnaces) {
@@ -5018,16 +5075,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         advancedEffects.push({ player, effects, advanced: Result.getOrThrow(tickStatusEffects(effects, DeltaTimeSecs(elapsedSecs))) })
       }
 
+      const brewingCommits: Array<() => void> = []
       for (const [key, stand] of brewingStands) {
         const next = tickBrewingStand(stand.state, DeltaTimeSecs(elapsedSecs))
         if (JSON.stringify(next) === JSON.stringify(stand.state)) continue
-        brewingStands.set(key, { at: stand.at, state: next })
+        brewingCommits.push(() => brewingStands.set(key, { at: stand.at, state: next }))
         changedBrewingStands.push({ at: stand.at, state: next })
       }
 
       for (const { player, effects, advanced } of advancedEffects) {
         if (JSON.stringify(advanced.state) !== JSON.stringify(effects)) {
-          statusEffects.set(player, advanced.state)
+          brewingCommits.push(() => statusEffects.set(player, advanced.state))
           changedEffects.add(player)
         }
 
@@ -5041,13 +5099,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           ),
         )
         if (nextHealth === playerVitals.health) continue
-        playerVitals.health = nextHealth
+        brewingCommits.push(() => { playerVitals.health = nextHealth })
         changedVitals.add(player)
       }
 
       if (changedBrewingStands.length > 0 || changedEffects.size > 0 || changedVitals.size > 0) {
         const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
+        for (const commit of brewingCommits) commit()
         stateChanged = true
         for (const stand of changedBrewingStands) {
           broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: stand.at, state: copyBrewingStandState(stand.state) })
@@ -5093,10 +5152,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         contactSteps.push({ player, playerVitals, step })
       }
 
+      const contactDamage = (step: EnvironmentalContactDamageStep): number => step.damages.reduce((total, entry) => total + entry.amount, 0)
+      if (contactSteps.some(({ step }) => contactDamage(step) > 0)) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
+      }
       for (const player of inactivePlayers) environmentalContactDamageStates.delete(player)
       for (const { player, playerVitals, step } of contactSteps) {
         environmentalContactDamageStates.set(player, step.state)
-        const damage = step.damages.reduce((total, entry) => total + entry.amount, 0)
+        const damage = contactDamage(step)
         if (damage <= 0) continue
 
         const wasAlive = playerVitals.health > 0
@@ -5107,8 +5171,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
       simulationElapsedSecs = nextSimulationElapsedSecs
       if (damagedPlayers.size > 0) {
-        const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
         stateChanged = true
         postPersistenceDeltas.push(...applyPlayerDeaths([...deadPlayers], revision))
         for (const player of damagedPlayers) {
@@ -5125,43 +5187,56 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
     }
 
     if (elapsedTicks > 0) {
-      const fallingBlocksResult = applyPendingFallingBlocks()
+      const fallingBlocksResult = planPendingFallingBlocks()
       if (Result.isFailure(fallingBlocksResult)) return Result.fail(fallingBlocksResult.failure)
-      if (fallingBlocksResult.success) {
+      if (fallingBlocksResult.success.moved) {
         const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
         stateChanged = true
         worldSnapshotRequired = true
       }
+      fallingBlocksResult.success.commit()
 
       const agedEntities: AuthoritativeDelta[] = []
+      const agingCommits: Array<() => void> = []
       for (const entity of entities.values()) {
         if (entity._tag !== 'item-drop') continue
         const ageTicks = (entity.ageTicks ?? 0) + elapsedTicks
         if (ageTicks >= ITEM_DROP_LIFESPAN_TICKS) {
-          entities.delete(entity.entityId)
-          droppedItemMetadata.delete(entity.entityId)
+          agingCommits.push(() => {
+            entities.delete(entity.entityId)
+            droppedItemMetadata.delete(entity.entityId)
+          })
           agedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
           continue
         }
         if (ageTicks === entity.ageTicks) continue
         const updated = { ...entity, ageTicks }
         // The update keeps the stored entity position, which writePositions or load validation admitted.
-        Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }]))
+        agingCommits.push(() => Result.getOrThrow(writePositions([{ _tag: 'entity', entity: updated }])))
         agedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
       }
+      // Age updates are replicated visual state; only a despawn invalidates commands.
+      if (agedEntities.some((delta) => delta._tag === 'EntityDespawnDelta')) {
+        const advancedRevision = advanceRevision()
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
+      }
+      for (const commit of agingCommits) commit()
       if (agedEntities.length > 0) {
-        // Age updates are replicated visual state; only a despawn invalidates commands.
-        if (agedEntities.some((delta) => delta._tag === 'EntityDespawnDelta')) {
-          const advancedRevision = advanceRevision()
-          if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
-        }
         stateChanged = true
         postPersistenceDeltas.push(...agedEntities.map((delta) => ({ ...delta, revision })))
       }
     }
 
-    if (elapsedSecs > 0) {
+    // Recoveries, arrows, primed TNT, and living mobs change on every step and later ones read earlier ones' effects,
+    // so this step checks its single revision advance before it changes anything.
+    const entityStepRuns = elapsedSecs > 0 && (eyeOfEnderRecoveries.size > 0
+      || [...entities.values()].some((entity) => entity._tag === 'arrow' || entity._tag === 'primed-tnt' || entity._tag === 'living'))
+    if (entityStepRuns) {
+      const reserved = revisionAfter(1)
+      if (Result.isFailure(reserved)) return failUnadvancedStep(reserved.failure)
+    }
+    if (entityStepRuns) {
       const movedEntities: AuthoritativeDelta[] = []
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
@@ -5180,8 +5255,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           at: recovery.at,
           stack: { item: 'eye_of_ender', count: 1 },
         }
-        const recovered = writePositions([{ _tag: 'entity', entity: drop }])
-        if (Result.isFailure(recovered)) return Result.fail(recovered.failure)
+        // The drop copies the stored recovery position, which writePositions or load validation admitted.
+        Result.getOrThrow(writePositions([{ _tag: 'entity', entity: drop }]))
         eyeOfEnderRecoveries.delete(key)
         movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
         worldChanged = true
@@ -5258,6 +5333,17 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             z: entity.at.z + entity.velocity.z * elapsedSecs,
           }
           const velocity = { ...entity.velocity, y: entity.velocity.y - ARROW_GRAVITY * elapsedSecs }
+          // The flight is written before the raycast, which then only reads cells between two admitted positions.
+          // A hit below despawns the arrow, so the early write never reaches a client.
+          const updated = { ...entity, at, velocity, ageTicks }
+          const flown = writePositions([{ _tag: 'entity', entity: updated }])
+          if (Result.isFailure(flown)) {
+            // Keeping the arrow would retry the same flight every tick, so it is despawned.
+            refuse(flown.failure, entity._tag, 'removed')
+            entities.delete(entity.entityId)
+            movedEntities.push({ _tag: 'EntityDespawnDelta', world: worldId, revision: 0, entityId: entity.entityId })
+            continue
+          }
           const travel = {
             x: at.x - entity.at.x,
             y: at.y - entity.at.y,
@@ -5353,8 +5439,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
                 stack: { item: 'arrow', count: 1 },
               }
               const dropped = writePositions([{ _tag: 'entity', entity: drop }])
-              if (Result.isFailure(dropped)) return Result.fail(dropped.failure)
-              movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
+              if (Result.isFailure(dropped)) refuse(dropped.failure, drop._tag, 'skipped')
+              else movedEntities.push({ _tag: 'EntitySpawnDelta', world: worldId, revision: 0, entity: drop })
             }
             if (playerWasHit) {
               const playerVitals = vitals.get(playerHit.player)
@@ -5394,9 +5480,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
             }
             continue
           }
-          const updated = { ...entity, at, velocity, ageTicks }
-          const flown = writePositions([{ _tag: 'entity', entity: updated }])
-          if (Result.isFailure(flown)) return Result.fail(flown.failure)
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
           continue
         }
@@ -5492,8 +5575,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
               // never matches what it looks up, so every candidate reads as unloaded and
               // the teleport is always refused.
               let blockReadFailure: MultiplayerServerCoreFailure | undefined
+              // A candidate outside addressable cells has no block to read, so it is left out like one out of bounds.
               const cells: EndermanTeleportCell[] = endermanTeleportCandidateCells(entity.at, anchor, rolls)
-                .filter((position) => isInBounds({
+                .filter((position) => isInAddressableCell(position) && isInBounds({
                   x: Math.floor(position.x),
                   y: Math.floor(position.y),
                   z: Math.floor(position.z),
@@ -5521,7 +5605,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           }
           const updated = { ...entity, at, mobState: { ...mobState, provoked: false } }
           const teleported = writePositions([{ _tag: 'entity', entity: updated }])
-          if (Result.isFailure(teleported)) return Result.fail(teleported.failure)
+          if (Result.isFailure(teleported)) {
+            refuse(teleported.failure, entity.entityType, 'kept')
+            continue
+          }
           movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
           continue
         }
@@ -5567,7 +5654,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         }
         const updated = { ...entity, at, mobState }
         const walked = writePositions([{ _tag: 'entity', entity: updated }])
-        if (Result.isFailure(walked)) return Result.fail(walked.failure)
+        if (Result.isFailure(walked)) {
+          // The refused step is not applied at all, including any attack it made from the refused position.
+          refuse(walked.failure, entity.entityType, 'kept')
+          continue
+        }
         movedEntities.push({ _tag: 'EntityUpdateDelta', world: worldId, revision: 0, entity: updated })
         const playerVitals = targetEntry === undefined ? undefined : vitals.get(targetEntry[0])
         if (targetEntry !== undefined && playerVitals !== undefined) {
@@ -5580,8 +5671,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         }
       }
       if (movedEntities.length > 0 || damagedPlayers.size > 0 || worldChanged) {
-        const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        // revisionAfter(1) succeeded before this step changed anything, and nothing in it advances the revision.
+        Result.getOrThrow(advanceRevision())
         stateChanged = true
         postPersistenceDeltas.push(...movedEntities.map((delta) => ({ ...delta, revision })))
         postPersistenceDeltas.push(...applyPlayerDeaths([...deadPlayers], revision))
@@ -5611,11 +5702,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         if (Result.isFailure(ticked)) return Result.fail(hungerFailure(ticked.failure))
         steps.push({ player, playerVitals, before: before.success, after: ticked.success.state, died: ticked.success.died })
       }
-      for (const step of steps) commitHunger(step.player, step.playerVitals, step.after)
       const changed = steps.filter((step) => hungerChanged(step.before, step.after))
       if (changed.length > 0) {
         const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        if (Result.isFailure(advancedRevision)) return failUnadvancedStep(advancedRevision.failure)
+      }
+      for (const step of steps) commitHunger(step.player, step.playerVitals, step.after)
+      if (changed.length > 0) {
         stateChanged = true
         postPersistenceDeltas.push(...applyPlayerDeaths(steps.filter((step) => step.died).map((step) => step.player), revision))
         for (const step of changed) {
@@ -5635,6 +5728,9 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       const damagedPlayers = new Set<PlayerId>()
       const deadPlayers = new Set<PlayerId>()
       let worldChanged = false
+      // Melee and explosions advance the revision once for this whole step, so that advance is checked before the
+      // first of them is applied.
+      let revisionReserved = false
       for (const dimension of dimensions) {
         const dimensionWithers = advanced.withers.filter((wither) => wither.dimension === dimension)
         const targetEntry = [...players.entries()]
@@ -5647,30 +5743,69 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
           .filter((entry) => entry[2] <= WITHER_TARGET_RANGE)
           .sort((left, right) => left[2] - right[2])[0]
         const target = targetEntry?.[1].at ?? dimensionWithers[0]?.state.feetPosition ?? { x: 0, y: 64, z: 0 }
-        let skullBlockReadFailure: MultiplayerServerCoreFailure | undefined
-        const advanceResult = advanceWitherRuntime(
-          advanced,
-          dimension,
-          target,
-          elapsedMs / 1_000,
-          (_skull, position) => {
-            const block = blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) })
-            if (Result.isFailure(block)) {
-              skullBlockReadFailure ??= block.failure
-              return false
-            }
-            return block.success !== null
-          },
-        )
-        if (skullBlockReadFailure !== undefined) return Result.fail(skullBlockReadFailure)
-        if (Result.isFailure(advanceResult)) {
-          return Result.fail({
-            _tag: 'WitherRuntimeFailure',
-            operation: 'advance',
-            failure: advanceResult.failure,
-          })
+        // mc-sim returns one dimension's melee, launches, and explosions summed over its withers, so a wither whose
+        // step leaves addressable cells is left out and the dimension is stepped again. The refused wither keeps its
+        // state, and none of its step's movement, regeneration, charge, launch, or melee applies.
+        const refusedWitherIds = new Set<string>()
+        const advanceDimension = (): Result.Result<WitherRuntimeAdvance, MultiplayerServerCoreFailure> => {
+          let skullBlockReadFailure: MultiplayerServerCoreFailure | undefined
+          const stepped = advanceWitherRuntime(
+            { ...advanced, withers: advanced.withers.filter((wither) => !refusedWitherIds.has(wither.id)) },
+            dimension,
+            target,
+            elapsedMs / 1_000,
+            (_skull, position) => {
+              // A cell outside addressable cells holds no block; the skull flies on and is refused below.
+              if (!isInAddressableCell(position)) return false
+              const block = blockAt({ x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) })
+              if (Result.isFailure(block)) {
+                skullBlockReadFailure ??= block.failure
+                return false
+              }
+              return block.success !== null
+            },
+          )
+          if (skullBlockReadFailure !== undefined) return Result.fail(skullBlockReadFailure)
+          if (Result.isFailure(stepped)) return Result.fail({ _tag: 'WitherRuntimeFailure', operation: 'advance', failure: stepped.failure })
+          return Result.succeed(stepped.success)
         }
-        advanced = advanceResult.success.state
+        let advanceResult = advanceDimension()
+        // Each pass leaves out at least one more wither, so the passes end within the number of withers.
+        while (Result.isSuccess(advanceResult)) {
+          const outside = advanceResult.success.state.withers
+            .filter((wither) => wither.dimension === dimension)
+            .flatMap((wither) => {
+              const refused = firstOutsideAddressableCells(witherPositions(wither))
+              return refused === undefined ? [] : [refused]
+            })
+          if (outside.length === 0) break
+          for (const refused of outside) {
+            refuse(refused, 'wither', 'kept')
+            refusedWitherIds.add(refused.id)
+          }
+          advanceResult = advanceDimension()
+        }
+        if (Result.isFailure(advanceResult)) return Result.fail(advanceResult.failure)
+        const steppedWithers = new Map(advanceResult.success.state.withers.map((wither) => [wither.id, wither]))
+        const hasEffects = advanceResult.success.explosions.length > 0
+          || (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined)
+        if (hasEffects && !revisionReserved) {
+          const reserved = revisionAfter(1)
+          if (Result.isFailure(reserved)) return failUnadvancedStep(reserved.failure)
+          revisionReserved = true
+        }
+        advanced = {
+          ...advanceResult.success.state,
+          // A refused wither was left out of the step, so it is the only one steppedWithers lacks.
+          withers: advanced.withers.map((wither) => steppedWithers.get(wither.id) ?? wither),
+          skulls: advanceResult.success.state.skulls.filter((skull) => {
+            if (skull.dimension !== dimension) return true
+            const outside = firstOutsideAddressableCells(witherSkullPositions(skull))
+            // Keeping a skull in flight would retry the same step every tick, so it leaves the next WitherSnapshot.
+            if (outside !== undefined) refuse(outside, 'wither-skull', 'removed')
+            return outside === undefined
+          }),
+        }
         if (advanceResult.success.meleeDamage > 0 && targetEntry !== undefined) {
           const playerVitals = vitals.get(targetEntry[0])
           if (playerVitals !== undefined) {
@@ -5728,8 +5863,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
         }
       }
       if (worldChanged || damagedPlayers.size > 0) {
-        const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        // revisionAfter(1) succeeded before the first melee or explosion, and nothing in this step advanced since.
+        Result.getOrThrow(advanceRevision())
         stateChanged = true
         const deathDeltas = applyPlayerDeaths([...deadPlayers], revision)
         if (worldChanged) worldSnapshotRequired = true
@@ -5741,8 +5876,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
       }
       const nextSnapshot = snapshotWitherRuntime(advanced)
     if (JSON.stringify(nextSnapshot) !== JSON.stringify(previousSnapshot)) {
-      const moved = writePositions([{ _tag: 'wither', state: advanced }])
-      if (Result.isFailure(moved)) return Result.fail(moved.failure)
+      // Every refused wither kept its stored, admitted state and every refused skull was removed above.
+      Result.getOrThrow(writePositions([{ _tag: 'wither', state: advanced }]))
       stateChanged = true
       broadcastWither(witherSnapshot())
     }
@@ -5750,47 +5885,56 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Mu
 
     if (dimension === 'end') {
       const [advancedDragon, dragonEvents] = advanceEnderDragonEncounter(enderDragonState, elapsedMs / 1_000)
-      if (JSON.stringify(advancedDragon) !== JSON.stringify(enderDragonState)) {
-        const nextEnderDragonRevision = revisionAfterSteps('ender-dragon', enderDragonRevision, 1)
-        if (Result.isFailure(nextEnderDragonRevision)) return Result.fail(nextEnderDragonRevision.failure)
-        enderDragonState = advancedDragon
-        enderDragonRevision = nextEnderDragonRevision.success
-        stateChanged = true
-        broadcastEnderDragon(enderDragonSnapshot())
-      }
-      for (const event of dragonEvents) {
-        if (event._tag !== 'PlayerDamaged') continue
-        const angle = advancedDragon.phaseTimerSecs * (advancedDragon.phase === 'charging' ? 1.4 : 0.35)
-        const radius = advancedDragon.phase === 'perching' ? 4 : advancedDragon.phase === 'charging' ? 8 : 20
-        const dragonAt = { x: Math.cos(angle) * radius, y: 72 + Math.sin(angle * 0.5) * 8, z: Math.sin(angle) * radius }
-        const damagedPlayers = [...players].flatMap(([player, presence]) => {
+      const dragonChanged = JSON.stringify(advancedDragon) !== JSON.stringify(enderDragonState)
+      const angle = advancedDragon.phaseTimerSecs * (advancedDragon.phase === 'charging' ? 1.4 : 0.35)
+      const radius = advancedDragon.phase === 'perching' ? 4 : advancedDragon.phase === 'charging' ? 8 : 20
+      const dragonAt = { x: Math.cos(angle) * radius, y: 72 + Math.sin(angle * 0.5) * 8, z: Math.sin(angle) * radius }
+      // The dragon's step and the damage it deals are planned first, then their revision advances are checked, so a
+      // step that cannot advance changes neither the dragon nor any player.
+      const plannedHealth = new Map<PlayerId, number>()
+      const damageSteps = dragonEvents.flatMap((event) => {
+        if (event._tag !== 'PlayerDamaged') return []
+        const damaged = [...players].flatMap(([player, presence]) => {
           if (presence.world !== worldId || Math.hypot(
             presence.at.x - dragonAt.x,
             presence.at.y - dragonAt.y,
             presence.at.z - dragonAt.z,
           ) > 6) return []
           const playerVitals = vitals.get(player)
-          if (playerVitals === undefined || playerVitals.health <= 0) return []
-          const wasAlive = playerVitals.health > 0
-          playerVitals.health = Math.max(0, playerVitals.health - event.amount)
-          return [{ player, died: wasAlive && playerVitals.health <= 0 }] as const
+          if (playerVitals === undefined) return []
+          const health = plannedHealth.get(player) ?? playerVitals.health
+          if (health <= 0) return []
+          const nextHealth = Math.max(0, health - event.amount)
+          plannedHealth.set(player, nextHealth)
+          return [{ player, playerVitals, health: nextHealth, died: nextHealth <= 0 }] as const
         })
-        if (damagedPlayers.length === 0) continue
-        const advancedRevision = advanceRevision()
-        if (Result.isFailure(advancedRevision)) return Result.fail(advancedRevision.failure)
+        return damaged.length === 0 ? [] : [damaged]
+      })
+      const nextEnderDragonRevision = revisionAfterSteps('ender-dragon', enderDragonRevision, dragonChanged ? 1 : 0)
+      if (Result.isFailure(nextEnderDragonRevision)) return failUnadvancedStep(nextEnderDragonRevision.failure)
+      const reserved = revisionAfter(damageSteps.length)
+      if (Result.isFailure(reserved)) return failUnadvancedStep(reserved.failure)
+      if (dragonChanged) {
+        enderDragonState = advancedDragon
+        enderDragonRevision = nextEnderDragonRevision.success
         stateChanged = true
-        postPersistenceDeltas.push(...applyPlayerDeaths(damagedPlayers.filter((entry) => entry.died).map((entry) => entry.player), revision))
-        for (const { player } of damagedPlayers) {
+        broadcastEnderDragon(enderDragonSnapshot())
+      }
+      for (const damaged of damageSteps) {
+        for (const { playerVitals, health } of damaged) playerVitals.health = health
+        // revisionAfter(damageSteps.length) succeeded above, and each damage step advances the revision once.
+        Result.getOrThrow(advanceRevision())
+        stateChanged = true
+        postPersistenceDeltas.push(...applyPlayerDeaths(damaged.filter((entry) => entry.died).map((entry) => entry.player), revision))
+        for (const { player } of damaged) {
           const presence = players.get(player)
           if (presence !== undefined) postPersistenceDeltas.push({ _tag: 'PlayerVitalsDelta', world: presence.world, revision, player, state: vitalsSnapshot(vitals.get(player) as MutableVitalsState) })
         }
       }
     }
 
-    if (stateChanged) notifyStateChanged()
-    for (const delta of postPersistenceDeltas) broadcast(delta)
-    if (worldSnapshotRequired) broadcast(snapshot())
-    return Result.succeed(undefined)
+    publish()
+    return Result.succeed({ refusals })
   }
 
   const spawnEntity = (entity: AuthoritativeEntityState): Result.Result<boolean, MultiplayerServerCoreFailure> => {

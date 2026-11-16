@@ -924,6 +924,8 @@ export const startMultiplayerServer = async (
         const result = core.tick(elapsedMs)
         if (Result.isFailure(result)) {
           console.error('Multiplayer tick failed', { worldId, failure: result.failure })
+        } else {
+          for (const refusal of result.success.refusals) console.error('Multiplayer tick refused a position', { worldId, refusal })
         }
       }
     })

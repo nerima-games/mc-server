@@ -108,6 +108,7 @@ const makeFixture = (
 ) => {
   const { metadata, ...serverOptions } = options
   const sent = new Map<string, Array<WireText>>()
+  const persisted: Array<MultiplayerServerState> = []
   let nowMs = 0
   const server = makeMultiplayerServerCore({
     worldId: 'world-1',
@@ -120,6 +121,7 @@ const makeFixture = (
     spawnAt,
     ...serverOptions,
     now: () => nowMs,
+    onStateChanged: (state) => { persisted.push(state) },
     initialState: {
       revision: 0,
       blocks: [],
@@ -151,7 +153,20 @@ const makeFixture = (
     server.receive(clientId, JSON.stringify(message) as WireText)
   const advanceTime = (elapsedMs: number): void => { nowMs += elapsedMs }
   const tick = (elapsedMs: number): void => { expect(Result.isSuccess(server.tick(elapsedMs))).toBe(true) }
-  return { server, sent, connect, receive, receiveSleep, receiveWither, receiveEnderDragon, advanceTime, tick }
+  return { server, sent, persisted, connect, receive, receiveSleep, receiveWither, receiveEnderDragon, advanceTime, tick }
+}
+
+/**
+ * The whole state the core holds in memory. A join persists all of it, so an observer joining reads it without a
+ * core getter; compare two fixtures that both had the observer join.
+ */
+const wholeStateAfterObserverJoins = (fixture: ReturnType<typeof makeFixture>): MultiplayerServerState => {
+  fixture.connect('socket-observer')
+  fixture.persisted.length = 0
+  expect(fixture.receive('socket-observer', join('observer')).accepted).toBe(true)
+  const [state, ...rest] = fixture.persisted
+  if (state === undefined || rest.length > 0) throw new Error('an observer join persists the state exactly once')
+  return state
 }
 
 describe('authoritative multiplayer server core', () => {
@@ -681,12 +696,20 @@ describe('authoritative multiplayer server core', () => {
   })
 
   it('rejects a Wither command without throwing once the Wither revision reaches the largest safe integer', () => {
-    const fixture = makeFixture(witherStructureAt, undefined, undefined, undefined, undefined, {
-      metadata: { witherRevision: Number.MAX_SAFE_INTEGER },
-    })
-    const frames = fixture.connect('socket-a')
-    fixture.receive('socket-a', join('alice'))
-    frames.length = 0
+    const makeJoinedFixture = () => {
+      const joined = makeFixture(witherStructureAt, undefined, undefined, undefined, undefined, {
+        metadata: { witherRevision: Number.MAX_SAFE_INTEGER },
+      })
+      const frames = joined.connect('socket-a')
+      joined.receive('socket-a', join('alice'))
+      frames.length = 0
+      joined.persisted.length = 0
+      return { ...joined, frames }
+    }
+    const untouched = makeJoinedFixture()
+    const fixture = makeJoinedFixture()
+    const { frames } = fixture
+    const before = fixture.server.snapshot()
 
     expect(fixture.receiveWither('socket-a', {
       _tag: 'WitherCommand',
@@ -703,6 +726,9 @@ describe('authoritative multiplayer server core', () => {
       _tag: 'WitherCommandResult', requestId: 'summon-at-limit', accepted: false, revision: Number.MAX_SAFE_INTEGER,
     })])
     expect(fixture.server.snapshot().revision).toBe(0)
+    expect(fixture.persisted).toEqual([])
+    expect(fixture.server.snapshot()).toEqual(before)
+    expect(wholeStateAfterObserverJoins(fixture)).toEqual(wholeStateAfterObserverJoins(untouched))
     fixture.receive('socket-a', { _tag: 'PlayerLeave', player: playerId('alice') })
     const rejoined = fixture.connect('socket-b')
     fixture.receive('socket-b', join('alice'))
