@@ -7,7 +7,7 @@ import { dirname } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { pathToFileURL } from 'node:url'
 
-import { AIR_BLOCK_ID } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, blockIdOf, BlockStateValuesSchema, encodeBlockState, isBlockType } from '@nerima-games/mc-kernel'
 import { CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
 import {
   CHUNK_HEIGHT,
@@ -33,7 +33,7 @@ import {
   isValidBrewingStandState,
   isValidStatusEffectState,
 } from '@nerima-games/mx-gameplay'
-import { Effect, Result, Schema } from 'effect'
+import { Effect, Option, Result, Schema } from 'effect'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import { isValidAnvilName } from '../multiplayer-shared/anvil-network.js'
@@ -222,30 +222,43 @@ const isOrientation = (value: unknown): value is Orientation => {
     && typeof orientation['pitchRadians'] === 'number' && Number.isFinite(orientation['pitchRadians'])
 }
 
-const decodeServerState = (value: unknown, worldId: string): MultiplayerServerState | undefined => {
-  if (!isRecord(value)) return undefined
+const decodeServerState = (value: unknown, worldId: string): Result.Result<MultiplayerServerState | undefined, MultiplayerServerCoreFailure> => {
+  if (!isRecord(value)) return Result.succeed(undefined)
   const state = value
   const revision = state['revision']
   const blocksValue = state['blocks']
-  if (!isNonNegativeSafeInteger(revision) || !Array.isArray(blocksValue)) return undefined
-  const blocks = blocksValue.flatMap((entry: unknown) => {
-    if (!isRecord(entry) || !isBlockPos(entry['at']) || (entry['block'] !== null && typeof entry['block'] !== 'string')) return []
-    return [{ at: entry['at'], block: entry['block'] }]
-  })
-  if (blocks.length !== blocksValue.length) return undefined
+  if (!isNonNegativeSafeInteger(revision) || !Array.isArray(blocksValue)) return Result.succeed(undefined)
+  const blocks: Array<MultiplayerServerState['blocks'][number]> = []
+  for (const entry of blocksValue) {
+    if (!isRecord(entry) || !isBlockPos(entry['at']) || (entry['block'] !== null && typeof entry['block'] !== 'string')) return Result.succeed(undefined)
+    const mutation = { at: entry['at'], block: entry['block'] }
+    if (!Object.hasOwn(entry, 'state')) {
+      blocks.push(mutation)
+      continue
+    }
+    const blockId = mutation.block === null
+      ? Option.some(AIR_BLOCK_ID)
+      : isBlockType(mutation.block) ? blockIdOf(mutation.block) : Option.none()
+    if (Option.isNone(blockId)) return Result.fail({ _tag: 'BlockOverrideNotInRegistry', at: mutation.at, block: String(mutation.block) })
+    const blockState = Schema.decodeUnknownResult(BlockStateValuesSchema)(entry['state'])
+    if (Result.isFailure(blockState)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: mutation.at, failure: blockState.failure })
+    const encoded = encodeBlockState(blockId.value, blockState.success)
+    if (Result.isFailure(encoded)) return Result.fail({ _tag: 'SavedBlockStateFailure', at: mutation.at, failure: encoded.failure })
+    blocks.push({ ...mutation, state: blockState.success })
+  }
 
   const poweredRailsValue = state['poweredRails']
-  if (poweredRailsValue !== undefined && !Array.isArray(poweredRailsValue)) return undefined
+  if (poweredRailsValue !== undefined && !Array.isArray(poweredRailsValue)) return Result.succeed(undefined)
   const poweredRails = poweredRailsValue === undefined
     ? []
     : poweredRailsValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isBlockPos(entry['at']) || typeof entry['powered'] !== 'boolean') return []
         return [{ at: entry['at'], powered: entry['powered'] }]
       })
-  if (poweredRailsValue !== undefined && poweredRails.length !== poweredRailsValue.length) return undefined
+  if (poweredRailsValue !== undefined && poweredRails.length !== poweredRailsValue.length) return Result.succeed(undefined)
 
   const playerPositionsValue = state['playerPositions']
-  if (playerPositionsValue !== undefined && !Array.isArray(playerPositionsValue)) return undefined
+  if (playerPositionsValue !== undefined && !Array.isArray(playerPositionsValue)) return Result.succeed(undefined)
   const playerPositions = playerPositionsValue === undefined
     ? []
     : playerPositionsValue.flatMap((entry: unknown) => {
@@ -253,10 +266,10 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
         const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
         return Result.isFailure(player) ? [] : [{ player: player.success, at: entry['at'], facing: entry['facing'] }]
       })
-  if (playerPositionsValue !== undefined && playerPositions.length !== playerPositionsValue.length) return undefined
+  if (playerPositionsValue !== undefined && playerPositions.length !== playerPositionsValue.length) return Result.succeed(undefined)
 
   const eyeOfEnderRecoveriesValue = state['eyeOfEnderRecoveries']
-  if (eyeOfEnderRecoveriesValue !== undefined && !Array.isArray(eyeOfEnderRecoveriesValue)) return undefined
+  if (eyeOfEnderRecoveriesValue !== undefined && !Array.isArray(eyeOfEnderRecoveriesValue)) return Result.succeed(undefined)
   const eyeOfEnderRecoveries = eyeOfEnderRecoveriesValue === undefined
     ? []
     : eyeOfEnderRecoveriesValue.flatMap((entry: unknown) => {
@@ -267,13 +280,13 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
           ? []
           : [{ entityId: entityId.success, at: entry['at'], remainingSecs: entry['remainingSecs'] }]
       })
-  if (eyeOfEnderRecoveriesValue !== undefined && eyeOfEnderRecoveries.length !== eyeOfEnderRecoveriesValue.length) return undefined
+  if (eyeOfEnderRecoveriesValue !== undefined && eyeOfEnderRecoveries.length !== eyeOfEnderRecoveriesValue.length) return Result.succeed(undefined)
 
   const weatherClock = state['weatherClock']
-  if (weatherClock !== undefined && !isWeatherClockState(weatherClock)) return undefined
+  if (weatherClock !== undefined && !isWeatherClockState(weatherClock)) return Result.succeed(undefined)
 
   const witherValue = state['wither']
-  if (witherValue !== undefined && !isValidWitherRuntimeSnapshot(witherValue)) return undefined
+  if (witherValue !== undefined && !isValidWitherRuntimeSnapshot(witherValue)) return Result.succeed(undefined)
   const wither = witherValue
 
   const witherRevisionValue = state['witherRevision']
@@ -282,21 +295,21 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     : isNonNegativeSafeInteger(witherRevisionValue)
       ? witherRevisionValue
       : null
-  if (witherRevision === null) return undefined
+  if (witherRevision === null) return Result.succeed(undefined)
 
   const leversValue = state['levers']
-  if (leversValue !== undefined && !Array.isArray(leversValue)) return undefined
+  if (leversValue !== undefined && !Array.isArray(leversValue)) return Result.succeed(undefined)
   const levers = leversValue === undefined
     ? []
     : leversValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isBlockPos(entry['at']) || typeof entry['active'] !== 'boolean') return []
         return [{ at: entry['at'], active: entry['active'] }]
       })
-  if (leversValue !== undefined && levers.length !== leversValue.length) return undefined
+  if (leversValue !== undefined && levers.length !== leversValue.length) return Result.succeed(undefined)
 
   const enderDragonValue = state['enderDragon']
   const enderDragon = enderDragonValue === undefined ? undefined : decodeEnderDragonEncounterSnapshot(enderDragonValue)
-  if (enderDragonValue !== undefined && enderDragon === undefined) return undefined
+  if (enderDragonValue !== undefined && enderDragon === undefined) return Result.succeed(undefined)
 
   const enderDragonRevisionValue = state['enderDragonRevision']
   const enderDragonRevision = enderDragonRevisionValue === undefined
@@ -304,20 +317,20 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     : isNonNegativeSafeInteger(enderDragonRevisionValue)
       ? enderDragonRevisionValue
       : null
-  if (enderDragonRevision === null) return undefined
+  if (enderDragonRevision === null) return Result.succeed(undefined)
 
   const brewingStandsValue = state['brewingStands']
-  if (brewingStandsValue !== undefined && !Array.isArray(brewingStandsValue)) return undefined
+  if (brewingStandsValue !== undefined && !Array.isArray(brewingStandsValue)) return Result.succeed(undefined)
   const brewingStands = brewingStandsValue === undefined
     ? []
     : brewingStandsValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isBlockPos(entry['at']) || !isValidBrewingStandState(entry['state'])) return []
         return [{ at: entry['at'], state: entry['state'] }]
       })
-  if (brewingStandsValue !== undefined && brewingStands.length !== brewingStandsValue.length) return undefined
+  if (brewingStandsValue !== undefined && brewingStands.length !== brewingStandsValue.length) return Result.succeed(undefined)
 
   const statusEffectsValue = state['statusEffects']
-  if (statusEffectsValue !== undefined && !Array.isArray(statusEffectsValue)) return undefined
+  if (statusEffectsValue !== undefined && !Array.isArray(statusEffectsValue)) return Result.succeed(undefined)
   const statusEffects = statusEffectsValue === undefined
     ? []
     : statusEffectsValue.flatMap((entry: unknown) => {
@@ -325,10 +338,10 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
         const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
         return Result.isFailure(player) ? [] : [{ player: player.success, state: entry['state'] }]
       })
-  if (statusEffectsValue !== undefined && statusEffects.length !== statusEffectsValue.length) return undefined
+  if (statusEffectsValue !== undefined && statusEffects.length !== statusEffectsValue.length) return Result.succeed(undefined)
 
   const anvilNamesValue = state['anvilNames']
-  if (anvilNamesValue !== undefined && !Array.isArray(anvilNamesValue)) return undefined
+  if (anvilNamesValue !== undefined && !Array.isArray(anvilNamesValue)) return Result.succeed(undefined)
   const anvilNames = anvilNamesValue === undefined
     ? []
     : anvilNamesValue.flatMap((entry: unknown) => {
@@ -342,10 +355,10 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
         if (names.length !== entry['names'].length) return []
         return [{ player: player.success, names }]
       })
-  if (anvilNamesValue !== undefined && anvilNames.length !== anvilNamesValue.length) return undefined
+  if (anvilNamesValue !== undefined && anvilNames.length !== anvilNamesValue.length) return Result.succeed(undefined)
 
   const enchantmentsValue = state['enchantments']
-  if (enchantmentsValue !== undefined && !Array.isArray(enchantmentsValue)) return undefined
+  if (enchantmentsValue !== undefined && !Array.isArray(enchantmentsValue)) return Result.succeed(undefined)
   const enchantments = enchantmentsValue === undefined
     ? []
     : enchantmentsValue.flatMap((entry: unknown) => {
@@ -360,7 +373,7 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
         if (items.length !== entry['items'].length) return []
         return [{ player: player.success, seed: entry['seed'], items }]
       })
-  if (enchantmentsValue !== undefined && enchantments.length !== enchantmentsValue.length) return undefined
+  if (enchantmentsValue !== undefined && enchantments.length !== enchantmentsValue.length) return Result.succeed(undefined)
 
   const decoded = Schema.decodeUnknownResult(AuthoritativeSnapshot)({
     _tag: 'AuthoritativeSnapshot',
@@ -384,9 +397,9 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     villagerTrades: state['villagerTrades'] ?? [],
     entities: state['entities'] ?? [],
   })
-  if (Result.isFailure(decoded)) return undefined
+  if (Result.isFailure(decoded)) return Result.succeed(undefined)
   const snapshot = decoded.success
-  return {
+  return Result.succeed({
     revision: snapshot.revision,
     blocks,
     poweredRails,
@@ -409,7 +422,7 @@ const decodeServerState = (value: unknown, worldId: string): MultiplayerServerSt
     statusEffects,
     anvilNames,
     enchantments,
-  }
+  })
 }
 
 export const loadServerState = async (
@@ -435,7 +448,9 @@ export const loadServerState = async (
   if (persisted['format'] !== 1 || persisted['worldId'] !== worldId || persisted['seed'] !== seed) {
     throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
   }
-  const state = decodeServerState(persisted['state'], worldId)
+  const decodedState = decodeServerState(persisted['state'], worldId)
+  if (Result.isFailure(decodedState)) return Result.fail(decodedState.failure)
+  const state = decodedState.success
   if (state === undefined) {
     throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
   }
@@ -624,6 +639,11 @@ export const startMultiplayerServer = async (
     destinationAt: BlockPos,
     command: Readonly<{ commandId: CommandId; world: WorldId }>,
   ): void => {
+    const preparedBlockSnapshot = destination.prepareRealmTransfer()
+    if (Result.isFailure(preparedBlockSnapshot)) {
+      console.error('Multiplayer realm transfer failed', { clientId, failure: preparedBlockSnapshot.failure })
+      return
+    }
     const detached = source.detachPlayer(clientId)
     if (Result.isFailure(detached)) {
       console.error('Multiplayer realm transfer failed', { clientId, failure: detached.failure })
@@ -636,7 +656,7 @@ export const startMultiplayerServer = async (
       fromWorld: command.world,
       at: destinationAt,
       facing: transfer.facing,
-    })) return
+    }, preparedBlockSnapshot.success)) return
     activeRealms.set(clientId, destination)
   }
   const overworldCoreResult = makeMultiplayerServerCore({
@@ -934,6 +954,8 @@ export const startMultiplayerServer = async (
           for (const refusal of result.success.refusals) console.error('Multiplayer tick refused a position', { worldId, refusal })
         }
       }
+    }).catch((failure: unknown) => {
+      console.error('Multiplayer server tick failed', { failure })
     })
   }, 50)
   let closing: Promise<void> | undefined

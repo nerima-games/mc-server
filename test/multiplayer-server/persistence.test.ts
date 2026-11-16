@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -148,6 +148,27 @@ describe('multiplayer state file round trip', () => {
       seed: 73,
       items: [{ slot: 0, item: { item: 'stone', durability: null, enchantments: [] } }],
     }],
+  })
+
+  it.each([
+    { label: 'null state', block: 'oak_log', state: null, tag: 'SavedBlockStateFailure' },
+    { label: 'invalid axis', block: 'oak_log', state: { axis: 'diagonal' }, tag: 'SavedBlockStateFailure' },
+    { label: 'unsupported property', block: 'stone', state: { age: 1 }, tag: 'SavedBlockStateFailure' },
+    { label: 'unknown block with state', block: 'unregistered-test-block', state: { axis: 'x' }, tag: 'BlockOverrideNotInRegistry' },
+  ])('returns a typed failure for persisted $label', async ({ block, state, tag }) => {
+    const stateFile = join(await mkdtemp(join(tmpdir(), 'server-invalid-block-state-')), 'state.json')
+    await writeFile(stateFile, JSON.stringify({
+      format: 1, worldId, seed,
+      state: {
+        ...fullyPopulatedState(),
+        blocks: [{ at: { x: 1, y: 64, z: 1 }, block, state }],
+      },
+    }), 'utf8')
+
+    const loaded = await loadServerState(stateFile, worldId, seed)
+
+    expect(Result.isFailure(loaded)).toBe(true)
+    if (Result.isFailure(loaded)) expect(loaded.failure).toMatchObject({ _tag: tag })
   })
 
   it('reads back every category the writer persists, including levers, the ender dragon encounter, brewing stands, status effects, anvil names, and enchantments', async () => {

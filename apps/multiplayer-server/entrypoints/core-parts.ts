@@ -14,7 +14,7 @@ import {
 import { Effect, Result } from 'effect'
 
 import type { MultiplayerServerCoreParts } from '../core.js'
-import { makeServerWorldWrite } from '../world-write-port.js'
+import { commitBlockBatch, makeServerWorldWrite } from '../world-write-port.js'
 
 // Bounds resident terrain. Evicted chunks regenerate through the source and its saved block overrides.
 const CHUNK_STORE_CAPACITY = Result.getOrThrow(ChunkCapacity.result(256))
@@ -75,6 +75,12 @@ const openWindowOver = (chunks: ReadonlyArray<ReadonlyChunkWithBlockStates>): Ch
  */
 export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => ({
   makeWorldWrite: (options) => Effect.runSync(Effect.result(makeServerWorldWrite(options))),
+  generateChunk: (source, coord) => Effect.runSync(Effect.result(source(coord))),
+  worldWriteRevisions: (write, dimension) => Effect.runSync(Effect.gen(function* () {
+    return { world: yield* write.coordinator.revision, dimension: yield* write.coordinator.dimensionRevision(dimension) }
+  })),
+  dieInvalidBlockBatch: (failure) => Effect.runSync(Effect.die(new Error('c7-adapter: unexpected WorldWriteInvalidBatch', { cause: failure }))),
+  commitWorldWrite: (write, dimension, batch) => Effect.runSync(Effect.result(commitBlockBatch(write.coordinator, dimension, batch))),
   survivalHunger: {
     create: (vitals, difficulty) => Effect.runSync(Effect.gen(function* () {
       // The in-memory vitals normalise spawn saturation against the given hunger.
@@ -96,8 +102,11 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
     return {
       store,
       peek: (coord) => Effect.runSync(store.peek(coord)),
-      load: (coord) => Effect.runSync(Effect.result(store.load(coord))),
-      unload: (coord) => Effect.runSync(Effect.result(store.unload(coord))),
+      // Successful deltas are recorded before another load. Regeneration can replay those edits,
+      // so the host may explicitly evict the dirty LRU selected by mc-worldgen without losing them.
+      load: (coord) => Effect.runSync(Effect.result(store.load(coord).pipe(
+        Effect.catchTag('DirtyChunkEvictionError', (failure) => Effect.andThen(store.unload(failure.coord), store.load(coord))),
+      ))),
       openWindow: openWindowOver,
     }
   },

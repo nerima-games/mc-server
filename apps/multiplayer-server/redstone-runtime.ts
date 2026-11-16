@@ -192,8 +192,8 @@ export const makeMultiplayerRedstoneRuntime = async (
   // DEFAULT_TICK_DURATION is a finite positive duration, so it is a valid delta time.
   const gameTickSecs = Result.getOrThrow(DeltaTimeSecs.result(Number(DEFAULT_TICK_DURATION)))
   let tickRemainderMs = 0
-  // mc-sim's HopperService owns hopper cooldowns, but it commits through WorldCommitCoordinator and
-  // ContainerStorageService, which this server does not run. Until those are wired, the host keeps the
+  // mc-sim's HopperService owns hopper cooldowns, but it also needs ContainerStorageService,
+  // which is not wired into this server yet. Until it is wired, the host keeps the
   // remaining cooldown per hopper and follows HopperService's planTransferTick rules: elapsed ticks
   // drain it, a powered hopper is locked, a transfer restarts it, and a rejected transfer clears it.
   const hopperCooldowns = new Map<string, number>()
@@ -263,13 +263,25 @@ export const makeMultiplayerRedstoneRuntime = async (
             lampBlocks,
             event.lit ? 'redstone_lamp_lit' : 'redstone_lamp',
           )
-          if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          if (result !== undefined && Result.isFailure(result)) {
+            if (result.failure._tag === 'WorldWriteFailure') {
+              console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.position, failure: result.failure })
+              continue
+            }
+            return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+          }
         }
         for (const event of Effect.runSync(runtime.drainPoweredComponentTransitions)) {
           const core = realmsByDimension.get(event.dimension)?.core
           if (event.kind === 'door') {
             const result = core?.applyRedstoneBlockState(event.position, doorBlocks, event.powered ? 'door_open' : 'door')
-            if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+            if (result !== undefined && Result.isFailure(result)) {
+              if (result.failure._tag === 'WorldWriteFailure') {
+                console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.position, failure: result.failure })
+                continue
+              }
+              return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+            }
           } else if (event.kind === 'powered-rail') {
             const result = core?.applyPoweredRailState(event.position, event.powered)
             if (result !== undefined && Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
@@ -303,7 +315,13 @@ export const makeMultiplayerRedstoneRuntime = async (
           }
           if (outcome.kind === 'move') {
             const result = realm.core.applyPistonPlan(outcome.plan)
-            if (Result.isFailure(result)) return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+            if (Result.isFailure(result)) {
+              if (result.failure._tag === 'WorldWriteFailure') {
+                console.error('Multiplayer redstone block write failed', { dimension: event.dimension, position: event.piston, failure: result.failure })
+                continue
+              }
+              return Result.fail({ _tag: 'CoreBlockReadFailure', failure: result.failure })
+            }
           }
         }
         return Result.succeed(undefined)
