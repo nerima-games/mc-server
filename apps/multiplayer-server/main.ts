@@ -17,6 +17,8 @@ import {
 } from '@nerima-games/mc-worldgen'
 import {
   AuthoritativeSnapshot,
+  brewingStateFromWire,
+  brewingStateToWire,
   ContainerKind,
   EntityId as EntityIdSchema,
   PlayerId as PlayerIdSchema,
@@ -31,7 +33,6 @@ import {
 import {
   decodeEnchantedItem,
   decodeEnderDragonEncounterSnapshot,
-  isValidBrewingStandState,
   isValidStatusEffectState,
 } from '@nerima-games/mx-gameplay'
 import { Effect, Option, Result, Schema } from 'effect'
@@ -54,6 +55,7 @@ import {
 } from './core.js'
 import { makeMultiplayerServerCoreParts } from './entrypoints/core-parts.js'
 import { loadLegacyPlayerClaims } from './legacy-player-claims.js'
+import { migrateLegacyBrewingState, migrateLegacyFurnaces, savedServerStateFailure, type SavedServerStateFailure } from './legacy-state.js'
 import { createReconnectAuth } from './reconnect-auth.js'
 import { makeMultiplayerRedstoneRuntime } from './redstone-runtime.js'
 import { isAllowedWebSocketOrigin, resolveTransportSecurity } from './transport-security.js'
@@ -196,7 +198,7 @@ export const resolveMultiplayerRuntimeOptions = (
 }
 
 interface PersistedServerState {
-  readonly format: 2
+  readonly format: 3
   readonly worldId: string
   readonly seed: number
   readonly state: unknown
@@ -205,8 +207,8 @@ interface PersistedServerState {
 type SavedItemStackFailure = Extract<MultiplayerServerCoreFailure, { _tag: 'SavedItemStackFailure' }>
 
 type SavedContainerIdFailure = Extract<MultiplayerServerCoreFailure, { _tag: 'SavedContainerIdInvalid' }>
-type ServerStateWriteFailure = SavedItemStackFailure | SavedContainerIdFailure
-const migratedContainerId = (value: unknown, worldId: string, format: 1 | 2): Result.Result<string, ServerStateWriteFailure> => {
+type ServerStateWriteFailure = SavedItemStackFailure | SavedContainerIdFailure | SavedServerStateFailure
+const migratedContainerId = (value: unknown, worldId: string, format: 1 | 2 | 3): Result.Result<string, ServerStateWriteFailure> => {
   const parsed = Schema.decodeUnknownResult(Schema.String)(value)
   if (Result.isFailure(parsed)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: parsed.failure })
   const id = parsed.success
@@ -221,7 +223,7 @@ const migratedContainerId = (value: unknown, worldId: string, format: 1 | 2): Re
     return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
   }
   const canonical = `${dimension}:${String(position.success.x)},${String(position.success.y)},${String(position.success.z)}`
-  if (format === 2 && id !== canonical) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
+  if (format !== 1 && id !== canonical) return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: id })
   return Result.succeed(canonical)
 }
 
@@ -241,7 +243,7 @@ const itemPaths: ReadonlyArray<ReadonlyArray<string>> = [
 ]
 const transformSavedItems = (
   value: unknown,
-  format: 1 | 2,
+  format: 1 | 2 | 3,
   direction: 'read' | 'write',
 ): Result.Result<SavedItemTransform, SavedItemStackFailure> => {
   const containerItems = new Map<string, ContainerStoredStack>()
@@ -315,7 +317,13 @@ const transformSavedItems = (
     return Result.map(transformed, (entry) => ({ ...value, [selector]: entry }))
   }
   let state = value
-  for (const path of itemPaths) {
+  const paths = format === 3 ? [
+    ...itemPaths,
+    ['brewingStands', '*', 'state', 'bottles', '*'],
+    ['brewingStands', '*', 'state', 'ingredient'],
+    ['brewingStands', '*', 'state', 'fuel'],
+  ] : itemPaths
+  for (const path of paths) {
     const transformed = visit(state, path, '')
     if (Result.isFailure(transformed)) return Result.fail(transformed.failure)
     state = transformed.success
@@ -361,17 +369,17 @@ const isOrientation = (value: unknown): value is Orientation => {
     && typeof orientation['pitchRadians'] === 'number' && Number.isFinite(orientation['pitchRadians'])
 }
 
-const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Result.Result<MultiplayerServerState | undefined, MultiplayerServerCoreFailure> => {
+const decodeServerState = (value: unknown, worldId: string, format: 1 | 2 | 3): Result.Result<MultiplayerServerState, MultiplayerServerCoreFailure> => {
   const items = transformSavedItems(value, format, 'read')
   if (Result.isFailure(items)) return Result.fail(items.failure)
-  if (!isRecord(items.success.state)) return Result.succeed(undefined)
+  if (!isRecord(items.success.state)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const state = items.success.state
   const revision = state['revision']
   const blocksValue = state['blocks']
-  if (!isNonNegativeSafeInteger(revision) || !Array.isArray(blocksValue)) return Result.succeed(undefined)
+  if (!isNonNegativeSafeInteger(revision) || !Array.isArray(blocksValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const blocks: Array<MultiplayerServerState['blocks'][number]> = []
   for (const entry of blocksValue) {
-    if (!isRecord(entry) || !isBlockPos(entry['at']) || (entry['block'] !== null && typeof entry['block'] !== 'string')) return Result.succeed(undefined)
+    if (!isRecord(entry) || !isBlockPos(entry['at']) || (entry['block'] !== null && typeof entry['block'] !== 'string')) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
     const mutation = { at: entry['at'], block: entry['block'] }
     if (!Object.hasOwn(entry, 'state')) {
       blocks.push(mutation)
@@ -389,17 +397,17 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
   }
 
   const poweredRailsValue = state['poweredRails']
-  if (poweredRailsValue !== undefined && !Array.isArray(poweredRailsValue)) return Result.succeed(undefined)
+  if (poweredRailsValue !== undefined && !Array.isArray(poweredRailsValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const poweredRails = poweredRailsValue === undefined
     ? []
     : poweredRailsValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isBlockPos(entry['at']) || typeof entry['powered'] !== 'boolean') return []
         return [{ at: entry['at'], powered: entry['powered'] }]
       })
-  if (poweredRailsValue !== undefined && poweredRails.length !== poweredRailsValue.length) return Result.succeed(undefined)
+  if (poweredRailsValue !== undefined && poweredRails.length !== poweredRailsValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const playerPositionsValue = state['playerPositions']
-  if (playerPositionsValue !== undefined && !Array.isArray(playerPositionsValue)) return Result.succeed(undefined)
+  if (playerPositionsValue !== undefined && !Array.isArray(playerPositionsValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const playerPositions = playerPositionsValue === undefined
     ? []
     : playerPositionsValue.flatMap((entry: unknown) => {
@@ -407,10 +415,10 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
         const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
         return Result.isFailure(player) ? [] : [{ player: player.success, at: entry['at'], facing: entry['facing'] }]
       })
-  if (playerPositionsValue !== undefined && playerPositions.length !== playerPositionsValue.length) return Result.succeed(undefined)
+  if (playerPositionsValue !== undefined && playerPositions.length !== playerPositionsValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const eyeOfEnderRecoveriesValue = state['eyeOfEnderRecoveries']
-  if (eyeOfEnderRecoveriesValue !== undefined && !Array.isArray(eyeOfEnderRecoveriesValue)) return Result.succeed(undefined)
+  if (eyeOfEnderRecoveriesValue !== undefined && !Array.isArray(eyeOfEnderRecoveriesValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const eyeOfEnderRecoveries = eyeOfEnderRecoveriesValue === undefined
     ? []
     : eyeOfEnderRecoveriesValue.flatMap((entry: unknown) => {
@@ -421,13 +429,13 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
           ? []
           : [{ entityId: entityId.success, at: entry['at'], remainingSecs: entry['remainingSecs'] }]
       })
-  if (eyeOfEnderRecoveriesValue !== undefined && eyeOfEnderRecoveries.length !== eyeOfEnderRecoveriesValue.length) return Result.succeed(undefined)
+  if (eyeOfEnderRecoveriesValue !== undefined && eyeOfEnderRecoveries.length !== eyeOfEnderRecoveriesValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const weatherClock = state['weatherClock']
-  if (weatherClock !== undefined && !isWeatherClockState(weatherClock)) return Result.succeed(undefined)
+  if (weatherClock !== undefined && !isWeatherClockState(weatherClock)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const witherValue = state['wither']
-  if (witherValue !== undefined && !isValidWitherRuntimeSnapshot(witherValue)) return Result.succeed(undefined)
+  if (witherValue !== undefined && !isValidWitherRuntimeSnapshot(witherValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const wither = witherValue
 
   const witherRevisionValue = state['witherRevision']
@@ -436,21 +444,21 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
     : isNonNegativeSafeInteger(witherRevisionValue)
       ? witherRevisionValue
       : null
-  if (witherRevision === null) return Result.succeed(undefined)
+  if (witherRevision === null) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const leversValue = state['levers']
-  if (leversValue !== undefined && !Array.isArray(leversValue)) return Result.succeed(undefined)
+  if (leversValue !== undefined && !Array.isArray(leversValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const levers = leversValue === undefined
     ? []
     : leversValue.flatMap((entry: unknown) => {
         if (!isRecord(entry) || !isBlockPos(entry['at']) || typeof entry['active'] !== 'boolean') return []
         return [{ at: entry['at'], active: entry['active'] }]
       })
-  if (leversValue !== undefined && levers.length !== leversValue.length) return Result.succeed(undefined)
+  if (leversValue !== undefined && levers.length !== leversValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const enderDragonValue = state['enderDragon']
   const enderDragon = enderDragonValue === undefined ? undefined : decodeEnderDragonEncounterSnapshot(enderDragonValue)
-  if (enderDragonValue !== undefined && enderDragon === undefined) return Result.succeed(undefined)
+  if (enderDragonValue !== undefined && enderDragon === undefined) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const enderDragonRevisionValue = state['enderDragonRevision']
   const enderDragonRevision = enderDragonRevisionValue === undefined
@@ -458,20 +466,24 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
     : isNonNegativeSafeInteger(enderDragonRevisionValue)
       ? enderDragonRevisionValue
       : null
-  if (enderDragonRevision === null) return Result.succeed(undefined)
+  if (enderDragonRevision === null) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const brewingStandsValue = state['brewingStands']
-  if (brewingStandsValue !== undefined && !Array.isArray(brewingStandsValue)) return Result.succeed(undefined)
-  const brewingStands = brewingStandsValue === undefined
-    ? []
-    : brewingStandsValue.flatMap((entry: unknown) => {
-        if (!isRecord(entry) || !isBlockPos(entry['at']) || !isValidBrewingStandState(entry['state'])) return []
-        return [{ at: entry['at'], state: entry['state'] }]
-      })
-  if (brewingStandsValue !== undefined && brewingStands.length !== brewingStandsValue.length) return Result.succeed(undefined)
+  if (brewingStandsValue !== undefined && !Array.isArray(brewingStandsValue)) {
+    return Result.fail(savedServerStateFailure('brewingStands', 'invalid brewing stand list'))
+  }
+  const brewingStands: Array<NonNullable<MultiplayerServerState['brewingStands']>[number]> = []
+  for (const entry of brewingStandsValue === undefined ? [] : brewingStandsValue) {
+    if (!isRecord(entry) || !isBlockPos(entry['at'])) return Result.fail(savedServerStateFailure('brewingStands', 'invalid brewing stand position'))
+    const brewing = format === 3
+      ? Result.mapError(brewingStateFromWire(entry['state']), (failure) => savedServerStateFailure('brewingStands', failure.reason))
+      : migrateLegacyBrewingState(entry['state'])
+    if (Result.isFailure(brewing)) return Result.fail(brewing.failure)
+    brewingStands.push({ at: entry['at'], state: brewing.success })
+  }
 
   const statusEffectsValue = state['statusEffects']
-  if (statusEffectsValue !== undefined && !Array.isArray(statusEffectsValue)) return Result.succeed(undefined)
+  if (statusEffectsValue !== undefined && !Array.isArray(statusEffectsValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const statusEffects = statusEffectsValue === undefined
     ? []
     : statusEffectsValue.flatMap((entry: unknown) => {
@@ -479,10 +491,10 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
         const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
         return Result.isFailure(player) ? [] : [{ player: player.success, state: entry['state'] }]
       })
-  if (statusEffectsValue !== undefined && statusEffects.length !== statusEffectsValue.length) return Result.succeed(undefined)
+  if (statusEffectsValue !== undefined && statusEffects.length !== statusEffectsValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const anvilNamesValue = state['anvilNames']
-  if (anvilNamesValue !== undefined && !Array.isArray(anvilNamesValue)) return Result.succeed(undefined)
+  if (anvilNamesValue !== undefined && !Array.isArray(anvilNamesValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const anvilNames = anvilNamesValue === undefined
     ? []
     : anvilNamesValue.flatMap((entry: unknown) => {
@@ -496,10 +508,10 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
         if (names.length !== entry['names'].length) return []
         return [{ player: player.success, names }]
       })
-  if (anvilNamesValue !== undefined && anvilNames.length !== anvilNamesValue.length) return Result.succeed(undefined)
+  if (anvilNamesValue !== undefined && anvilNames.length !== anvilNamesValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const enchantmentsValue = state['enchantments']
-  if (enchantmentsValue !== undefined && !Array.isArray(enchantmentsValue)) return Result.succeed(undefined)
+  if (enchantmentsValue !== undefined && !Array.isArray(enchantmentsValue)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const enchantments = enchantmentsValue === undefined
     ? []
     : enchantmentsValue.flatMap((entry: unknown) => {
@@ -514,7 +526,7 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
         if (items.length !== entry['items'].length) return []
         return [{ player: player.success, seed: entry['seed'], items }]
       })
-  if (enchantmentsValue !== undefined && enchantments.length !== enchantmentsValue.length) return Result.succeed(undefined)
+  if (enchantmentsValue !== undefined && enchantments.length !== enchantmentsValue.length) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
 
   const savedContainers = state['containers'] === undefined ? [] : state['containers']
   const migratedContainers = Array.isArray(savedContainers)
@@ -556,13 +568,16 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
   })
   if (Result.isFailure(stored)) return Result.fail({ _tag: 'SavedItemStackFailure', path: 'containers', failure: stored.failure })
   const containers = stored.success.containers.map(({ id, kind, slots }) => ({ containerId: id, kind, slots }))
+  const furnaces = format === 3 ? Result.succeed(state['furnaces'] === undefined ? [] : state['furnaces'])
+    : migrateLegacyFurnaces(state['furnaces'] === undefined ? [] : state['furnaces'])
+  if (Result.isFailure(furnaces)) return Result.fail(furnaces.failure)
   const decoded = Schema.decodeUnknownResult(AuthoritativeSnapshot)({
     _tag: 'AuthoritativeSnapshot',
     world: worldId,
     revision,
-    inventories: state['inventories'] ?? [],
-    vitals: state['vitals'] ?? [],
-    timeWeather: state['timeWeather'] ?? { timeOfDay: 6_000, weather: 'clear' },
+    inventories: state['inventories'] === undefined ? [] : state['inventories'],
+    vitals: state['vitals'] === undefined ? [] : state['vitals'],
+    timeWeather: state['timeWeather'] === undefined ? { timeOfDay: 6_000, weather: 'clear' } : state['timeWeather'],
     containers: containers.map((container) => ({
       ...container,
       slots: container.slots.map((stack) => stack === null ? null : ({
@@ -570,11 +585,11 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2): Resu
         ...(stack.durability === null ? {} : { durability: stack.durability }),
       })),
     })),
-    furnaces: state['furnaces'] ?? [],
-    villagerTrades: state['villagerTrades'] ?? [],
-    entities: state['entities'] ?? [],
+    furnaces: furnaces.success,
+    villagerTrades: state['villagerTrades'] === undefined ? [] : state['villagerTrades'],
+    entities: state['entities'] === undefined ? [] : state['entities'],
   })
-  if (Result.isFailure(decoded)) return Result.succeed(undefined)
+  if (Result.isFailure(decoded)) return Result.fail(savedServerStateFailure('state', 'invalid saved server state'))
   const snapshot = decoded.success
   return Result.succeed({
     revision: snapshot.revision,
@@ -611,29 +626,24 @@ export const loadServerState = async (
   try {
     source = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Result.succeed(undefined)
-    throw new Error(`Failed to read multiplayer state: ${path}`, { cause: error })
+    if (isRecord(error) && error['code'] === 'ENOENT') return Result.succeed(undefined)
+    return Result.fail(savedServerStateFailure('file', 'failed to read multiplayer state'))
   }
   let value: unknown
   try {
     value = JSON.parse(source)
-  } catch (error) {
-    throw new Error(`Failed to read multiplayer state: ${path}`, { cause: error })
+  } catch {
+    return Result.fail(savedServerStateFailure('file', 'invalid multiplayer state JSON'))
   }
-  if (!isRecord(value)) throw new Error(`invalid multiplayer state file: ${path}`)
-  const persisted = value
-  const format = persisted['format']
-  if ((format !== 1 && format !== 2) || persisted['worldId'] !== worldId || persisted['seed'] !== seed) {
-    throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
+  if (!isRecord(value)) return Result.fail(savedServerStateFailure('file', 'invalid multiplayer state envelope'))
+  const format = value['format']
+  if ((format !== 1 && format !== 2 && format !== 3) || value['worldId'] !== worldId || value['seed'] !== seed) {
+    return Result.fail(savedServerStateFailure('file', 'multiplayer state file does not match world and seed or supported format'))
   }
-  const decodedState = decodeServerState(persisted['state'], worldId, format)
+  const decodedState = decodeServerState(value['state'], worldId, format)
   if (Result.isFailure(decodedState)) return Result.fail(decodedState.failure)
-  const state = decodedState.success
-  if (state === undefined) {
-    throw new Error(`multiplayer state file does not match world ${worldId} and seed ${String(seed)}: ${path}`)
-  }
   // An unaddressable position or a mob state mx-gameplay cannot repair would otherwise stop every tick of this dimension.
-  return Result.map(validateLoadedServerState(state), () => state)
+  return Result.map(validateLoadedServerState(decodedState.success), () => decodedState.success)
 }
 
 export const writeServerState = async (
@@ -642,13 +652,19 @@ export const writeServerState = async (
   seed: number,
   state: MultiplayerServerState,
 ): Promise<Result.Result<void, ServerStateWriteFailure>> => {
-  const encoded = transformSavedItems(state, 2, 'write')
+  const brewingStands = []
+  for (const entry of state.brewingStands === undefined ? [] : state.brewingStands) {
+    const wire = brewingStateToWire(entry.state)
+    if (Result.isFailure(wire)) return Result.fail(savedServerStateFailure('brewingStands', wire.failure.reason))
+    brewingStands.push({ at: entry.at, state: wire.success })
+  }
+  const encoded = transformSavedItems({ ...state, brewingStands }, 3, 'write')
   if (Result.isFailure(encoded)) return Result.fail(encoded.failure)
   const validContainers = validatePersistentContainers(state.containers, worldId)
   if (Result.isFailure(validContainers)) return validContainers
   await mkdir(dirname(path), { recursive: true })
   const temporaryPath = `${path}.${String(process.pid)}.${randomUUID()}.tmp`
-  const persisted: PersistedServerState = { format: 2, worldId, seed, state: encoded.success.state }
+  const persisted: PersistedServerState = { format: 3, worldId, seed, state: encoded.success.state }
   await writeFile(temporaryPath, `${JSON.stringify(persisted)}\n`, 'utf8')
   await rename(temporaryPath, path)
   return Result.succeed(undefined)
@@ -849,12 +865,17 @@ export const startMultiplayerServer = async (
     }
     const transfer = detached.success
     if (transfer === undefined) return
-    if (!destination.acceptRealmTransfer(clientId, transfer, {
+    const accepted = destination.acceptRealmTransfer(clientId, transfer, {
       commandId: command.commandId,
       fromWorld: command.world,
       at: destinationAt,
       facing: transfer.facing,
-    }, preparedBlockSnapshot.success)) return
+    }, preparedBlockSnapshot.success)
+    if (Result.isFailure(accepted)) {
+      console.error('Multiplayer realm transfer failed', { clientId, failure: accepted.failure })
+      return
+    }
+    if (!accepted.success) return
     activeRealms.set(clientId, destination)
   }
   const overworldCoreResult = makeMultiplayerServerCore({

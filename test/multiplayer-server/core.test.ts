@@ -13,7 +13,7 @@ import {
   type WorldId,
 } from '@nerima-games/mx-multiplayer'
 import type { Dimension } from '@nerima-games/mc-worldgen'
-import { CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
+import { brewingState, itemStack, CHEST_CONTAINER_CAPACITY } from '@nerima-games/mc-sim'
 import { AIR_BLOCK_ID, blockIdOf, EncodedBlockStateSchema, itemStackFromUnknown } from '@nerima-games/mc-kernel'
 import { Option, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
@@ -22,7 +22,6 @@ import { makeMultiplayerServerCore, type MultiplayerServerOptions, type Multipla
 import { decodeAnvilWireMessage } from '../../apps/multiplayer-shared/anvil-network'
 import { airTerrain, terrainFrom } from './terrain'
 import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
-import { decodeBrewingWireMessage } from '../../apps/multiplayer-shared/brewing-network'
 import { decodeEnderDragonWireMessage, type EnderDragonWireMessage } from '../../apps/multiplayer-shared/ender-dragon-network'
 import { decodeEnchantingWireMessage } from '../../apps/multiplayer-shared/enchanting-network'
 import { decodeSleepWireMessage, type SleepWireMessage } from '../../apps/multiplayer-shared/sleep-network'
@@ -43,7 +42,7 @@ const frame = (message: NetworkMessage): WireText => {
 }
 
 const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage> =>
-  frames.filter((wire) => decodeSleepWireMessage(wire) === undefined && decodeWitherWireMessage(wire) === undefined && decodeEnderDragonWireMessage(wire) === undefined && decodeBrewingWireMessage(wire) === undefined && decodeAnvilWireMessage(wire) === undefined && decodeEnchantingWireMessage(wire) === undefined).map((wire) => {
+  frames.filter((wire) => decodeSleepWireMessage(wire) === undefined && decodeWitherWireMessage(wire) === undefined && decodeEnderDragonWireMessage(wire) === undefined && decodeAnvilWireMessage(wire) === undefined && decodeEnchantingWireMessage(wire) === undefined).map((wire) => {
     const result = decodeFrame(wire, replicatedOwners)
     if (result._tag === 'Failure') throw result.failure
     return result.success
@@ -1063,7 +1062,7 @@ describe('authoritative multiplayer server core', () => {
       fromWorld: worldId('world-1'),
       at: { x: far, y: 65, z: 0 },
       facing: { yawRadians: 0, pitchRadians: 0 },
-    }, prepared)).toBe(false)
+    }, prepared)).toMatchObject(Result.fail({ _tag: 'PositionOutsideAddressableCells' }))
     expect(destination.server.snapshot().players).toEqual([])
   })
 
@@ -1101,7 +1100,7 @@ describe('authoritative multiplayer server core', () => {
       fromWorld: worldId('world-1'),
       at: { x: 0, y: 65, z: 0 },
       facing: { yawRadians: 1, pitchRadians: 0 },
-    }, prepared)).toBe(true)
+    }, prepared)).toEqual(Result.succeed(true))
 
     expect(messages(destinationFrames)).toContainEqual(expect.objectContaining({
       _tag: 'RealmTransferSnapshot',
@@ -1234,7 +1233,7 @@ describe('authoritative multiplayer server core', () => {
               input: { item: 'raw_iron', count: 3 },
               fuel: { item: 'coal', count: 2 },
               output: { item: 'iron_ingot', count: 1 },
-              burnTicksRemaining: 40,
+              burnTicksRemaining: 40, burnTicksTotal: 40, station: 'furnace',
               cookTicks: 10,
             }],
           },
@@ -1268,7 +1267,7 @@ describe('authoritative multiplayer server core', () => {
           metadata: {
             brewingStands: [{
               at,
-              state: { fuelUnits: 1, bottle: 'water_bottle', ingredient: 'nether_wart', brewing: undefined },
+              state: Result.getOrThrow(brewingState({ bottles: [Result.getOrThrow(itemStack('water_bottle', 1)), Result.getOrThrow(itemStack('awkward_potion', 1)), Result.getOrThrow(itemStack('potion_of_poison', 1))], ingredient: Result.getOrThrow(itemStack('nether_wart', 2)), fuel: Result.getOrThrow(itemStack('blaze_powder', 3)), fuelCharges: 1 })),
             }],
           },
         },
@@ -1284,7 +1283,7 @@ describe('authoritative multiplayer server core', () => {
         .map((message) => message.entity)
       expect(drops).toEqual(expect.arrayContaining([
         expect.objectContaining({ _tag: 'item-drop', stack: { item: 'water_bottle', count: 1 } }),
-        expect.objectContaining({ _tag: 'item-drop', stack: { item: 'nether_wart', count: 1 } }),
+        expect.objectContaining({ _tag: 'item-drop', stack: { item: 'nether_wart', count: 2 } }),
       ]))
     })
 
@@ -1300,7 +1299,7 @@ describe('authoritative multiplayer server core', () => {
           metadata: {
             brewingStands: [{
               at,
-              state: { fuelUnits: 0, bottle: { potion: 'speed' }, ingredient: undefined, brewing: undefined },
+              state: Result.getOrThrow(brewingState({ bottles: [Result.getOrThrow(itemStack('potion_of_swiftness', 1)), undefined, undefined] })),
             }],
           },
         },

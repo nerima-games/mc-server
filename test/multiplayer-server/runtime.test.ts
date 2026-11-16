@@ -606,7 +606,7 @@ describe('multiplayer WebSocket runtime', () => {
       seed: 73,
       stateFile,
       installSignalHandlers: false,
-    })).rejects.toThrow(/Failed to read multiplayer state/)
+    })).resolves.toMatchObject(Result.fail({ _tag: 'SavedServerStateFailure', path: 'file', reason: 'invalid multiplayer state JSON' }))
   })
 
   it('lets legacy players reclaim a lost browser token and then rotates normally', async () => {
@@ -800,14 +800,14 @@ describe('multiplayer WebSocket runtime', () => {
     { name: 'lever position', state: { levers: [{ at: {}, active: true }] } },
     { name: 'ender dragon encounter', state: { enderDragon: {} } },
     { name: 'ender dragon revision', state: { enderDragonRevision: -1 } },
-    { name: 'brewing stand state', state: { brewingStands: [{ at: { x: 0, y: 0, z: 0 }, state: {} }] } },
+    { name: 'brewing stand state', state: { brewingStands: [{ at: { x: 0, y: 0, z: 0 }, state: { bottles: [null, null], ingredient: null, fuel: null, fuelCharges: 0, brewProgressSecs: 0 } }] } },
     { name: 'status effect state', state: { statusEffects: [{ player: 'alice', state: {} }] } },
     { name: 'anvil name slot', state: { anvilNames: [{ player: 'alice', names: [{ slot: -1, name: 'x' }] }] } },
     { name: 'enchanted item', state: { enchantments: [{ player: 'alice', seed: 1, items: [{ slot: 0, item: {} }] }] } },
   ])('refuses persisted authority state with invalid $name', async ({ state: invalidState }) => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-server-')), 'state.json')
     await writeFile(stateFile, JSON.stringify({
-      format: 1,
+      format: 3,
       worldId: 'invalid-authority-boundary-world',
       seed: 73,
       state: {
@@ -824,7 +824,7 @@ describe('multiplayer WebSocket runtime', () => {
       seed: 73,
       stateFile,
       installSignalHandlers: false,
-    })).rejects.toThrow(/does not match world/)
+    })).resolves.toMatchObject(Result.fail({ _tag: 'SavedServerStateFailure' }))
   })
 
   it('refuses persisted authority state with invalid nested values', async () => {
@@ -847,6 +847,6 @@ describe('multiplayer WebSocket runtime', () => {
       seed: 73,
       stateFile,
       installSignalHandlers: false,
-    })).rejects.toThrow(/does not match world/)
+    })).resolves.toMatchObject(Result.fail({ _tag: 'SavedServerStateFailure' }))
   })
 })

@@ -6,7 +6,6 @@ The `@nerima-games/mc-server/shared` subpath re-exports these modules from `apps
 
 - `anvil-network`
 - `anvil-repair`
-- `brewing-network`
 - `crafting-network`
 - `enchanting-network`
 - `ender-dragon-network`

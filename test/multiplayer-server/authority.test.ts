@@ -49,7 +49,6 @@ import {
   encodeCraftingCommand,
   type CraftingCommand,
 } from '../../apps/multiplayer-shared/crafting-network'
-import { decodeBrewingWireMessage } from '../../apps/multiplayer-shared/brewing-network'
 import {
   decodeAnvilWireMessage,
   encodeAnvilCommand,
@@ -90,7 +89,6 @@ const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage
     && decodeEnderDragonWireMessage(wire) === undefined
     && decodePlayerDamageWireMessage(wire) === undefined
     && decodeCraftingWireMessage(wire) === undefined
-    && decodeBrewingWireMessage(wire) === undefined
     && decodeAnvilWireMessage(wire) === undefined
     && decodeEnchantingWireMessage(wire) === undefined).map((wire) => {
     const decoded = decodeFrame(wire, replicatedOwners)
@@ -123,7 +121,7 @@ const initialState = (): MultiplayerServerState => ({
     input: null,
     fuel: null,
     output: { item: 'iron_ingot', count: 2 },
-    burnTicksRemaining: 0,
+    burnTicksRemaining: 0, burnTicksTotal: 0, station: 'furnace',
     cookTicks: 0,
   }],
   villagerTrades: [],
@@ -1116,7 +1114,7 @@ describe('multiplayer server authoritative state', () => {
       ...initialState(),
       furnaces: [{
         furnaceId: '["world-1",2,64,0]', input: { item: 'legacy_ore', count: 1 }, fuel: null, output: null,
-        burnTicksRemaining: 0, cookTicks: 0,
+        burnTicksRemaining: 0, burnTicksTotal: 0, station: 'furnace', cookTicks: 0,
       }],
     }
     const untouched = makeFixture(state)
@@ -1124,7 +1122,7 @@ describe('multiplayer server authoritative state', () => {
     fixture.sent.length = 0
 
     expect(fixture.server.tick(100)).toEqual(Result.fail({
-      _tag: 'FurnaceAdvanceFailure', failure: { _tag: 'UnknownFurnaceItemType', slot: 'input', item: 'legacy_ore' },
+      _tag: 'FurnaceAdvanceFailure', failure: { _tag: 'FurnaceWireConversionFailure', reason: 'invalid-stack', path: 'input' },
     }))
     const timeWeather = { timeOfDay: 6_002, weather: 'clear' }
     expect(messages(fixture.sent)).toEqual([{ _tag: 'WorldTimeWeatherDelta', world: 'world-1', revision: 4, state: timeWeather }])
@@ -1212,7 +1210,7 @@ describe('multiplayer server authoritative state', () => {
       ...arrowInUnreadableChunk,
       furnaces: [{
         furnaceId: '["world-1",2,64,0]', input: { item: 'iron_ore', count: 1 }, fuel: { item: 'coal', count: 1 }, output: null,
-        burnTicksRemaining: 0, cookTicks: 0,
+        burnTicksRemaining: 0, burnTicksTotal: 0, station: 'furnace', cookTicks: 0,
       }],
     }
     const fixture = makeFixture(state)
@@ -3053,7 +3051,7 @@ describe('multiplayer server authoritative state', () => {
     }).accepted).toBe(true)
     // resolveFoodUse grants the golden apple's regeneration (kernel food data, chance 1); absorption
     // has no mx-gameplay status-effect type, so it is not part of the consume outcome.
-    const effects = fixture.sent.map(decodeBrewingWireMessage).find((message) => message?._tag === 'PlayerStatusEffectsDelta')
+    const effects = messages(fixture.sent).find((message) => message._tag === 'PlayerStatusEffectsDelta')
     const regeneration = { type: 'regeneration', remainingSecs: 5, pulseClockSecs: 0, amplifier: 1 }
     expect(effects).toEqual({
       _tag: 'PlayerStatusEffectsDelta', world: 'world-1', revision: 5, player: 'alice', state: { effects: [regeneration] },
@@ -3220,7 +3218,7 @@ describe('multiplayer server authoritative state', () => {
         input: { item: 'raw_iron', count: 1 },
         fuel: { item: 'coal', count: 1 },
         output: null,
-        burnTicksRemaining: 0,
+        burnTicksRemaining: 0, burnTicksTotal: 0, station: 'furnace',
         cookTicks: 0,
       }],
     })
@@ -3236,7 +3234,7 @@ describe('multiplayer server authoritative state', () => {
           input: null,
           fuel: null,
           output: { item: 'iron_ingot', count: 1 },
-          burnTicksRemaining: 1_400,
+          burnTicksRemaining: 1_400, burnTicksTotal: 1_600, station: 'furnace',
           cookTicks: 0,
         }),
       }),
@@ -3253,7 +3251,7 @@ describe('multiplayer server authoritative state', () => {
         input: null,
         fuel: null,
         output: { item: 'iron_ingot', count: 1 },
-        burnTicksRemaining: 1_400,
+        burnTicksRemaining: 1_400, burnTicksTotal: 1_600, station: 'furnace',
         cookTicks: 0,
       }],
     })
@@ -4147,7 +4145,7 @@ describe('multiplayer server authoritative state', () => {
         input: null,
         fuel: null,
         output: null,
-        burnTicksRemaining: 0,
+        burnTicksRemaining: 0, burnTicksTotal: 0, station: 'furnace',
         cookTicks: 0,
       }],
     })
@@ -4326,7 +4324,7 @@ describe('multiplayer server authoritative state', () => {
         input: null,
         fuel: null,
         output: null,
-        burnTicksRemaining: 0,
+        burnTicksRemaining: 0, burnTicksTotal: 0, station: 'furnace',
         cookTicks: 0,
       }],
     })

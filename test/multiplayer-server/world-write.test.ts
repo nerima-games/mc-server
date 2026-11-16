@@ -17,7 +17,6 @@ import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/en
 import { loadServerState, writeServerState } from '../../apps/multiplayer-server/main'
 import { makeMultiplayerRedstoneRuntime } from '../../apps/multiplayer-server/redstone-runtime'
 import { decodeAnvilWireMessage } from '../../apps/multiplayer-shared/anvil-network'
-import { decodeBrewingWireMessage } from '../../apps/multiplayer-shared/brewing-network'
 import { decodeCraftingWireMessage } from '../../apps/multiplayer-shared/crafting-network'
 import { decodeEnchantingWireMessage } from '../../apps/multiplayer-shared/enchanting-network'
 import { decodeEnderDragonWireMessage } from '../../apps/multiplayer-shared/ender-dragon-network'
@@ -45,7 +44,6 @@ const networkMessages = (frames: ReadonlyArray<WireText>): ReadonlyArray<Network
     && decodeEnderDragonWireMessage(wire) === undefined
     && decodePlayerDamageWireMessage(wire) === undefined
     && decodeCraftingWireMessage(wire) === undefined
-    && decodeBrewingWireMessage(wire) === undefined
     && decodeAnvilWireMessage(wire) === undefined
     && decodeEnchantingWireMessage(wire) === undefined)
     .map((wire) => Result.getOrThrow(decodeFrame(wire, replicatedOwners)))
