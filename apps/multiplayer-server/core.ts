@@ -26,10 +26,10 @@ import {
   SurvivalAuthority,
   type SurvivalEvent,
 } from '@nerima-games/mx-multiplayer'
-import { AIR_BLOCK_ID, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
+import { AIR_BLOCK_ID, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, DimensionRevisionSchema, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
-import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
-import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState } from '@nerima-games/mc-sim'
+import { blockIndex, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -202,6 +202,7 @@ import {
   spendExperienceLevels,
 } from '../multiplayer-shared/anvil-repair.js'
 import { frameTag, specializedFrameWireLengths, unknownRecord } from './wire-frame-validation.js'
+import type { ServerWorldWrite, ServerWorldWriteOptions } from './world-write-port.js'
 import {
   addStackToInventory,
   cloneInventory,
@@ -272,6 +273,7 @@ export type GeneratedBlockReadFailure =
   | Readonly<{ _tag: 'GeneratedBlockRegistryFailure'; failure: BlockRegistryFailure }>
 
 export type MultiplayerServerCoreFailure =
+  | Readonly<{ _tag: 'WorldWriteInitializationFailure'; failure: Schema.SchemaError | WorldCommitCoordinatorError }>
   | Readonly<{ _tag: 'WitherRuntimeFailure'; operation: WitherOperation; failure: WitherRuntimeFailure }>
   | Readonly<{ _tag: 'FurnaceAdvanceFailure'; failure: FurnaceAdvanceFailure }>
   | Readonly<{ _tag: 'ExplosionPlanFailure'; failure: ExplosionPlanFailure }>
@@ -374,8 +376,9 @@ export interface SurvivalHungerPart {
   ) => Result.Result<Readonly<{ state: SurvivalHungerState; died: boolean }>, SurvivalHungerError>
 }
 
-/** The read operations of an mc-worldgen ChunkStore, made synchronous by the server entrypoint. */
+/** A raw ChunkStore and synchronous access operations built by the server entrypoint. */
 export interface ChunkStorePart {
+  readonly store: ChunkStoreApi
   readonly peek: (coord: ChunkCoord) => ReadonlyChunkWithBlockStates | undefined
   readonly load: (coord: ChunkCoord) => Result.Result<ReadonlyChunkWithBlockStates, ChunkStoreError>
   readonly unload: (coord: ChunkCoord) => Result.Result<boolean, ChunkPersistenceError>
@@ -390,6 +393,7 @@ export interface ChunkStorePart {
 export interface MultiplayerServerCoreParts {
   readonly survivalHunger: SurvivalHungerPart
   readonly openChunkStore: (source: ChunkSource) => ChunkStorePart
+  readonly makeWorldWrite: (options: ServerWorldWriteOptions) => Result.Result<ServerWorldWrite, WorldCommitCoordinatorError>
 }
 
 /** The block box a core simulates; every bound must be finite and each minimum at most its maximum. */
@@ -1099,6 +1103,11 @@ export interface ContainerSlotSnapshot {
 }
 
 export interface MultiplayerServerCore {
+  /**
+   * Mutation callers must not use this port until U6b-2 removes the legacy reload path,
+   * which can erase committed writes.
+   */
+  readonly worldWrite: ServerWorldWrite
   readonly connect: (clientId: ClientId, send: SendFrame) => boolean
   readonly receive: (clientId: ClientId, frame: WireText) => ReceiveResult
   readonly disconnect: (clientId: ClientId) => Result.Result<void, MultiplayerServerCoreFailure>
@@ -1159,7 +1168,7 @@ export interface WorldBlockReader {
 
 const generatedReadFailure = (failure: GeneratedBlockReadFailure): MultiplayerServerCoreFailure => ({ _tag: 'GeneratedBlockReadFailure', failure })
 
-const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts, blocks: BlockOverrides): WorldBlockReader => {
+const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts, blocks: BlockOverrides): WorldBlockReader & Readonly<{ chunkStore: ChunkStoreApi }> => {
   // Block ids of the edits inside the chunk being loaded; loadChunk validates them before generation.
   const pendingOverlays = new Map<string, ChunkOverlay>()
   const overlaySource: ChunkSource = (coord) => Effect.map(source(coord), (chunk) => {
@@ -1170,7 +1179,7 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
     for (const { index, block } of overlay) chunkBlocks[index] = block
     return { coord: chunk.coord, blocks: chunkBlocks, biomes: chunk.biomes }
   })
-  // The store is the read side of the world only; edits stay in `blocks` until block writes move to the commit path.
+  // Legacy edits stay in `blocks` until mutation callers move to the commit path in U6b-2.
   const chunkStore = parts.openChunkStore(overlaySource)
 
   const overlayFor = (coord: ChunkCoord): Result.Result<ChunkOverlay, MultiplayerServerCoreFailure> => {
@@ -1237,7 +1246,7 @@ const makeWorldReader = (source: ChunkSource, parts: MultiplayerServerCoreParts,
     return Result.succeed(chunkStore.openWindow(chunks))
   }
 
-  return { blockAt, openWindow }
+  return { blockAt, openWindow, chunkStore: chunkStore.store }
 }
 
 /** The generated terrain alone, read through the same path the core uses; the entrypoint finds spawn with it. */
@@ -1245,7 +1254,9 @@ export const makeTerrainReader = (source: ChunkSource, parts: MultiplayerServerC
   makeWorldReader(source, parts, new BlockOverrides())
 
 export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Result.Result<MultiplayerServerCore, MultiplayerServerCoreFailure> => {
-  const worldId = options.worldId as WorldId
+  const decodedWorldId = Schema.decodeUnknownResult(WorldIdSchema)(options.worldId)
+  if (Result.isFailure(decodedWorldId)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: decodedWorldId.failure })
+  const worldId = decodedWorldId.success
   const dimension = options.dimension ?? 'overworld'
   // Bounds come from the caller's configuration; a non-finite bound would fail every lightning strike and bounds test.
   const validBounds = validateServerBounds(options.bounds ?? DEFAULT_BOUNDS)
@@ -1266,6 +1277,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     blocks.set(positionKey(mutation.at), mutation)
   }
   const world = makeWorldReader(options.chunkSource, options.parts, blocks)
+  const worldWrite = options.parts.makeWorldWrite({
+    world: worldId,
+    owners: [],
+    dimension,
+    chunkStores: { forDimension: () => world.chunkStore },
+  })
+  if (Result.isFailure(worldWrite)) return Result.fail({ _tag: 'WorldWriteInitializationFailure', failure: worldWrite.failure })
   const blockAt = world.blockAt
   const poweredRails = new Map<string, Readonly<{ at: BlockPos; powered: boolean }>>(
     (options.initialState?.poweredRails ?? []).map(({ at, powered }) => [positionKey(at), {
@@ -6192,5 +6210,5 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(true)
   }
 
-  return Result.succeed({ connect, receive, disconnect, detachPlayer, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
+  return Result.succeed({ worldWrite: worldWrite.success, connect, receive, disconnect, detachPlayer, acceptRealmTransfer, snapshot, applyHopperTransfer, applyDispenserTrigger, applyDropperTrigger, applyRedstoneBlockState, isPoweredRailPowered, applyPoweredRailState, isLeverActive, readContainerSlots, readPistonCell, applyPistonPlan, tick, spawnEntity })
 }
