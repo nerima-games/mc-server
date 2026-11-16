@@ -4980,8 +4980,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     let stateChanged = false
     let worldSnapshotRequired = false
     const postPersistenceDeltas: AuthoritativeDelta[] = []
-    // Furnace, brewing, Wither, and ender dragon messages, built when their step completes and sent, ahead of the
-    // deltas, once that state is persisted.
+    // Furnace, brewing, Wither, and ender dragon messages, built when their step completes. publish requests
+    // persistence first and then sends them ahead of the deltas; it does not wait for the write to finish.
     const postPersistenceSends: Array<() => void> = []
     const changedFurnaces: MutableFurnaceState[] = []
     // The time delta carries the revision after the furnace step, so the time step leaves it pending until then, or
