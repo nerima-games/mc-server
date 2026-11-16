@@ -1385,8 +1385,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const world = makeWorldReader(options.chunkSource, options.parts, blocks, plannedBlocks)
   const initialContainers: Array<Container> = []
   for (const state of options.initialState?.containers ?? []) {
-    const match = /^([^:]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(state.containerId)
-    if (match === null || (match[1] !== options.worldId && match[1] !== dimension)) {
+    const match = /^([\s\S]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(state.containerId)
+    if (match === null || match[0] !== state.containerId || (match[1] !== options.worldId && match[1] !== dimension)) {
       return Result.fail({ _tag: 'SavedContainerIdInvalid', containerId: state.containerId })
     }
     const at = { x: Number(match[2]), y: Number(match[3]), z: Number(match[4]) }
@@ -2113,8 +2113,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     JSON.stringify([worldId, at.x, at.y, at.z])
 
   const parseContainerId = (containerId: string): BlockPos | null => {
-    const match = /^([^:]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(containerId)
-    if (match === null || match[1] !== worldId) return null
+    const match = /^([\s\S]+):(-?\d+),(-?\d+),(-?\d+)$/.exec(containerId)
+    if (match === null || match[0] !== containerId || match[1] !== worldId) return null
     const at = { x: Number(match[2]), y: Number(match[3]), z: Number(match[4]) }
     if (!Number.isSafeInteger(at.x) || !Number.isSafeInteger(at.y) || !Number.isSafeInteger(at.z)) return null
     return isInBounds(at) && containerIdAt(at) === containerId ? at : null

@@ -135,11 +135,12 @@ describe('coordinator-backed hopper runtime', () => {
 
   it('pulls above and pushes down for a legacy hopper, preserving components and the eight-game-tick cooldown', async () => {
     const special = enchanted()
-    const fixture = makeFixture('legacy-hopper-world', 'overworld', {
+    const fixture = makeFixture('legacy:hopper-world', 'overworld', {
+      inventories: [{ player: PLAYER, state: { slots: [{ item: 'apple', count: 1 }, null], selectedSlot: 0 } }],
       containers: [
-        { containerId: 'legacy-hopper-world:1,65,0', kind: 'chest', slots: slots(27, special) },
-        { containerId: 'legacy-hopper-world:1,64,0', kind: 'hopper', slots: slots(5) },
-        { containerId: 'legacy-hopper-world:1,63,0', kind: 'chest', slots: slots(27) },
+        { containerId: 'legacy:hopper-world:1,65,0', kind: 'chest', slots: slots(27, special) },
+        { containerId: 'legacy:hopper-world:1,64,0', kind: 'hopper', slots: slots(5) },
+        { containerId: 'legacy:hopper-world:1,63,0', kind: 'chest', slots: slots(27) },
       ],
     })
     const runtime = await makeMultiplayerRedstoneRuntime([{ dimension: 'overworld', core: fixture.core }])
@@ -169,8 +170,8 @@ describe('coordinator-backed hopper runtime', () => {
       expect.objectContaining({ world: fixture.world, revision: 1, changes: [], blockChanges: [] }),
     ])
     expect(emitted.filter((message) => message._tag === 'ContainerDelta')).toEqual(expect.arrayContaining([
-      expect.objectContaining({ state: expect.objectContaining({ containerId: 'legacy-hopper-world:1,65,0', slots: slots(27) }) }),
-      expect.objectContaining({ state: expect.objectContaining({ containerId: 'legacy-hopper-world:1,64,0', slots: [{ item: 'diamond_sword', count: 1, durability: special.durability }, null, null, null, null] }) }),
+      expect.objectContaining({ state: expect.objectContaining({ containerId: 'legacy:hopper-world:1,65,0', slots: slots(27) }) }),
+      expect.objectContaining({ state: expect.objectContaining({ containerId: 'legacy:hopper-world:1,64,0', slots: [{ item: 'diamond_sword', count: 1, durability: special.durability }, null, null, null, null] }) }),
     ]))
 
     Result.getOrThrow(await Effect.runPromise(runtime.tick(300)))
@@ -189,6 +190,24 @@ describe('coordinator-backed hopper runtime', () => {
     const revisions = messages(fixture.sent).filter((message) => message._tag === 'ReplicatedWorldDelta')
       .map((message) => message.revision)
     expect(revisions).toEqual(Array.from({ length: revisions.length }, (_, index) => index + 1))
+
+    const current = fixture.freshSnapshot()
+    fixture.sent.length = 0
+    expect(fixture.receive({
+      _tag: 'ContainerCommand', commandId: CommandId.make('store-apple-after-hopper'),
+      player: PLAYER, world: fixture.world, expectedRevision: current.revision,
+      containerId: 'legacy:hopper-world:1,65,0',
+      action: {
+        _tag: 'move-item', source: { _tag: 'player-slot', slot: 0 },
+        destination: { _tag: 'container-slot', slot: 0 }, count: 1,
+      },
+    }).accepted).toBe(true)
+    expect(await fixture.canonicalSlots(ABOVE)).toEqual(slots(27, stack('apple', 1)))
+    expect(fixture.freshSnapshot().inventories.find(({ player }) => player === PLAYER)?.state.slots[0]).toBeNull()
+    expect(messages(fixture.sent)).toContainEqual(expect.objectContaining({
+      _tag: 'ContainerDelta',
+      state: expect.objectContaining({ containerId: 'legacy:hopper-world:1,65,0', slots: [{ item: 'apple', count: 1 }, ...Array.from({ length: 26 }, () => null)] }),
+    }))
   })
 
   it('uses encoded facing and stops disabled and redstone-powered hoppers', async () => {
