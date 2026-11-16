@@ -16,35 +16,5 @@
     "file": "apps/multiplayer-server/redstone-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Scope.make())"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.drainHopperTransferEvents)"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.drainLampTransitions)"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.drainPistonTransitions)"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.drainPoweredComponentTransitions)"
-  },
-  {
-    "count": 1,
-    "file": "apps/multiplayer-server/redstone-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.drainTriggerEvents)"
   }
 ]

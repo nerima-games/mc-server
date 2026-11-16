@@ -8,6 +8,7 @@ import {
   ChunkAxis,
   chunkCoord,
   chunkKeyOfPosition,
+  itemStackFromUnknown,
   WorldIdSchema,
   WorldWriteBatchSchema,
   WorldWriteCommitSchema,
@@ -17,7 +18,11 @@ import {
   type WorldWritePort,
 } from '@nerima-games/mc-kernel'
 import {
+  CONTAINER_STORAGE_REPLICATED_OWNER_ID,
+  ContainerStorageSnapshotSchema,
+  containerStorageOwnerRegistration,
   makeReplicatedOwnerId,
+  type ReplicatedOwnerRegistration,
   makeWorldCommitCoordinator,
   type WorldCommitCoordinatorApi,
 } from '@nerima-games/mc-sim'
@@ -72,6 +77,7 @@ const edit = (position: EncodedEdit['position'], block: number = STONE): Encoded
 
 type FixtureOptions = {
   readonly wrapStore?: (store: ChunkStoreApi) => ChunkStoreApi
+  readonly owners?: ReadonlyArray<ReplicatedOwnerRegistration>
 }
 
 const makeFixture = (options: FixtureOptions = {}) => Effect.gen(function* () {
@@ -89,7 +95,7 @@ const makeFixture = (options: FixtureOptions = {}) => Effect.gen(function* () {
   }
   const coordinator = yield* makeWorldCommitCoordinator({
     world,
-    owners: [{ ownerId: OWNER, schema: Schema.Number, initialState: 0 }],
+    owners: [{ ownerId: OWNER, schema: Schema.Number, initialState: 0 }, ...(options.owners ?? [])],
     chunkStores,
   })
   const commits = yield* Ref.make(0)
@@ -298,6 +304,62 @@ describe('WorldWritePort adapter over WorldCommitCoordinator and ChunkStore', ()
         expect(error).toMatchObject({ _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '0,0' })
         expect(yield* fixture.currentRevisions).toStrictEqual({ world: 0, dimension: 0 })
         expect(yield* fixture.coordinator.snapshot(OWNER, Schema.Number)).toMatchObject({ revision: 0, state: 0 })
+      }))
+  })
+
+  describe('container and block atomic commits', () => {
+    const containerState = (count: number) => ({
+      version: 3,
+      containers: [{
+        id: 'overworld:1,10,1',
+        kind: 'chest',
+        slots: Array.from({ length: 27 }, (_, index) => index === 0
+          ? { ...Result.getOrThrow(itemStackFromUnknown('apple', count)), durability: null }
+          : null),
+      }],
+    })
+
+    it.effect('publishes canonical container state and blocks in one adapter commit', () =>
+      Effect.gen(function* () {
+        const initial = yield* Schema.decodeUnknownEffect(ContainerStorageSnapshotSchema)(containerState(2))
+        const next = yield* Schema.decodeUnknownEffect(ContainerStorageSnapshotSchema)(containerState(1))
+        const fixture = yield* makeFixture({ owners: [containerStorageOwnerRegistration(initial)] })
+
+        const committed = yield* commitBlockBatch(fixture.coordinator, 'overworld', yield* batchOf(), [
+          { ownerId: CONTAINER_STORAGE_REPLICATED_OWNER_ID, state: next },
+        ])
+
+        expect(committed.commit).toStrictEqual({ worldRevision: 1, dimensionRevision: 1 })
+        expect(committed.delta.changes).toEqual([
+          expect.objectContaining({ owner: CONTAINER_STORAGE_REPLICATED_OWNER_ID, state: next }),
+        ])
+        expect(committed.delta.blockChanges).toEqual([
+          expect.objectContaining({ position: P, before: AIR_BLOCK_ID, after: STONE }),
+        ])
+        expect(yield* fixture.coordinator.snapshot(CONTAINER_STORAGE_REPLICATED_OWNER_ID, ContainerStorageSnapshotSchema))
+          .toMatchObject({ revision: 1, state: next })
+        expect(yield* fixture.overworld.getBlock(at(P))).toStrictEqual({ _tag: 'Block', block: STONE })
+        expect(yield* fixture.currentRevisions).toStrictEqual({ world: 1, dimension: 1 })
+      }))
+
+    it.effect('refuses the owner and every block edit when one target chunk is unavailable', () =>
+      Effect.gen(function* () {
+        const initial = yield* Schema.decodeUnknownEffect(ContainerStorageSnapshotSchema)(containerState(2))
+        const next = yield* Schema.decodeUnknownEffect(ContainerStorageSnapshotSchema)(containerState(1))
+        const fixture = yield* makeFixture({ owners: [containerStorageOwnerRegistration(initial)] })
+        const before = yield* fixture.observeAll
+        const beforeContainer = yield* fixture.coordinator.snapshot(CONTAINER_STORAGE_REPLICATED_OWNER_ID, ContainerStorageSnapshotSchema)
+
+        const error = yield* Effect.flip(commitBlockBatch(fixture.coordinator, 'overworld', yield* batchOf({
+          edits: [edit(P), edit({ x: CHUNK_SIZE_XZ + 1, y: 10, z: 1 })],
+        }), [{ ownerId: CONTAINER_STORAGE_REPLICATED_OWNER_ID, state: next }]))
+
+        expect(error).toMatchObject({ _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '1,0' })
+        expect(yield* fixture.coordinator.snapshot(CONTAINER_STORAGE_REPLICATED_OWNER_ID, ContainerStorageSnapshotSchema))
+          .toStrictEqual(beforeContainer)
+        expect(yield* fixture.observeAll).toStrictEqual(before)
+        expect(yield* fixture.currentRevisions).toStrictEqual({ world: 0, dimension: 0 })
+        expect(yield* fixture.overworld.getBlock(at(P))).toStrictEqual({ _tag: 'Block', block: AIR_BLOCK_ID })
       }))
   })
 

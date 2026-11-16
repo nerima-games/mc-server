@@ -11,10 +11,11 @@ import {
   type SurvivalHungerState,
   type ChunkWindow,
 } from '@nerima-games/mx-gameplay'
+import { makeContainerStorageService, makeHopperService, WorldCommitCoordinator, ContainerStorageService, CONTAINER_STORAGE_REPLICATED_OWNER_ID } from '@nerima-games/mc-sim'
 import { Effect, Result } from 'effect'
 
 import type { MultiplayerServerCoreParts } from '../core.js'
-import { commitBlockBatch, makeServerWorldWrite } from '../world-write-port.js'
+import { commitBlockBatch, commitCoordinatorRequest, makeServerWorldWrite } from '../world-write-port.js'
 
 // Bounds resident terrain. Evicted chunks regenerate through the source and its saved block overrides.
 const CHUNK_STORE_CAPACITY = Result.getOrThrow(ChunkCapacity.result(256))
@@ -80,7 +81,21 @@ export const makeMultiplayerServerCoreParts = (): MultiplayerServerCoreParts => 
     return { world: yield* write.coordinator.revision, dimension: yield* write.coordinator.dimensionRevision(dimension) }
   })),
   dieInvalidBlockBatch: (failure) => Effect.runSync(Effect.die(new Error('c7-adapter: unexpected WorldWriteInvalidBatch', { cause: failure }))),
-  commitWorldWrite: (write, dimension, batch) => Effect.runSync(Effect.result(commitBlockBatch(write.coordinator, dimension, batch))),
+  makeContainerServices: (write) => Effect.runSync(Effect.gen(function* () {
+    const containers = yield* makeContainerStorageService().pipe(Effect.provideService(WorldCommitCoordinator, write.coordinator))
+    const hoppers = yield* makeHopperService().pipe(
+      Effect.provideService(WorldCommitCoordinator, write.coordinator), Effect.provideService(ContainerStorageService, containers),
+    )
+    return { containers, hoppers }
+  })),
+  containerStorageSnapshot: (service) => Effect.runSync(service.snapshot),
+  commitContainerStorage: (write, snapshot) => Effect.runSync(Effect.result(Effect.gen(function* () {
+    return yield* commitCoordinatorRequest(write.coordinator, {
+      expectedRevision: yield* write.coordinator.revision, expectedDimensions: [],
+      changes: [{ ownerId: CONTAINER_STORAGE_REPLICATED_OWNER_ID, state: snapshot }],
+    })
+  }))),
+  commitWorldWrite: (write, dimension, batch, changes) => Effect.runSync(Effect.result(commitBlockBatch(write.coordinator, dimension, batch, changes))),
   survivalHunger: {
     create: (vitals, difficulty) => Effect.runSync(Effect.gen(function* () {
       // The in-memory vitals normalise spawn saturation against the given hunger.

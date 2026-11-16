@@ -30,6 +30,7 @@ import {
   type MultiplayerServerOptions,
   playerDamageResultKey,
   type MultiplayerServerState,
+  type MultiplayerServerInitialState,
   type ReceiveResult,
 } from '../../apps/multiplayer-server/core'
 import { makeMultiplayerRedstoneRuntime } from '../../apps/multiplayer-server/redstone-runtime'
@@ -98,7 +99,7 @@ const messages = (frames: ReadonlyArray<WireText>): ReadonlyArray<NetworkMessage
     return decoded.success
   })
 
-const initialState = (): MultiplayerServerState => ({
+const initialState = (): MultiplayerServerInitialState => ({
   revision: 4,
   blocks: [
     { at: { x: 1, y: 64, z: 0 }, block: 'chest' },
@@ -164,7 +165,7 @@ const edgeAt = { x: Number.MAX_SAFE_INTEGER - 1, y: 64, z: 0 }
  * player gives it no acceleration, and its melee reaches 2.25 blocks from the stepped feet, so a 0.4 s step at speed 5
  * moves it 2 blocks and still hits.
  */
-const edgeWitherState = (velocityX: number): MultiplayerServerState => ({
+const edgeWitherState = (velocityX: number): MultiplayerServerInitialState => ({
   ...initialState(),
   vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
   wither: {
@@ -193,7 +194,7 @@ const edgeWitherState = (velocityX: number): MultiplayerServerState => ({
 })
 
 const makeFixture = (
-  state: MultiplayerServerState = initialState(),
+  state: MultiplayerServerInitialState = initialState(),
   joinAt: Readonly<{ x: number; y: number; z: number }> = { x: 0, y: 64, z: 0 },
   difficulty: 'peaceful' | 'easy' | 'normal' | 'hard' = 'normal',
   serverOptions: Partial<Pick<MultiplayerServerOptions, 'allowedBlocks' | 'chunkSource' | 'now' | 'passableBlocks' | 'spawnAt'>> = {},
@@ -898,7 +899,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('fails a tick with a typed failure when it cannot advance the revision or the simulation tick', () => {
-    const state: MultiplayerServerState = {
+    const state: MultiplayerServerInitialState = {
       ...initialState(),
       revision: Number.MAX_SAFE_INTEGER,
       entities: [{
@@ -936,7 +937,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('leaves positions and health unchanged when the entity step cannot advance the revision', () => {
-    const state = (revision: number): MultiplayerServerState => ({
+    const state = (revision: number): MultiplayerServerInitialState => ({
       ...initialState(),
       revision,
       vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
@@ -1112,7 +1113,7 @@ describe('multiplayer server authoritative state', () => {
   const unreadableChunkFailure = { _tag: 'BlockOverrideNotInRegistry', ...unreadableChunkBlock }
 
   it('publishes the completed time step when the furnace step fails on a loaded item it cannot read', () => {
-    const state: MultiplayerServerState = {
+    const state: MultiplayerServerInitialState = {
       ...initialState(),
       furnaces: [{
         furnaceId: '["world-1",2,64,0]', input: { item: 'legacy_ore', count: 1 }, fuel: null, output: null,
@@ -1140,7 +1141,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('undoes the entity step when an arrow reads a chunk it cannot load after earlier entities changed state', () => {
-    const state: MultiplayerServerState = {
+    const state: MultiplayerServerInitialState = {
       ...initialState(),
       vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
       blocks: [...initialState().blocks, { at: { x: 11, y: 64, z: 0 }, block: 'stone' }, unreadableChunkBlock],
@@ -1177,7 +1178,7 @@ describe('multiplayer server authoritative state', () => {
 
   // R-SV3b's input: an arrow in a chunk whose saved block name the registry lacks. Load validation now rejects that
   // save, so the core is built here from initialState directly to reach the runtime path.
-  const arrowInUnreadableChunk: MultiplayerServerState = {
+  const arrowInUnreadableChunk: MultiplayerServerInitialState = {
     ...initialState(),
     blocks: [...initialState().blocks, { at: { x: 64, y: 64, z: 0 }, block: 'legacy_unknown' }],
     entities: [{
@@ -1208,7 +1209,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   it('sends a completed furnace step only after persisting it when a later step of the tick fails', () => {
-    const state: MultiplayerServerState = {
+    const state: MultiplayerServerInitialState = {
       ...arrowInUnreadableChunk,
       furnaces: [{
         furnaceId: '["world-1",2,64,0]', input: { item: 'iron_ore', count: 1 }, fuel: { item: 'coal', count: 1 }, output: null,
@@ -1231,7 +1232,7 @@ describe('multiplayer server authoritative state', () => {
   it('keeps a skull explosion out of an unloaded corrupt chunk and reports corruption when that chunk is read', () => {
     const playerAt = { x: 15.7, y: 64, z: 0.5 }
     const unreadable = { at: { x: 20, y: 64, z: 0 }, block: 'legacy_unknown' }
-    const state: MultiplayerServerState = {
+    const state: MultiplayerServerInitialState = {
       ...initialState(),
       vitals: [{ player: playerId('alice'), state: { health: 20, hunger: 20, experience: 7 } }],
       blocks: [...initialState().blocks, unreadable],
@@ -3419,7 +3420,7 @@ describe('multiplayer server authoritative state', () => {
   const pastureTerrain = floorTerrain(63, 'stone')
   const cowStart = { x: 0, y: 64, z: 8 }
   const pastureJoinAt = { x: -2, y: 64, z: 8 }
-  const pastureState = (): MultiplayerServerState => ({
+  const pastureState = (): MultiplayerServerInitialState => ({
     ...initialState(),
     entities: [{ _tag: 'living', entityId: entityId('cow-1'), entityType: 'cow', at: cowStart, health: 10, maxHealth: 10 }],
   })
@@ -3563,7 +3564,7 @@ describe('multiplayer server authoritative state', () => {
     // A saved block name the registry lacks, in a chunk inside the cow's movement window. Load validation rejects
     // such a save, so the core is built from initialState directly to reach the runtime path.
     const unreadable = { at: { x: 20, y: 64, z: 8 }, block: 'legacy_unknown' }
-    const state: MultiplayerServerState = { ...pastureState(), blocks: [...initialState().blocks, unreadable] }
+    const state: MultiplayerServerInitialState = { ...pastureState(), blocks: [...initialState().blocks, unreadable] }
     const untouched = makeFixture(state, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
     const fixture = makeFixture(state, pastureJoinAt, 'normal', { chunkSource: pastureTerrain })
     fixture.sent.length = 0
@@ -3643,7 +3644,7 @@ describe('multiplayer server authoritative state', () => {
   })
 
   // R-SV3b's input: a cow on a stone floor with no saved edits, two blocks from where a player may stand.
-  const fleeState = (): MultiplayerServerState => ({
+  const fleeState = (): MultiplayerServerInitialState => ({
     ...initialState(),
     blocks: [],
     containers: [],
@@ -3705,7 +3706,7 @@ describe('multiplayer server authoritative state', () => {
   it('leaves a living entity of an unsupported kind untouched instead of repairing its state', () => {
     // R-SV3b's input: state decoding admits any entity type and any finite motion phase, and load validation skips
     // kinds mx-gameplay does not simulate, so this phase never meets the repair that rejects it.
-    const state: MultiplayerServerState = {
+    const state: MultiplayerServerInitialState = {
       ...initialState(),
       entities: [{
         _tag: 'living', entityId: entityId('custom-1'), entityType: 'custom-mob', at: { x: 0, y: 64, z: 0 },

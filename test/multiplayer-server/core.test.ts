@@ -17,7 +17,7 @@ import { AIR_BLOCK_ID, blockIdOf, EncodedBlockStateSchema } from '@nerima-games/
 import { Option, Result, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 
-import { makeMultiplayerServerCore, type MultiplayerServerOptions, type MultiplayerServerState, type ReceiveResult } from '../../apps/multiplayer-server/core'
+import { makeMultiplayerServerCore, type MultiplayerServerOptions, type MultiplayerServerInitialState, type MultiplayerServerState, type ReceiveResult } from '../../apps/multiplayer-server/core'
 import { decodeAnvilWireMessage } from '../../apps/multiplayer-shared/anvil-network'
 import { airTerrain, terrainFrom } from './terrain'
 import { makeMultiplayerServerCoreParts } from '../../apps/multiplayer-server/entrypoints/core-parts'
@@ -105,7 +105,7 @@ const makeFixture = (
   initialWeather: 'clear' | 'rain' | 'thunder' = 'clear',
   dimension: Dimension = 'overworld',
   options: Pick<MultiplayerServerOptions, 'staticBlocks' | 'onEndPortalUse' | 'onNetherPortalUse'> & Readonly<{
-    metadata?: Partial<Pick<MultiplayerServerState, 'anvilNames' | 'enchantments' | 'containers' | 'furnaces' | 'brewingStands' | 'witherRevision'>>
+    metadata?: Partial<Pick<MultiplayerServerInitialState, 'anvilNames' | 'enchantments' | 'containers' | 'furnaces' | 'brewingStands' | 'witherRevision'>>
   }> = {},
 ) => {
   const { metadata, ...serverOptions } = options

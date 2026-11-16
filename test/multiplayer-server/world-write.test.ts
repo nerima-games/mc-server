@@ -335,7 +335,7 @@ describe('coordinator-backed multiplayer block writes', () => {
     })
 
     const file = join(await mkdtemp(join(tmpdir(), 'server-world-write-')), 'state.json')
-    await writeServerState(file, WORLD, 42, fixture.lastState())
+    Result.getOrThrow(await writeServerState(file, WORLD, 42, fixture.lastState()))
     const loaded = Result.getOrThrow(await loadServerState(file, WORLD, 42))
     expect(loaded).toBeDefined()
     const restored = makeFixture({ state: Option.getOrThrow(Option.fromUndefinedOr(loaded)) })

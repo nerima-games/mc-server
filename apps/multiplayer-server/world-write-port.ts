@@ -17,6 +17,7 @@ import {
   type WorldCommitCoordinatorOptions,
   type ReplicatedWorldDelta,
   type ReplicatedOwnerChange,
+  type ReplicatedOwnerCandidate,
 } from '@nerima-games/mc-sim'
 import { CHUNK_HEIGHT, type ChunkStoreRegistryApi, type Dimension } from '@nerima-games/mc-worldgen'
 import { Effect, Result, Schema } from 'effect'
@@ -45,17 +46,35 @@ const validateBeforeCommit = (batch: WorldWriteBatch) => Effect.gen(function* ()
   }
 })
 
-const commitRequestOf = (batch: WorldWriteBatch) => ({
+const commitRequestOf = (batch: WorldWriteBatch, changes: ReadonlyArray<ReplicatedOwnerCandidate>) => ({
   expectedRevision: batch.expectedWorldRevision,
   expectedDimensions: [{ dimension: batch.dimension, expectedRevision: batch.expectedDimensionRevision }],
-  changes: [],
+  changes,
   blockWrite: batch,
 })
+
+export const commitCoordinatorRequest = (
+  coordinator: WorldCommitCoordinatorApi,
+  request: import('@nerima-games/mc-sim').WorldCommitRequest,
+): Effect.Effect<ReplicatedWorldDelta<ReplicatedOwnerChange>, WorldCommitCoordinatorError> =>
+  coordinator.commit(request).pipe(Effect.catchTags({
+    WorldWriteInvalidBatch: (failure) => Effect.fail(failure),
+    WorldWriteChunkUnavailable: (failure) => Effect.fail(failure),
+    WorldRevisionConflict: (failure) => Effect.fail(failure),
+    DimensionRevisionConflict: (failure) => Effect.fail(failure),
+    // A stale chunk with no current revision was unloaded or evicted
+    // between prepare and publish. A present revision means a write or reload
+    // bypassed the coordinator, which wiring must rule out.
+    WorldWriteStale: (failure) => failure.actualRevision._tag === 'None'
+      ? Effect.fail(new WorldWriteChunkUnavailable({ dimension: failure.dimension, chunk: failure.key }))
+      : dieUnexpected(failure),
+  }, (failure) => dieUnexpected(failure)))
 
 export const commitBlockBatch = (
   coordinator: WorldCommitCoordinatorApi,
   expectedDimension: Dimension,
   batch: WorldWriteBatch,
+  changes: ReadonlyArray<ReplicatedOwnerCandidate> = [],
 ): Effect.Effect<Readonly<{ commit: WorldWriteCommit; delta: ReplicatedWorldDelta<ReplicatedOwnerChange> }>,
   WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteChunkUnavailable> => Effect.gen(function* () {
     yield* validateBeforeCommit(batch)
@@ -76,7 +95,7 @@ export const commitBlockBatch = (
         chunk: chunkKeyOfPosition(outOfWorld.position),
       }))
     }
-    const delta = yield* coordinator.commit(commitRequestOf(batch)).pipe(
+    const delta = yield* commitCoordinatorRequest(coordinator, commitRequestOf(batch, changes)).pipe(
       Effect.catchTags({
         WorldWriteInvalidBatch: (error) => Effect.fail(error),
         WorldWriteChunkUnavailable: (error) => Effect.fail(error),
@@ -97,12 +116,6 @@ export const commitBlockBatch = (
           expectedDimensionRevision: error.expected,
           currentDimensionRevision: error.actual,
         })),
-        // A stale chunk with no current revision was unloaded or evicted
-        // between prepare and publish. A present revision means a write or reload
-        // bypassed the coordinator, which wiring must rule out.
-        WorldWriteStale: (error) => error.actualRevision._tag === 'None'
-          ? Effect.fail(new WorldWriteChunkUnavailable({ dimension: batch.dimension, chunk: error.key }))
-          : dieUnexpected(error),
       }, (error) => dieUnexpected(error)),
     )
     const commit = yield* Schema.decodeEffect(WorldWriteCommitSchema)({
