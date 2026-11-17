@@ -1,6 +1,5 @@
 export * from "./anvil-network.js"
 export * from "./anvil-repair.js"
-export * from "./brewing-network.js"
 export * from "./crafting-network.js"
 export * from "./enchanting-network.js"
 export * from "./ender-dragon-network.js"

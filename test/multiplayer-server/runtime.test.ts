@@ -606,7 +606,7 @@ describe('multiplayer WebSocket runtime', () => {
       seed: 73,
       stateFile,
       installSignalHandlers: false,
-    })).rejects.toThrow(/Failed to read multiplayer state/)
+    })).resolves.toMatchObject(Result.fail({ _tag: 'SavedServerStateFailure', path: stateFile, filePath: stateFile, reason: 'invalid multiplayer state JSON' }))
   })
 
   it('lets legacy players reclaim a lost browser token and then rotates normally', async () => {
@@ -793,44 +793,35 @@ describe('multiplayer WebSocket runtime', () => {
     socket.close()
   })
 
-  it.each([
-    { name: 'revision', state: { revision: Number.MAX_SAFE_INTEGER + 1 } },
-    { name: 'wither snapshot', state: { wither: {} } },
-    { name: 'wither revision', state: { witherRevision: -1 } },
-    { name: 'lever position', state: { levers: [{ at: {}, active: true }] } },
-    { name: 'ender dragon encounter', state: { enderDragon: {} } },
-    { name: 'ender dragon revision', state: { enderDragonRevision: -1 } },
-    { name: 'brewing stand state', state: { brewingStands: [{ at: { x: 0, y: 0, z: 0 }, state: {} }] } },
-    { name: 'status effect state', state: { statusEffects: [{ player: 'alice', state: {} }] } },
-    { name: 'anvil name slot', state: { anvilNames: [{ player: 'alice', names: [{ slot: -1, name: 'x' }] }] } },
-    { name: 'enchanted item', state: { enchantments: [{ player: 'alice', seed: 1, items: [{ slot: 0, item: {} }] }] } },
-  ])('refuses persisted authority state with invalid $name', async ({ state: invalidState }) => {
+  it.each([1, 2, 3].flatMap((format) => [
+    { name: 'revision', state: { revision: Number.MAX_SAFE_INTEGER + 1 }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'wither snapshot', state: { wither: {} }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'wither revision', state: { witherRevision: -1 }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'lever position', state: { levers: [{ at: {}, active: true }] }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'ender dragon encounter', state: { enderDragon: {} }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'ender dragon revision', state: { enderDragonRevision: -1 }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'brewing stand state', state: { brewingStands: [{ at: { x: 0, y: 0, z: 0 }, state: {} }] },
+      path: 'brewingStands', reason: format === 3 ? 'invalid-wire' : 'invalid legacy brewing state' },
+    { name: 'status effect state', state: { statusEffects: [{ player: 'alice', state: {} }] }, path: 'statusEffects', reason: 'invalid status effect state' },
+    { name: 'anvil name slot', state: { anvilNames: [{ player: 'alice', names: [{ slot: -1, name: 'x' }] }] }, path: 'state', reason: 'invalid saved server state' },
+    { name: 'enchanted item', state: { enchantments: [{ player: 'alice', seed: 1, items: [{ slot: 0, item: {} }] }] }, path: 'state', reason: 'invalid saved server state' },
+  ].map((entry) => ({ ...entry, format }))))('refuses format $format persisted authority state with invalid $name', async ({ format, state: invalidState, path, reason }) => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-server-')), 'state.json')
     await writeFile(stateFile, JSON.stringify({
-      format: 1,
-      worldId: 'invalid-authority-boundary-world',
-      seed: 73,
-      state: {
-        revision: 0,
-        blocks: [],
-        ...invalidState,
-      },
+      format, worldId: 'invalid-authority-boundary-world', seed: 73,
+      state: { revision: 0, blocks: [], ...invalidState },
     }), 'utf8')
 
     await expect(startMultiplayerServer({
-      host: '127.0.0.1',
-      port: 0,
-      worldId: 'invalid-authority-boundary-world',
-      seed: 73,
-      stateFile,
-      installSignalHandlers: false,
-    })).rejects.toThrow(/does not match world/)
+      host: '127.0.0.1', port: 0, worldId: 'invalid-authority-boundary-world', seed: 73,
+      stateFile, installSignalHandlers: false,
+    })).resolves.toEqual(Result.fail({ _tag: 'SavedServerStateFailure', path, reason, filePath: stateFile }))
   })
 
-  it('refuses persisted authority state with invalid nested values', async () => {
+  it.each([1, 2, 3])('refuses format %s persisted authority state with invalid nested values', async (format) => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'mc-compose-server-')), 'state.json')
     await writeFile(stateFile, JSON.stringify({
-      format: 1,
+      format,
       worldId: 'invalid-authority-world',
       seed: 73,
       state: {
@@ -847,6 +838,6 @@ describe('multiplayer WebSocket runtime', () => {
       seed: 73,
       stateFile,
       installSignalHandlers: false,
-    })).rejects.toThrow(/does not match world/)
+    })).resolves.toEqual(Result.fail({ _tag: 'SavedServerStateFailure', path: 'state', reason: 'invalid saved server state', filePath: stateFile }))
   })
 })

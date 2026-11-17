@@ -1,6 +1,5 @@
 import type { WireText } from '@nerima-games/mx-multiplayer'
 import { ANVIL_MAX_WIRE_LENGTH } from '../multiplayer-shared/anvil-network.js'
-import { BREWING_MAX_WIRE_LENGTH } from '../multiplayer-shared/brewing-network.js'
 import { CRAFTING_MAX_WIRE_LENGTH } from '../multiplayer-shared/crafting-network.js'
 import { ENCHANTING_MAX_WIRE_LENGTH } from '../multiplayer-shared/enchanting-network.js'
 import { ENDER_DRAGON_MAX_WIRE_LENGTH } from '../multiplayer-shared/ender-dragon-network.js'
@@ -16,7 +15,6 @@ export const unknownRecord = (value: unknown): UnknownRecord | undefined =>
 export const specializedFrameWireLengths: ReadonlyMap<string, number> = new Map([
   ['PlayerDamageCommand', PLAYER_DAMAGE_MAX_WIRE_LENGTH],
   ['CraftingCommand', CRAFTING_MAX_WIRE_LENGTH],
-  ['BrewingCommand', BREWING_MAX_WIRE_LENGTH],
   ['AnvilCommand', ANVIL_MAX_WIRE_LENGTH],
   ['EnchantingCommand', ENCHANTING_MAX_WIRE_LENGTH],
   ['WitherCommand', WITHER_MAX_WIRE_LENGTH],

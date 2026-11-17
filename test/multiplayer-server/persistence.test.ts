@@ -3,13 +3,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
-  emptyBrewingStandState,
   emptyStatusEffectState,
+  applyStatusEffect,
   initialEnderDragonEncounter,
 } from '@nerima-games/mx-gameplay'
 import { EntityId, PlayerId, PlayerName, encodeFrame, type ContainerKind } from '@nerima-games/mx-multiplayer'
 import { PositionAxis, position, itemStackFromUnknown } from '@nerima-games/mc-kernel'
-import { CHEST_CONTAINER_CAPACITY, containerCapacity, durabilityForItem, LegacyItemStackSchema, WitherProjectileSpeed, witherSkullProjectile } from '@nerima-games/mc-sim'
+import { emptyBrewingState, CHEST_CONTAINER_CAPACITY, containerCapacity, durabilityForItem, LegacyItemStackSchema, WitherProjectileSpeed, witherSkullProjectile } from '@nerima-games/mc-sim'
 import { Option, Result, Schema } from 'effect'
 import fc from 'fast-check'
 import { describe, expect, it, vi } from 'vitest'
@@ -156,7 +156,7 @@ describe('multiplayer state file round trip', () => {
     witherRevision: 2,
     enderDragon: initialEnderDragonEncounter(),
     enderDragonRevision: 3,
-    brewingStands: [{ at: { x: 4, y: 64, z: 4 }, state: emptyBrewingStandState() }],
+    brewingStands: [{ at: { x: 4, y: 64, z: 4 }, state: Result.getOrThrow(emptyBrewingState()) }],
     statusEffects: [{ player: alice, state: emptyStatusEffectState() }],
     anvilNames: [{ player: alice, names: [{ slot: 0, name: 'Endbringer' }] }],
     enchantments: [{
@@ -164,6 +164,11 @@ describe('multiplayer state file round trip', () => {
       seed: 73,
       items: [{ slot: 0, item: { item: 'stone', durability: null, enchantments: [] } }],
     }],
+  })
+
+  const legacyPopulatedState = () => ({
+    ...fullyPopulatedState(),
+    brewingStands: [{ at: { x: 4, y: 64, z: 4 }, state: { fuelUnits: 0 } }],
   })
 
   it.each([
@@ -198,7 +203,27 @@ describe('multiplayer state file round trip', () => {
   })
 
 
-  it('migrates format 1 items and writes LegacyItemStackSchema values for every item-bearing field in format 2', async () => {
+  it('preserves hidden status effect chains through saving and reloading', async () => {
+    const path = join(await mkdtemp(join(tmpdir(), 'server-hidden-effects-')), 'state.json')
+    const lower = Result.getOrThrow(applyStatusEffect(emptyStatusEffectState(), {
+      type: 'regeneration', durationSecs: 60, amplifier: 0,
+    })).state
+    const stacked = Result.getOrThrow(applyStatusEffect(lower, {
+      type: 'regeneration', durationSecs: 5, amplifier: 1,
+    })).state
+    expect(stacked.effects[0]?.hiddenEffects).toHaveLength(1)
+    expect(stacked.effects[0]?.hiddenEffects?.[0]).toMatchObject({ amplifier: 0, remainingSecs: 60 })
+    const state = { ...fullyPopulatedState(), statusEffects: [{ player: alice, state: stacked }] }
+    await persistState(path, worldId, seed, state)
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({
+      format: 3, state: { statusEffects: [{ state: stacked }] },
+    })
+    const loaded = Result.getOrThrow(await loadServerState(path, worldId, seed))
+    expect(loaded?.statusEffects).toStrictEqual(state.statusEffects)
+    expect(loaded).toStrictEqual(state)
+  })
+
+  it('migrates format 1 items and writes LegacyItemStackSchema values for every item-bearing field in format 3', async () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-items-format-')), 'state.json')
     const oldContainer = {
       containerId: `${worldId}:0,64,0`, kind: 'chest',
@@ -206,7 +231,7 @@ describe('multiplayer state file round trip', () => {
         ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)],
     }
     const legacy = {
-      ...fullyPopulatedState(),
+      ...legacyPopulatedState(),
       inventories: [{ player: alice, state: {
         slots: [{ item: 'stone', count: 8 }], selectedSlot: 0,
         equipment: { head: null, chest: null, legs: null, feet: null,
@@ -227,7 +252,7 @@ describe('multiplayer state file round trip', () => {
     })
     await persistState(stateFile, worldId, seed, migrated)
     const saved: unknown = JSON.parse(await readFile(stateFile, 'utf8'))
-    expect(saved).toMatchObject({ format: 2, state: {
+    expect(saved).toMatchObject({ format: 3, state: {
       inventories: [{ state: { slots: [{ item: 'stone', count: 8, components: null }],
         equipment: { offhand: { item: 'bow', count: 1, components: null, durability: { current: 128, max: 384 } } } } }],
       containers: [{ slots: [{ item: 'bow', count: 1, components: null, durability: { current: 128, max: 384 } },
@@ -253,15 +278,13 @@ describe('multiplayer state file round trip', () => {
     }] }
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-component-round-trip-')), 'state.json')
     await persistState(stateFile, worldId, seed, state)
-    expect(JSON.parse(await readFile(stateFile, 'utf8'))).toMatchObject({ format: 2, state: { containers: [{ slots: [
+    expect(JSON.parse(await readFile(stateFile, 'utf8'))).toMatchObject({ format: 3, state: { containers: [{ slots: [
       expect.objectContaining({ components: expect.objectContaining({ enchantments: { 'minecraft:power': 3 } }),
         durability: { current: 128, max: 384 } }),
       ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null),
     ] }] } })
     const loaded = Option.getOrThrow(Option.fromUndefinedOr(Result.getOrThrow(await loadServerState(stateFile, worldId, seed))))
-    expect(loaded).toStrictEqual({
-      ...state, brewingStands: [{ at: { x: 4, y: 64, z: 4 }, state: { fuelUnits: 0 } }],
-    })
+    expect(loaded).toStrictEqual(state)
     expect(loaded.containers).toStrictEqual(state.containers)
     const persisted: Array<MultiplayerServerState> = []
     const core = Result.getOrThrow(makeMultiplayerServerCore({
@@ -348,7 +371,7 @@ describe('multiplayer state file round trip', () => {
 
   it('migrates omitted legacy sword durability to the public default while rejecting explicit null', async () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-legacy-durable-item-')), 'state.json')
-    const state = { ...fullyPopulatedState(), containers: [{
+    const state = { ...legacyPopulatedState(), containers: [{
       containerId: `${worldId}:0,64,0`, kind: 'chest',
       slots: [{ item: 'diamond_sword', count: 1 }, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)],
     }] }
@@ -424,9 +447,7 @@ describe('multiplayer state file round trip', () => {
     }] }
     await persistState(stateFile, worldId, seed, state)
     const loaded = Result.getOrThrow(await loadServerState(stateFile, worldId, seed))
-    expect(loaded).toStrictEqual({
-      ...state, brewingStands: [{ at: { x: 4, y: 64, z: 4 }, state: { fuelUnits: 0 } }],
-    })
+    expect(loaded).toStrictEqual(state)
     expect(loaded?.containers).toStrictEqual(state.containers)
   })
 
@@ -440,7 +461,7 @@ describe('multiplayer state file round trip', () => {
   it.each(legacyContainerKinds)('pads a legacy short $label container without losing its items', async ({ kind }) => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-legacy-capacity-')), 'state.json')
     await writeFile(stateFile, JSON.stringify({ format: 1, worldId, seed, state: {
-      ...fullyPopulatedState(), containers: [{ containerId: `${worldId}:0,64,0`, ...(kind === undefined ? {} : { kind }),
+      ...legacyPopulatedState(), containers: [{ containerId: `${worldId}:0,64,0`, ...(kind === undefined ? {} : { kind }),
         slots: [{ item: 'stone', count: 3 }] }],
     } }), 'utf8')
     const loaded = Option.getOrThrow(Option.fromUndefinedOr(Result.getOrThrow(await loadServerState(stateFile, worldId, seed))))
@@ -455,7 +476,7 @@ describe('multiplayer state file round trip', () => {
   it('rejects an oversized legacy container without truncating its saved slots', async () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-legacy-oversize-')), 'state.json')
     const contents = JSON.stringify({ format: 1, worldId, seed, state: {
-      ...fullyPopulatedState(), containers: [{ containerId: `${worldId}:0,64,0`, kind: 'hopper',
+      ...legacyPopulatedState(), containers: [{ containerId: `${worldId}:0,64,0`, kind: 'hopper',
         slots: Array.from({ length: containerCapacity('hopper') + 1 }, () => ({ item: 'stone', count: 1 })) }],
     } })
     await writeFile(stateFile, contents, 'utf8')
@@ -491,7 +512,7 @@ describe('multiplayer state file round trip', () => {
     expect(await writeServerState(stateFile, worldId, seed, bad)).toMatchObject(Result.fail(failure))
     expect(await readFile(stateFile, 'utf8')).toBe(before)
     expect(await loadServerState(stateFile, worldId, seed)).toEqual(Result.succeed(good))
-    await writeFile(stateFile, JSON.stringify({ format: 2, worldId, seed, state: bad }), 'utf8')
+    await writeFile(stateFile, JSON.stringify({ format: 2, worldId, seed, state: { ...bad, brewingStands: legacyPopulatedState().brewingStands } }), 'utf8')
     expect(await loadServerState(stateFile, worldId, seed)).toMatchObject(Result.fail(failure))
   })
 
@@ -499,7 +520,7 @@ describe('multiplayer state file round trip', () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-components-property-')), 'state.json')
     await fc.assert(fc.asyncProperty(fc.jsonValue(), async (components) => {
       await writeFile(stateFile, JSON.stringify({ format: 2, worldId, seed, state: {
-        ...fullyPopulatedState(), containers: [{ containerId: 'overworld:0,64,0', kind: 'chest',
+        ...legacyPopulatedState(), containers: [{ containerId: 'overworld:0,64,0', kind: 'chest',
           slots: [{ item: 'stone', count: 1, components, durability: null }, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)] }],
       } }), 'utf8')
       const expected = Schema.decodeUnknownResult(LegacyItemStackSchema)({ item: 'stone', count: 1, components })
@@ -567,7 +588,7 @@ describe('multiplayer state file round trip', () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-legacy-hopper-file-')), 'state.json')
     const hopperAt = { x: 1, y: 64, z: 0 }
     await writeFile(stateFile, JSON.stringify({ format: 1, worldId, seed, state: {
-      ...fullyPopulatedState(), blocks: [{ at: hopperAt, block: 'hopper' }],
+      ...legacyPopulatedState(), blocks: [{ at: hopperAt, block: 'hopper' }],
       containers: [{ containerId: `${worldId}:1,64,0`, kind: 'hopper', slots: [] }],
     } }), 'utf8')
     const loaded = Option.getOrThrow(Option.fromUndefinedOr(Result.getOrThrow(await loadServerState(stateFile, worldId, seed))))
@@ -583,7 +604,7 @@ describe('multiplayer state file round trip', () => {
   it('migrates namespaced world container IDs only in format 1 and rejects world IDs in canonical format 2', async () => {
     const namespacedWorld = 'legacy:round-trip-world'
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-container-id-format-')), 'state.json')
-    const legacy = { ...fullyPopulatedState(), containers: [{
+    const legacy = { ...legacyPopulatedState(), containers: [{
       containerId: `${namespacedWorld}:0,64,0`, kind: 'chest', slots: [{ item: 'stone', count: 1 }],
     }] }
     await writeFile(stateFile, JSON.stringify({ format: 1, worldId: namespacedWorld, seed, state: legacy }), 'utf8')
@@ -599,7 +620,7 @@ describe('multiplayer state file round trip', () => {
     }))
     expect(await readFile(stateFile, 'utf8')).toBe(before)
     await writeFile(stateFile, JSON.stringify({ format: 2, worldId: namespacedWorld, seed, state: {
-      ...fullyPopulatedState(), containers: [{
+      ...legacyPopulatedState(), containers: [{
         containerId: `${namespacedWorld}:0,64,0`, kind: 'chest',
         slots: [{ item: 'stone', count: 1, components: null, durability: null },
           ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)],
@@ -615,7 +636,7 @@ describe('multiplayer state file round trip', () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'server-legacy-id-newline-')), 'state.json')
     const containerId = `${worldId}:1,64,0\n`
     const before = JSON.stringify({ format: 1, worldId, seed, state: {
-      ...fullyPopulatedState(), containers: [{ containerId, kind: 'chest', slots: [] }],
+      ...legacyPopulatedState(), containers: [{ containerId, kind: 'chest', slots: [] }],
     } })
     await writeFile(stateFile, before, 'utf8')
     expect(await loadServerState(stateFile, worldId, seed)).toMatchObject(Result.fail({

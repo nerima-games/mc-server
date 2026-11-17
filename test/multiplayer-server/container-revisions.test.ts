@@ -74,7 +74,7 @@ const openCore = (state: MultiplayerServerState) => {
 }
 
 describe('canonical container commands and storage revisions', () => {
-  it('retains table-only tool damage through deposit, format 2 save, reboot and withdrawal, publishing both storage clocks', async () => {
+  it('retains table-only tool damage through deposit, format 3 save, reboot and withdrawal, publishing both storage clocks', async () => {
     const state: MultiplayerServerState = {
       revision: 0,
       blocks: [{ at: { x: 1, y: 64, z: 0 }, block: 'chest' }],
@@ -117,7 +117,7 @@ describe('canonical container commands and storage revisions', () => {
     const stateFile = join(await mkdtemp(join(tmpdir(), 'container-tool-revisions-')), 'state.json')
     Result.getOrThrow(await writeServerState(stateFile, WORLD, 42, saved))
     const encoded: unknown = JSON.parse(await readFile(stateFile, 'utf8'))
-    expect(encoded).toMatchObject({ format: 2, state: { containers: [{
+    expect(encoded).toMatchObject({ format: 3, state: { containers: [{
       containerId: CHEST_ID,
       slots: [{ item: 'diamond_sword', count: 1, components: null, durability: DAMAGED }, ...Array.from({ length: 26 }, () => null)],
     }] } })

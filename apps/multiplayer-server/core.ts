@@ -31,7 +31,7 @@ import {
 import { itemStackFromUnknown, maxStackCountForStack, BlockStateFacingSchema, type BlockStateFacing, itemStackEqualsIgnoringCount, AIR_BLOCK_ID, WorldWriteBatchSchema, BlockPositionSchema, EncodedBlockStateSchema, defaultBlockState, blockStateDefinitionOf, type EncodedBlockState, decodeBlockState, encodeBlockState, type BlockStateCodecFailure, type BlockStateValues, type WorldWriteBatch, type WorldWriteCommit, type WorldWriteConflict, type WorldWriteInvalidBatch, type WorldWriteChunkUnavailable, type WorldRevision, type DimensionRevision, WorldIdSchema, DimensionIdSchema, blockIdOf, blockPosition, blockTypeOfId, BlockAxis, BlockId, chunkCoordOfBlock, CHUNK_SIZE_XZ, localCoordOfBlock, type ChunkCoord, DeltaTimeSecs, EnchantmentLevel, EntityHealthPoints, EntityKind, EntitySerial, isBlockType, isItemType, itemIdOf, itemTypeOfId, maxStackCountOfItem, PositionAxis, propertyOfBlockId, SimulationTick, StackCount, type ItemId, type ItemType, type Position } from '@nerima-games/mc-kernel'
 import { ContainerSlotSchema, applyRedstoneHostEvents, type RedstoneWorldRuntimeService, type RedstoneHostLookup, type RedstoneHostWritePort, PistonBlockOffsetSchema, pistonPositionAt, validatePistonPlan, type PistonCellRead, type PistonMovementPlan } from '@nerima-games/mx-redstone'
 import { blockIndex, readBlock, type Chunk, type ChunkWithBlockStates, CHUNK_HEIGHT, CHUNK_VOLUME, END_PORTAL_FRAME_OFFSETS, endPortalCenterForStronghold, getBlockAt, nearestStrongholdSite, NoiseSeed as WorldgenNoiseSeed, type ChunkSource, type ChunkStoreApi, type ChunkStoreError, type ChunkPersistenceError, type Dimension, type ChunkBiomeType, type ReadonlyChunkWithBlockStates } from '@nerima-games/mc-worldgen'
-import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, FurnaceStateSchema as SimFurnaceStateSchema, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange, type ContainerStoredStack, type Container, type ContainerStorageSnapshot, type ContainerStorageServiceApi, type HopperServiceApi, type ContainerStorageServiceFailure, ContainerStorageSnapshotSchema, containerStorageOwnerRegistration, hopperOwnerRegistration, CONTAINER_STORAGE_REPLICATED_OWNER_ID, type ReplicatedOwnerCandidate } from '@nerima-games/mc-sim'
+import { advanceFurnace, DEFAULT_TICK_DURATION, HungerPoints, type Intent, EYE_LEVEL_OFFSET, containerCapacity, craftFromGrid, craftGrid, equipmentItem, ExperienceLevel, forwardVector, isValidDurabilityForItem, itemStack, levelForTotalExperience, planExplosion, raycastArrowBlock, STARTER_RECIPES, witherSkullProjectile, type WitherSkullProjectileDescriptor, targetBlockFromPlayerPose, TotalExperience, totalExperienceAtLevel, type BlockTarget, type FurnaceFailure as SimFurnaceFailure, type FurnaceState as SimFurnaceState, type WorldCommitCoordinatorError, type ReplicatedWorldDelta, type ReplicatedOwnerChange, type ContainerStoredStack, type Container, type ContainerStorageSnapshot, type ContainerStorageServiceApi, type HopperServiceApi, type ContainerStorageServiceFailure, ContainerStorageSnapshotSchema, containerStorageOwnerRegistration, hopperOwnerRegistration, CONTAINER_STORAGE_REPLICATED_OWNER_ID, type ReplicatedOwnerCandidate } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   BLAZE_XP_REWARD,
@@ -63,22 +63,13 @@ import {
   ZOMBIE_XP_REWARD,
   ZOMBIFIED_PIGLIN_KIND,
   applyStatusEffect,
-  acceptBrewingBottle,
-  acceptBrewingFuel,
-  acceptBrewingIngredient,
-  collectBrewingBottle,
-  copyBrewingStandState,
+  statusEffectOfPotion,
   copyStatusEffectState,
-  drinkBrewingPotion,
-  emptyBrewingStandState,
   emptyStatusEffectState,
-  isValidBrewingStandState,
-  isValidStatusEffectState,
   POISON_DAMAGE_POINTS,
   POISON_MINIMUM_HEALTH_POINTS,
   REGENERATION_HEAL_POINTS,
   PLAYER_MAXIMUM_HEALTH_POINTS,
-  tickBrewingStand,
   tickStatusEffects,
   blockLoot,
   isBucketItem,
@@ -122,8 +113,6 @@ import {
   type EnvironmentalContactDamageState,
   type Explosion,
   type FishingSession,
-  type BrewingBottle,
-  type BrewingStandState,
   type StatusEffectState,
   applyEnchantmentOffer,
   advanceEnderDragonEncounter,
@@ -182,7 +171,8 @@ import {
   type PlayerDamageWireMessage,
 } from '../multiplayer-shared/player-damage-network.js'
 import { decodeCraftingWireMessage, type CraftingCommand, type CraftingCommandResult } from '../multiplayer-shared/crafting-network.js'
-import { decodeBrewingWireMessage, type BrewingCommand, type BrewingCommandResult, type BrewingWireMessage } from '../multiplayer-shared/brewing-network.js'
+import { advanceBrewing, emptyBrewingState, brewingStateToWire, furnaceStateFromWire, insertBrewingItem, setBrewingBottle, brewingDrops, type BrewingState, type BrewingCommand, type BrewingCommandResult, type BrewingWireMessage, type BrewingRejectionReason, type BrewingWireConversionFailure, type FurnaceWireConversionFailure, type BrewingOperationFailure, type BrewingStandWire, statusEffectsToWire, type StatusEffectsWireFailure, validateServerStatusEffects } from './brewing-stands.js'
+import type { SavedServerStateFailure } from './legacy-state.js'
 import {
   decodeAnvilWireMessage,
   isValidAnvilName,
@@ -238,13 +228,7 @@ type WitherRuntimeFailure = ResultFailure<
   | ReturnType<typeof damageRuntimeWither>
   | ReturnType<typeof advanceWitherRuntime>
 >
-type FurnaceStackFailure = ResultFailure<ReturnType<typeof itemStack>>
-type FurnaceStateConstructionFailure = FurnaceStackFailure | Schema.SchemaError | Readonly<{
-  readonly _tag: 'UnknownFurnaceItemType'
-  readonly slot: 'input' | 'fuel' | 'output'
-  readonly item: string
-}>
-type FurnaceAdvanceFailure = SimFurnaceFailure | FurnaceStateConstructionFailure
+type FurnaceAdvanceFailure = SimFurnaceFailure | FurnaceWireConversionFailure
 type ExplosionPlanFailure = ResultFailure<ReturnType<typeof planExplosion>>
 type BlockRegistryFailure = ResultFailure<ReturnType<typeof propertyOfBlockId> | ReturnType<typeof blockTypeOfId>>
 type BlockIdFailure = ResultFailure<ReturnType<typeof BlockId.result>>
@@ -288,12 +272,17 @@ type PreparedBlockBatch = Readonly<{
 // Explicit host limits are required: the pinned protocol codec exports no default limits.
 // createReplicatedOwnerRegistry validates them against its internal caps. This path has no owner states.
 const replicatedOwners = Result.getOrThrow(createReplicatedOwnerRegistry([], {
-  maxCollectionItems: 31_149, maxDeltaBlockChanges: 31_149, maxSnapshotBlockReads: 31_149,
+  maxCollectionItems: 31_148, maxDeltaBlockChanges: 31_148, maxSnapshotBlockReads: 31_148,
   maxDepth: 13, maxDeltaFrameBytes: 4_194_304, maxSnapshotFrameBytes: 4_194_304,
   maxRegisteredOwners: 0, ownerStates: [],
 }))
 
 export type MultiplayerServerCoreFailure =
+  | Readonly<{ _tag: 'BrewingEncodingFailure'; failure: ProtocolError }>
+  | Readonly<{ _tag: 'StatusEffectApplyFailure'; failure: ResultFailure<ReturnType<typeof applyStatusEffect>> }>
+  | StatusEffectsWireFailure
+  | SavedServerStateFailure
+  | Readonly<{ _tag: 'BrewingStateFailure'; failure: BrewingOperationFailure | BrewingWireConversionFailure }>
   | Readonly<{ _tag: 'WorldWriteEncodingFailure'; failure: ProtocolError }>
   | Readonly<{ _tag: 'WorldWriteFailure'; failure: BlockWriteError }>
   | Readonly<{ _tag: 'HopperFailure'; failure: HopperHostFailure | MultiplayerServerCoreFailure }>
@@ -503,7 +492,7 @@ export interface MultiplayerServerState {
   readonly witherRevision?: number
   readonly enderDragon?: EnderDragonEncounterSnapshot
   readonly enderDragonRevision?: number
-  readonly brewingStands?: ReadonlyArray<Readonly<{ at: BlockPos; state: BrewingStandState }>>
+  readonly brewingStands?: ReadonlyArray<Readonly<{ at: BlockPos; state: BrewingState }>>
   readonly statusEffects?: ReadonlyArray<Readonly<{ player: PlayerId; state: StatusEffectState }>>
   readonly anvilNames?: ReadonlyArray<Readonly<{
     player: PlayerId
@@ -860,6 +849,7 @@ interface MutableVitalsState {
 
 interface MutableFurnaceState {
   readonly furnaceId: string
+  readonly station: FurnaceState['station']
   input: ItemStack | null
   fuel: ItemStack | null
   output: ItemStack | null
@@ -875,7 +865,6 @@ type CommandDecision =
       deltas: (revision: number) => ReadonlyArray<AuthoritativeDelta>
       messages?: (revision: number) => ReadonlyArray<NetworkMessage>
       frames?: ReadonlyArray<WireText>
-      statusEffectDeltas?: (revision: number) => ReadonlyArray<BrewingWireMessage>
       worldSnapshotRequired?: boolean
       snapshotBroadcastRequired?: boolean
     }>
@@ -1030,56 +1019,32 @@ const hasNondefaultContainerComponents = (stack: ContainerStoredStack): boolean 
 
 const furnaceSnapshot = (state: MutableFurnaceState): FurnaceState => ({
   furnaceId: state.furnaceId,
+  station: state.station,
   input: cloneStack(state.input),
   fuel: cloneStack(state.fuel),
   output: cloneStack(state.output),
   burnTicksRemaining: state.burnTicksRemaining,
+  burnTicksTotal: state.burnTicksTotal,
   cookTicks: state.cookTicks,
 })
 
 type SimItemStack = NonNullable<SimFurnaceState['input']>
 
-const toSimulationStack = (
-  stack: ItemStack | null,
-  slot: 'input' | 'fuel' | 'output',
-): Result.Result<SimItemStack | undefined, FurnaceStateConstructionFailure> => {
-  if (stack === null) return Result.succeed(undefined)
-  if (!isItemType(stack.item)) return Result.fail({ _tag: 'UnknownFurnaceItemType', slot, item: stack.item })
-  return itemStack(stack.item, stack.count)
-}
 
 const fromSimulationStack = (stack: SimItemStack | undefined): ItemStack | null =>
   stack === undefined ? null : { item: stack.item, count: stack.count }
 
-/** A saved furnace as the core holds it; the wire snapshot stores remaining burn time only. */
+/** A saved furnace keeps the wire interval and station unchanged across reloads. */
 const furnaceFromSnapshot = (state: MultiplayerServerState['furnaces'][number]): MutableFurnaceState => ({
   ...state,
   input: cloneStack(state.input),
   fuel: cloneStack(state.fuel),
   output: cloneStack(state.output),
-  // Continue from that exact interval length.
-  burnTicksTotal: state.burnTicksRemaining,
 })
 
 const furnaceSimulationState = (
   state: MutableFurnaceState,
-): Result.Result<SimFurnaceState, FurnaceStateConstructionFailure> => {
-  const input = toSimulationStack(state.input, 'input')
-  if (Result.isFailure(input)) return Result.fail(input.failure)
-  const fuel = toSimulationStack(state.fuel, 'fuel')
-  if (Result.isFailure(fuel)) return Result.fail(fuel.failure)
-  const output = toSimulationStack(state.output, 'output')
-  if (Result.isFailure(output)) return Result.fail(output.failure)
-  return Schema.decodeUnknownResult(SimFurnaceStateSchema)({
-    station: 'furnace',
-    input: input.success,
-    fuel: fuel.success,
-    output: output.success,
-    fuelTimeRemainingSecs: state.burnTicksRemaining / 20,
-    fuelTimeTotalSecs: state.burnTicksTotal / 20,
-    cookProgressSecs: state.cookTicks / 20,
-  })
-}
+): Result.Result<SimFurnaceState, FurnaceWireConversionFailure> => furnaceStateFromWire(furnaceSnapshot(state))
 
 const applyFurnaceSimulationState = (target: MutableFurnaceState, state: SimFurnaceState): void => {
   target.input = fromSimulationStack(state.input)
@@ -1146,7 +1111,7 @@ export interface MultiplayerServerCore {
   readonly disconnect: (clientId: ClientId) => Result.Result<void, MultiplayerServerCoreFailure>
   readonly detachPlayer: (clientId: ClientId) => Result.Result<RealmTransferPlayer | undefined, MultiplayerServerCoreFailure>
   readonly prepareRealmTransfer: () => Result.Result<WireText, MultiplayerServerCoreFailure>
-  readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText) => boolean
+  readonly acceptRealmTransfer: (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText) => Result.Result<boolean, MultiplayerServerCoreFailure>
   readonly snapshot: () => WorldSnapshot
   readonly applyHopperEvents: (runtime: RedstoneWorldRuntimeService) => Effect.Effect<Result.Result<void, MultiplayerServerCoreFailure>>
   readonly readHopperState: (at: BlockPos) => Result.Result<Readonly<{ facing: BlockStateFacing; enabled: boolean }>, MultiplayerServerCoreFailure>
@@ -1518,16 +1483,22 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const furnaces = new Map<string, MutableFurnaceState>(
     (options.initialState?.furnaces ?? []).map((state) => [state.furnaceId, furnaceFromSnapshot(state)]),
   )
-  const brewingStands = new Map<string, Readonly<{ at: BlockPos; state: BrewingStandState }>>(
-    (options.initialState?.brewingStands ?? [])
-      .filter(({ state }) => isValidBrewingStandState(state))
-      .map(({ at, state }) => [positionKey(at), { at: { ...at }, state: copyBrewingStandState(state) }]),
-  )
-  const statusEffects = new Map<PlayerId, StatusEffectState>(
-    (options.initialState?.statusEffects ?? [])
-      .filter(({ state }) => isValidStatusEffectState(state))
-      .map(({ player, state }) => [player, copyStatusEffectState(state)]),
-  )
+  const emptyStand = emptyBrewingState()
+  if (Result.isFailure(emptyStand)) return Result.fail({ _tag: 'BrewingStateFailure', failure: emptyStand.failure })
+  const emptyStandWire = brewingStateToWire(emptyStand.success)
+  if (Result.isFailure(emptyStandWire)) return Result.fail({ _tag: 'BrewingStateFailure', failure: emptyStandWire.failure })
+  const brewingStands = new Map<string, Readonly<{ at: BlockPos; state: BrewingState }>>()
+  for (const { at, state } of options.initialState?.brewingStands ?? []) {
+    const wire = brewingStateToWire(state)
+    if (Result.isFailure(wire)) return Result.fail({ _tag: 'BrewingStateFailure', failure: wire.failure })
+    brewingStands.set(positionKey(at), { at: { ...at }, state })
+  }
+  const statusEffects = new Map<PlayerId, StatusEffectState>()
+  for (const { player, state } of options.initialState?.statusEffects ?? []) {
+    const validated = validateServerStatusEffects(state)
+    if (Result.isFailure(validated)) return Result.fail(validated.failure)
+    statusEffects.set(player, validated.success)
+  }
   const anvilNames = new Map<PlayerId, Map<number, string>>(
     (options.initialState?.anvilNames ?? []).map(({ player, names }) => [player, new Map(
       names
@@ -1730,9 +1701,10 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   const sendCrafting = (client: ConnectedClient, message: CraftingCommandResult): void => {
     client.send(JSON.stringify(message))
   }
-  const sendBrewing = (client: ConnectedClient, message: BrewingWireMessage): void => {
-    client.send(JSON.stringify(message))
-  }
+  const encodeBrewing = (message: BrewingWireMessage): Result.Result<WireText, MultiplayerServerCoreFailure> =>
+    Result.mapError(encodeFrame(message, replicatedOwners), (failure): MultiplayerServerCoreFailure => ({ _tag: 'BrewingEncodingFailure', failure }))
+  const sendBrewing = (client: ConnectedClient, message: BrewingWireMessage): Result.Result<void, MultiplayerServerCoreFailure> =>
+    Result.map(encodeBrewing(message), (frame) => { client.send(frame) })
   const sendAnvil = (client: ConnectedClient, message: AnvilWireMessage): void => {
     client.send(JSON.stringify(message))
   }
@@ -1745,9 +1717,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
   }
   const broadcastEnderDragon = (message: EnderDragonWireMessage): void => {
     for (const client of clients.values()) if (client.playerId !== null) sendEnderDragon(client, message)
-  }
-  const broadcastBrewing = (message: BrewingWireMessage): void => {
-    for (const client of clients.values()) if (client.playerId !== null) sendBrewing(client, message)
   }
   const anvilNamesDelta = (player: PlayerId): PlayerAnvilNamesDelta => {
     return {
@@ -2127,23 +2096,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(isBlockWithinReach(actor, at) ? null : 'out-of-range')
   }
 
-  const brewingBottleFromItem = (item: string): BrewingBottle | undefined => {
-    if (item === 'water_bottle') return item
-    if (item === 'awkward_potion') return { potion: 'awkward' }
-    if (item === 'potion_of_swiftness') return { potion: 'speed' }
-    if (item === 'potion_of_poison') return { potion: 'poison' }
-    if (item === 'potion_of_regeneration') return { potion: 'regeneration' }
-    return undefined
-  }
-
-  const brewingBottleItem = (bottle: BrewingBottle): ItemStack['item'] => {
-    if (bottle === 'water_bottle') return bottle
-    if (bottle.potion === 'awkward') return 'awkward_potion'
-    if (bottle.potion === 'speed') return 'potion_of_swiftness'
-    if (bottle.potion === 'poison') return 'potion_of_poison'
-    return 'potion_of_regeneration'
-  }
-
   const persistentState = (): MultiplayerServerState => ({
     revision,
     blocks: [...blocks.values()].map((mutation) => ({ ...mutation, at: { ...mutation.at } })),
@@ -2171,7 +2123,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     witherRevision,
     enderDragon: enderDragonState,
     enderDragonRevision,
-    brewingStands: [...brewingStands.values()].map(({ at, state }) => ({ at: { ...at }, state: copyBrewingStandState(state) })),
+    brewingStands: [...brewingStands.values()].map(({ at, state }) => ({ at: { ...at }, state })),
     statusEffects: [...statusEffects].map(([player, state]) => ({ player, state: copyStatusEffectState(state) })),
     anvilNames: [...anvilNames].map(([player, names]) => ({
       player,
@@ -2727,6 +2679,12 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       // Status-effect state is load-validated or an mx-gameplay result, and resolveFoodUse validated the application.
       nextEffects = Result.getOrThrow(applyStatusEffect(nextEffects, effect)).state
     }
+    const visibleEffects = statusEffectsToWire(nextEffects)
+    if (Result.isFailure(visibleEffects)) return { accepted: false, reason: 'invalid-command', failure: visibleEffects.failure }
+    const effectsRevision = revisionAfter(1)
+    if (Result.isFailure(effectsRevision)) return { accepted: false, reason: 'invalid-command', failure: effectsRevision.failure }
+    const effectsFrames = Result.all(plan.effects.length === 0 ? [] : [encodeBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision: effectsRevision.success, player: message.player, state: visibleEffects.success })])
+    if (Result.isFailure(effectsFrames)) return { accepted: false, reason: 'invalid-command', failure: effectsFrames.failure }
     const respawnedPlayer = message.action === 'respawn' ? players.get(message.player) : undefined
     if (respawnedPlayer !== undefined) {
       const placed = writePositions([{ _tag: 'player', presence: respawnedPlayer, at: options.spawnAt, facing: respawnedPlayer.facing }])
@@ -2746,15 +2704,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       { _tag: 'PlayerVitalsDelta' as const, world: presence.world, revision: nextRevision, player: message.player, state: vitalsSnapshot(playerVitals) },
       ...(consumedSlot === undefined ? [] : [{ _tag: 'PlayerInventoryDelta' as const, world: presence.world, revision: nextRevision, player: message.player, state: inventorySnapshot(inventory) }]),
     ],
-    ...(plan.effects.length === 0 ? {} : {
-      statusEffectDeltas: (nextRevision: number) => [{
-        _tag: 'PlayerStatusEffectsDelta' as const,
-        world: worldId,
-        revision: nextRevision,
-        player: message.player,
-        state: copyStatusEffectState(nextEffects),
-      }],
-    }),
+    frames: effectsFrames.success,
     ...(respawnedPlayer === undefined ? {} : {
       messages: () => [{
         _tag: 'PlayerMove' as const,
@@ -3993,7 +3943,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     }
     for (const outboundMessage of outboundMessages) broadcast(outboundMessage)
     for (const frame of decision.frames ?? []) broadcastFrame(frame)
-    for (const statusEffectDelta of decision.statusEffectDeltas?.(revision) ?? []) broadcastBrewing(statusEffectDelta)
     if (decision.worldSnapshotRequired === true) broadcast(authoritativeSnapshot())
     if (decision.snapshotBroadcastRequired === true) broadcast(snapshot())
     return { accepted: true, message }
@@ -4504,104 +4453,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       sendEnchanting(client, result)
       return { accepted: true, message: enchantingMessage }
     }
-    const brewingMessage = decodeBrewingWireMessage(frame)
-    if (brewingMessage?._tag === 'BrewingCommand') {
-      if (client.playerId === null) return { accepted: false, reason: 'join-required' }
-      const command = brewingMessage
-      const resultKey = brewingResultKey(client.playerId, command.commandId)
-      const fingerprint = brewingFingerprint(command)
-      const cached = brewingResults.get(resultKey)
-      if (cached !== undefined) {
-        if (cached.fingerprint !== fingerprint) return { accepted: false, reason: 'invalid-command' }
-        sendBrewing(client, cached.result)
-        return cached.result.accepted ? { accepted: true, message: brewingMessage } : { accepted: false, reason: receiveReasonForRejection(cached.result.reason) }
-      }
-      const rejectBrewing = (
-        reason: Extract<BrewingCommandResult, { accepted: false }>['reason'],
-        receiveReason: Extract<ReceiveResult, { accepted: false }>['reason'] = 'invalid-command',
-        failure?: MultiplayerServerCoreFailure,
-      ): ReceiveResult => {
-        const result: BrewingCommandResult = { _tag: 'BrewingCommandResult', commandId: command.commandId, accepted: false, revision, reason }
-        if (failure === undefined) cacheBrewingResult(resultKey, fingerprint, result)
-        sendBrewing(client, result)
-        return failure === undefined
-          ? { accepted: false, reason: receiveReason }
-          : { accepted: false, reason: receiveReason, failure }
-      }
-      if (command.player !== client.playerId) return rejectBrewing('unauthorized-player', 'identity-spoof')
-      if (command.world !== worldId) return rejectBrewing('wrong-world', 'wrong-world')
-      if (command.expectedRevision !== revision) return rejectBrewing('stale-revision')
-      const playerId = client.playerId
-      const inventory = inventories.get(playerId)
-      const presence = players.get(playerId)
-      const playerVitals = vitals.get(playerId)
-      if (inventory === undefined || presence === undefined || playerVitals === undefined || playerVitals.health <= 0) return rejectBrewing('invalid-command')
-      const at = { ...command.at }
-      const access = facilityIsAccessible(playerId, at, 'brewing_stand')
-      if (Result.isFailure(access)) return rejectBrewing('invalid-command', 'invalid-command', access.failure)
-      if (access.success !== null) return rejectBrewing('invalid-command')
-      const current = brewingStands.get(positionKey(at))?.state
-      if (current === undefined) return rejectBrewing('invalid-command')
-      if (command.action._tag === 'open') {
-        const result: BrewingCommandResult = { _tag: 'BrewingCommandResult', commandId: command.commandId, accepted: true, revision }
-        cacheBrewingResult(resultKey, fingerprint, result)
-        sendBrewing(client, { _tag: 'BrewingStandDelta', world: worldId, revision, at, state: copyBrewingStandState(current) })
-        sendBrewing(client, result)
-        return { accepted: true, message: brewingMessage }
-      }
-      const reserved = revisionAfter(1)
-      if (Result.isFailure(reserved)) return rejectBrewing('invalid-command', 'invalid-command', reserved.failure)
-      let next = copyBrewingStandState(current)
-      let inventoryChanged = false
-      let effectsChanged = false
-      if (command.action._tag === 'insert') {
-        const source = inventory.slots[command.action.slot]
-        if (source === null || source === undefined || source.count < 1) return rejectBrewing('missing-ingredients')
-        const bottle = brewingBottleFromItem(source.item)
-        if (source.item === 'blaze_powder') {
-          const outcome = acceptBrewingFuel(next)
-          if (outcome[1]._tag !== 'Accepted') return rejectBrewing('invalid-command')
-          next = outcome[0]
-        } else if (bottle !== undefined) {
-          const outcome = acceptBrewingBottle(next, bottle)
-          if (outcome[1]._tag !== 'Accepted') return rejectBrewing('invalid-command')
-          next = outcome[0]
-        } else if (source.item === 'nether_wart' || source.item === 'sugar' || source.item === 'spider_eye' || source.item === 'ghast_tear') {
-          const outcome = acceptBrewingIngredient(next, source.item)
-          if (outcome[1]._tag !== 'Accepted') return rejectBrewing('invalid-command')
-          next = outcome[0]
-        } else return rejectBrewing('invalid-command')
-        inventory.slots[command.action.slot] = source.count === 1 ? null : { ...source, count: source.count - 1 }
-        inventoryChanged = true
-      } else if (command.action._tag === 'collect') {
-        const outcome = collectBrewingBottle(next)
-        if (outcome[1]._tag !== 'Collected') return rejectBrewing('invalid-command')
-        const nextSlots = inventory.slots.map(cloneStack)
-        if (addStackToInventory(nextSlots, outcome[1].returned) !== null) return rejectBrewing('no-room')
-        inventory.slots.splice(0, inventory.slots.length, ...nextSlots)
-        next = outcome[0]
-        inventoryChanged = true
-      } else {
-        const outcome = drinkBrewingPotion(next)
-        if (outcome[1]._tag !== 'Consumed') return rejectBrewing('invalid-command')
-        next = outcome[0]
-        // Status-effect state is load-validated or an mx-gameplay result, and the potion effect comes from mx-gameplay.
-        const applied = Result.getOrThrow(applyStatusEffect(statusEffects.get(playerId) ?? emptyStatusEffectState(), outcome[1].effect))
-        statusEffects.set(playerId, applied.state)
-        effectsChanged = true
-      }
-      brewingStands.set(positionKey(at), { at, state: next })
-      // revisionAfter(1) succeeded before the action changed any state, and nothing has advanced the revision since.
-      Result.getOrThrow(advanceRevision())
-      const result: BrewingCommandResult = { _tag: 'BrewingCommandResult', commandId: command.commandId, accepted: true, revision }
-      cacheBrewingResult(resultKey, fingerprint, result)
-      notifyStateChanged()
-      broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at, state: copyBrewingStandState(next) })
-      if (inventoryChanged) broadcast({ _tag: 'PlayerInventoryDelta', world: worldId, revision, player: playerId, state: inventorySnapshot(inventory) })
-      if (effectsChanged) broadcastBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision, player: playerId, state: copyStatusEffectState(statusEffects.get(playerId) as StatusEffectState) })
-      sendBrewing(client, result)
-      return { accepted: true, message: brewingMessage }
-    }
     const playerDamageMessage = decodePlayerDamageWireMessage(frame)
     if (playerDamageMessage?._tag === 'PlayerDamageCommand') {
       if (client.playerId === null) return { accepted: false, reason: 'join-required' }
@@ -4918,13 +4769,148 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     if (Result.isFailure(decoded)) return { accepted: false, reason: 'malformed-frame' }
     const message = decoded.success
 
+    if (message._tag === 'BrewingCommand') {
+      if (client.playerId === null) return { accepted: false, reason: 'join-required' }
+      const command = message
+      const playerId = client.playerId
+      const resultKey = brewingResultKey(playerId, command.commandId)
+      const fingerprint = brewingFingerprint(command)
+      const cached = brewingResults.get(resultKey)
+      if (cached !== undefined) {
+        if (cached.fingerprint !== fingerprint) return { accepted: false, reason: 'invalid-command' }
+        const sent = sendBrewing(client, cached.result)
+        if (Result.isFailure(sent)) return { accepted: false, reason: 'invalid-command', failure: sent.failure }
+        return cached.result._tag === 'BrewingCommandAccepted'
+          ? { accepted: true, message }
+          : { accepted: false, reason: receiveReasonForRejection(cached.result.reason) }
+      }
+      const rejectBrewing = (
+        reason: BrewingRejectionReason,
+        receiveReason: RejectedReceiveReason = 'invalid-command',
+        failure?: MultiplayerServerCoreFailure,
+      ): ReceiveResult => {
+        const result: BrewingCommandResult = { _tag: 'BrewingCommandRejected', commandId: command.commandId, revision, reason }
+        const encoded = encodeBrewing(result)
+        if (Result.isFailure(encoded)) return { accepted: false, reason: 'invalid-command', failure: encoded.failure }
+        if (failure === undefined) cacheBrewingResult(resultKey, fingerprint, result)
+        client.send(encoded.success)
+        return failure === undefined ? { accepted: false, reason: receiveReason } : { accepted: false, reason: receiveReason, failure }
+      }
+      if (command.player !== playerId) return rejectBrewing('unauthorized-player', 'identity-spoof')
+      if (command.world !== worldId) return rejectBrewing('wrong-world', 'wrong-world')
+      if (command.expectedRevision !== revision) return rejectBrewing('stale-revision')
+      const inventory = inventories.get(playerId)
+      const presence = players.get(playerId)
+      const playerVitals = vitals.get(playerId)
+      if (inventory === undefined || presence === undefined || playerVitals === undefined || playerVitals.health <= 0) return rejectBrewing('invalid-command')
+      const at = { ...command.at }
+      const access = facilityIsAccessible(playerId, at, 'brewing_stand')
+      if (Result.isFailure(access)) return rejectBrewing('invalid-command', 'invalid-command', access.failure)
+      if (access.success !== null) return rejectBrewing('invalid-command')
+      const current = brewingStands.get(positionKey(at))?.state
+      if (current === undefined) return rejectBrewing('invalid-command')
+      let next = current
+      const nextSlots = inventory.slots.map(cloneStack)
+      let nextEffects: StatusEffectState | undefined
+      switch (command.action._tag) {
+        case 'open': break
+        case 'insert-fuel':
+        case 'insert-bottle':
+        case 'insert-ingredient': {
+          if (hasInventorySlotMetadata(playerId, command.action.slot)) return rejectBrewing('invalid-command')
+          const source = nextSlots[command.action.slot]
+          if (source === null || source === undefined) return rejectBrewing('missing-ingredients')
+          const inserted = insertBrewingItem(current, command.action, source)
+          if (Result.isFailure(inserted)) {
+            if (inserted.failure._tag === 'BrewingInsertRejected') return rejectBrewing('invalid-command')
+            return rejectBrewing('invalid-command', 'invalid-command', { _tag: 'BrewingStateFailure', failure: inserted.failure })
+          }
+          next = inserted.success
+          nextSlots[command.action.slot] = source.count === 1 ? null : { ...source, count: source.count - 1 }
+          break
+        }
+        case 'collect': {
+          const bottle = current.bottles[command.action.bottleIndex]
+          if (bottle === undefined) return rejectBrewing('invalid-command')
+          if (addStackToInventory(nextSlots, { item: bottle.item, count: bottle.count }) !== null) return rejectBrewing('no-room')
+          const collected = setBrewingBottle(current, command.action.bottleIndex, undefined)
+          if (Result.isFailure(collected)) return rejectBrewing('invalid-command', 'invalid-command', { _tag: 'BrewingStateFailure', failure: collected.failure })
+          next = collected.success
+          break
+        }
+        case 'drink': {
+          const source = nextSlots[command.action.slot]
+          if (source === null || source === undefined) return rejectBrewing('missing-ingredients')
+          const potion = source.item === 'potion_of_swiftness' ? 'speed'
+            : source.item === 'potion_of_poison' ? 'poison'
+              : source.item === 'potion_of_regeneration' ? 'regeneration'
+                : source.item === 'awkward_potion' || source.item === 'water_bottle' ? 'awkward' : undefined
+          if (potion === undefined) return rejectBrewing('invalid-command')
+          nextSlots[command.action.slot] = source.count === 1 ? null : { ...source, count: source.count - 1 }
+          if (addStackToInventory(nextSlots, { item: 'glass_bottle', count: 1 }) !== null) return rejectBrewing('no-room')
+          const effect = statusEffectOfPotion(potion)
+          if (effect !== undefined) {
+            const applied = applyStatusEffect(statusEffects.get(playerId) ?? emptyStatusEffectState(), effect)
+            if (Result.isFailure(applied)) return rejectBrewing('invalid-command', 'invalid-command', { _tag: 'StatusEffectApplyFailure', failure: applied.failure })
+            nextEffects = applied.success.state
+          }
+          break
+        }
+      }
+      const visibleEffects = statusEffectsToWire(nextEffects ?? statusEffects.get(playerId) ?? emptyStatusEffectState())
+      if (Result.isFailure(visibleEffects)) return rejectBrewing('invalid-command', 'invalid-command', visibleEffects.failure)
+      const wire = brewingStateToWire(next)
+      if (Result.isFailure(wire)) return rejectBrewing('invalid-command', 'invalid-command', { _tag: 'BrewingStateFailure', failure: wire.failure })
+      const plannedRevision = revisionAfter(command.action._tag === 'open' ? 0 : 1)
+      if (Result.isFailure(plannedRevision)) return rejectBrewing('invalid-command', 'invalid-command', plannedRevision.failure)
+      const deltaFrame = encodeBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision: plannedRevision.success, at, state: wire.success })
+      if (Result.isFailure(deltaFrame)) return rejectBrewing('invalid-command', 'invalid-command', deltaFrame.failure)
+      const effectsFrames = Result.all(nextEffects === undefined ? [] : [encodeBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision: plannedRevision.success, player: playerId, state: visibleEffects.success })])
+      if (Result.isFailure(effectsFrames)) return rejectBrewing('invalid-command', 'invalid-command', effectsFrames.failure)
+      const result: BrewingCommandResult = { _tag: 'BrewingCommandAccepted', commandId: command.commandId, revision: plannedRevision.success }
+      const resultFrame = encodeBrewing(result)
+      if (Result.isFailure(resultFrame)) return rejectBrewing('invalid-command', 'invalid-command', resultFrame.failure)
+      if (command.action._tag !== 'open') {
+        const advanced = advanceRevision()
+        if (Result.isFailure(advanced)) return rejectBrewing('invalid-command', 'invalid-command', advanced.failure)
+        if (command.action._tag === 'drink' && inventory.slots[command.action.slot]?.count === 1) {
+          setInventorySlotMetadata(playerId, command.action.slot, { name: null, enchantment: null })
+          inventory.durability[command.action.slot] = null
+        }
+        inventory.slots.splice(0, inventory.slots.length, ...nextSlots)
+        brewingStands.set(positionKey(at), { at, state: next })
+        if (nextEffects !== undefined) statusEffects.set(playerId, nextEffects)
+        notifyStateChanged()
+        broadcastFrame(deltaFrame.success)
+        broadcast({ _tag: 'PlayerInventoryDelta', world: worldId, revision, player: playerId, state: inventorySnapshot(inventory) })
+        for (const frame of effectsFrames.success) broadcastFrame(frame)
+      } else {
+        client.send(deltaFrame.success)
+      }
+      cacheBrewingResult(resultKey, fingerprint, result)
+      client.send(resultFrame.success)
+      return { accepted: true, message }
+    }
+
     if (message._tag === 'PlayerJoin') {
       if (client.playerId !== null) {
         return { accepted: false, reason: 'identity-spoof' }
       }
       if (playerClients.has(message.player)) return { accepted: false, reason: 'duplicate-player' }
+      const visibleEffects = statusEffectsToWire(statusEffects.get(message.player) ?? emptyStatusEffectState())
+      if (Result.isFailure(visibleEffects)) return { accepted: false, reason: 'invalid-command', failure: visibleEffects.failure }
       const blockSnapshot = replicatedSnapshotFrame()
       if (Result.isFailure(blockSnapshot)) return { accepted: false, reason: 'invalid-command', failure: blockSnapshot.failure }
+      const brewingFrames: Array<WireText> = []
+      for (const { at, state } of brewingStands.values()) {
+        const wire = brewingStateToWire(state)
+        if (Result.isFailure(wire)) return { accepted: false, reason: 'invalid-command', failure: { _tag: 'BrewingStateFailure', failure: wire.failure } }
+        const encoded = encodeBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: wire.success })
+        if (Result.isFailure(encoded)) return { accepted: false, reason: 'invalid-command', failure: encoded.failure }
+        brewingFrames.push(encoded.success)
+      }
+      const effectsFrame = encodeBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision, player: message.player, state: visibleEffects.success })
+      if (Result.isFailure(effectsFrame)) return { accepted: false, reason: 'invalid-command', failure: effectsFrame.failure }
       const persistedPosition = playerPositions.get(message.player)
       const authoritativeAt = persistedPosition?.at ?? options.spawnAt
       const authoritativeFacing = persistedPosition?.facing ?? DEFAULT_FACING
@@ -4961,16 +4947,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       sendMessage(client, authoritativeSnapshot())
       sendAnvil(client, anvilNamesDelta(message.player))
       sendEnchanting(client, enchantmentsDelta(message.player))
-      for (const { at, state } of brewingStands.values()) {
-        sendBrewing(client, { _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: copyBrewingStandState(state) })
-      }
-      sendBrewing(client, {
-        _tag: 'PlayerStatusEffectsDelta',
-        world: worldId,
-        revision,
-        player: message.player,
-        state: copyStatusEffectState(statusEffects.get(message.player) ?? emptyStatusEffectState()),
-      })
+      for (const frame of brewingFrames) client.send(frame)
+      client.send(effectsFrame.success)
       sendSleep(client, { _tag: 'SleepSnapshot', snapshot: sleepSnapshot })
       const authoritativeJoin = { ...message, at: authoritativeAt }
       broadcast(authoritativeJoin, clientId)
@@ -5083,6 +5061,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         if (Result.isFailure(reserved)) return rejectMutation(client, message, 'stale-revision', 'invalid-mutation', reserved.failure)
         const state = decodeBlockState(blockId.value, message.state)
         if (Result.isFailure(state)) return rejectBlockWrite(client, message, { _tag: 'SavedBlockStateFailure', at, failure: state.failure })
+        const brewingFrames = Result.all(placedBlock === 'brewing_stand' ? [encodeBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision: reserved.success, at: { ...at }, state: emptyStandWire.success })] : [])
+        if (Result.isFailure(brewingFrames)) return rejectMutation(client, message, 'unknown-block', 'invalid-mutation', brewingFrames.failure)
         const committed = commitBlockEdits([{ at, block: placedBlock, state: state.success }])
         if (Result.isFailure(committed)) return rejectBlockWrite(client, message, committed.failure)
         Result.getOrThrow(advanceRevision())
@@ -5099,10 +5079,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
             output: null,
             burnTicksRemaining: 0,
             burnTicksTotal: 0,
+            station: 'furnace',
             cookTicks: 0,
           })
         } else if (placedBlock === 'brewing_stand') {
-          brewingStands.set(positionKey(at), { at: { ...at }, state: emptyBrewingStandState() })
+          brewingStands.set(positionKey(at), { at: { ...at }, state: emptyStand.success })
         }
         notifyStateChanged()
         broadcastFrame(committed.success.frame)
@@ -5113,9 +5094,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
           player: message.player,
           state: inventorySnapshot(inventory),
         })
-        if (placedBlock === 'brewing_stand') {
-          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: emptyBrewingStandState() })
-        }
+        for (const frame of brewingFrames.success) broadcastFrame(frame)
         if (containerKindForBlock(placedBlock) !== undefined || placedBlock === 'furnace' || placedBlock === 'brewing_stand') broadcast(authoritativeSnapshot())
         return { accepted: true, message }
       }
@@ -5189,8 +5168,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         } else if (brokenBlock === 'brewing_stand') {
           const stand = brewingStands.get(brewingKey)
           if (stand !== undefined) {
-            if (stand.state.bottle !== undefined) storedStacks.push({ item: brewingBottleItem(stand.state.bottle), count: 1 })
-            if (stand.state.ingredient !== undefined) storedStacks.push({ item: stand.state.ingredient, count: 1 })
+            for (const stack of brewingDrops(stand.state)) storedStacks.push({ item: stack.item, count: stack.count })
           }
         }
         const blockDrops = blockLootStacks.map((stack, index): AuthoritativeEntityState => ({
@@ -5208,6 +5186,8 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         const drops = [...blockDrops, ...contentsDrops]
         const outside = firstOutsideAddressableCells(drops.flatMap((entity) => positionsOfWrite({ _tag: 'entity', entity })))
         if (outside !== undefined) return rejectMutation(client, message, 'out-of-bounds', 'invalid-mutation', outside)
+        const brewingFrames = Result.all(brokenBlock === 'brewing_stand' ? [encodeBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision: breakRevision, at: { ...at }, state: emptyStandWire.success })] : [])
+        if (Result.isFailure(brewingFrames)) return rejectMutation(client, message, 'missing-block', 'invalid-mutation', brewingFrames.failure)
         const committed = commitBlockEdits([{ at, block: null }])
         if (Result.isFailure(committed)) return rejectBlockWrite(client, message, committed.failure)
         Result.getOrThrow(writePositions(drops.map((drop) => ({ _tag: 'entity', entity: drop }))))
@@ -5221,9 +5201,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         notifyStateChanged()
         broadcastFrame(committed.success.frame)
         for (const drop of drops) broadcast({ _tag: 'EntitySpawnDelta', world: worldId, revision, entity: drop })
-        if (brokenBlock === 'brewing_stand') {
-          broadcastBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision, at: { ...at }, state: emptyBrewingStandState() })
-        }
+        for (const frame of brewingFrames.success) broadcastFrame(frame)
         if (containerKindForBlock(brokenBlock) !== undefined || brokenBlock === 'furnace' || brokenBlock === 'brewing_stand') broadcast(authoritativeSnapshot())
         const sleepEvents = sleepAuthority.reconcile()
         // revisionAfter(2) reserved the advance a skipped night takes.
@@ -5273,7 +5251,6 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       case 'PlayerDamageCommand':
       case 'PlayerDamageCommandAccepted':
       case 'PlayerDamageCommandRejected':
-      case 'BrewingCommand':
       case 'BrewingCommandAccepted':
       case 'BrewingCommandRejected':
       case 'BrewingStandDelta':
@@ -5351,9 +5328,15 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     return Result.succeed(transfer)
   }
 
-  const acceptRealmTransfer = (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText): boolean => {
+  const acceptRealmTransfer = (clientId: ClientId, transfer: RealmTransferPlayer, arrival: RealmTransferArrival, preparedBlockSnapshot: WireText): Result.Result<boolean, MultiplayerServerCoreFailure> => {
     const client = clients.get(clientId)
-    if (client === undefined || client.playerId !== null || playerClients.has(transfer.player)) return false
+    if (client === undefined || client.playerId !== null || playerClients.has(transfer.player)) return Result.succeed(false)
+    const validatedEffects = validateServerStatusEffects(transfer.statusEffects)
+    if (Result.isFailure(validatedEffects)) return Result.fail(validatedEffects.failure)
+    const visibleEffects = statusEffectsToWire(validatedEffects.success)
+    if (Result.isFailure(visibleEffects)) return Result.fail(visibleEffects.failure)
+    const effectsFrame = encodeBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision, player: transfer.player, state: visibleEffects.success })
+    if (Result.isFailure(effectsFrame)) return Result.fail(effectsFrame.failure)
     const player: MutablePlayer = {
       player: transfer.player,
       name: transfer.name,
@@ -5361,12 +5344,13 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
       at: arrival.at,
       facing: arrival.facing,
     }
-    if (Result.isFailure(writePositions([{ _tag: 'player', presence: player, at: arrival.at, facing: arrival.facing }]))) return false
+    const placed = writePositions([{ _tag: 'player', presence: player, at: arrival.at, facing: arrival.facing }])
+    if (Result.isFailure(placed)) return Result.fail(placed.failure)
     client.playerId = transfer.player
     playerClients.set(transfer.player, clientId)
     inventories.set(transfer.player, cloneInventory(transfer.inventory))
     vitals.set(transfer.player, { ...transfer.vitals })
-    statusEffects.set(transfer.player, copyStatusEffectState(transfer.statusEffects))
+    statusEffects.set(transfer.player, validatedEffects.success)
     anvilNames.set(transfer.player, new Map(transfer.anvilNames.map(({ slot, name }) => [slot, name])))
     enchantments.set(transfer.player, {
       seed: transfer.enchantments.seed,
@@ -5398,17 +5382,11 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     client.send(preparedBlockSnapshot)
     sendAnvil(client, anvilNamesDelta(transfer.player))
     sendEnchanting(client, enchantmentsDelta(transfer.player))
-    sendBrewing(client, {
-      _tag: 'PlayerStatusEffectsDelta',
-      world: worldId,
-      revision,
-      player: transfer.player,
-      state: copyStatusEffectState(statusEffects.get(transfer.player) ?? emptyStatusEffectState()),
-    })
+    client.send(effectsFrame.success)
     sendSleep(client, { _tag: 'SleepSnapshot', snapshot: sleepAuthority.snapshot() })
     sendWither(client, witherSnapshot())
     sendEnderDragon(client, enderDragonSnapshot())
-    return true
+    return Result.succeed(true)
   }
 
   /**
@@ -5703,7 +5681,7 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
     }
 
     if (elapsedSecs > 0) {
-      const changedBrewingStands: Array<Readonly<{ at: BlockPos; state: BrewingStandState }>> = []
+      const changedBrewingStands: Array<Readonly<{ at: BlockPos; state: BrewingState; wire: BrewingStandWire }>> = []
       const changedEffects = new Map<PlayerId, StatusEffectState>()
       const changedVitals = new Set<PlayerId>()
       const advancedEffects: Array<Readonly<{ player: PlayerId; effects: StatusEffectState; advanced: StatusEffectTick }>> = []
@@ -5715,10 +5693,14 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
 
       const brewingCommits: Array<() => void> = []
       for (const [key, stand] of brewingStands) {
-        const next = tickBrewingStand(stand.state, DeltaTimeSecs(elapsedSecs))
+        const advanced = advanceBrewing(stand.state, elapsedSecs)
+        if (Result.isFailure(advanced)) return failStep({ _tag: 'BrewingStateFailure', failure: advanced.failure })
+        const next = advanced.success.state
         if (JSON.stringify(next) === JSON.stringify(stand.state)) continue
+        const wire = brewingStateToWire(next)
+        if (Result.isFailure(wire)) return failStep({ _tag: 'BrewingStateFailure', failure: wire.failure })
         brewingCommits.push(() => brewingStands.set(key, { at: stand.at, state: next }))
-        changedBrewingStands.push({ at: stand.at, state: next })
+        changedBrewingStands.push({ at: stand.at, state: next, wire: wire.success })
       }
 
       for (const { player, effects, advanced } of advancedEffects) {
@@ -5741,19 +5723,21 @@ export const makeMultiplayerServerCore = (options: MultiplayerServerOptions): Re
         changedVitals.add(player)
       }
 
+      const visibleEffectChanges = Result.all([...changedEffects].map(([player, effects]) => Result.map(statusEffectsToWire(effects), (state) => ({ player, state }))))
+      if (Result.isFailure(visibleEffectChanges)) return failStep(visibleEffectChanges.failure)
       if (changedBrewingStands.length > 0 || changedEffects.size > 0 || changedVitals.size > 0) {
+        const plannedRevision = revisionAfter(1)
+        if (Result.isFailure(plannedRevision)) return failStep(plannedRevision.failure)
+        const frames = Result.all([
+          ...changedBrewingStands.map((stand) => encodeBrewing({ _tag: 'BrewingStandDelta', world: worldId, revision: plannedRevision.success, at: stand.at, state: stand.wire })),
+          ...visibleEffectChanges.success.map(({ player, state }) => encodeBrewing({ _tag: 'PlayerStatusEffectsDelta', world: worldId, revision: plannedRevision.success, player, state })),
+        ])
+        if (Result.isFailure(frames)) return failStep(frames.failure)
         const advancedRevision = advanceRevision()
         if (Result.isFailure(advancedRevision)) return failStep(advancedRevision.failure)
         for (const commit of brewingCommits) commit()
         stateChanged = true
-        for (const stand of changedBrewingStands) {
-          const delta: BrewingWireMessage = { _tag: 'BrewingStandDelta', world: worldId, revision, at: stand.at, state: copyBrewingStandState(stand.state) }
-          postPersistenceSends.push(() => broadcastBrewing(delta))
-        }
-        for (const [player, effects] of changedEffects) {
-          const delta: BrewingWireMessage = { _tag: 'PlayerStatusEffectsDelta', world: worldId, revision, player, state: copyStatusEffectState(effects) }
-          postPersistenceSends.push(() => broadcastBrewing(delta))
-        }
+        for (const frame of frames.success) postPersistenceSends.push(() => broadcastFrame(frame))
         for (const player of changedVitals) {
           const presence = players.get(player)
           if (presence !== undefined) postPersistenceDeltas.push({
