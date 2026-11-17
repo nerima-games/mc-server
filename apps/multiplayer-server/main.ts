@@ -488,10 +488,10 @@ const decodeServerState = (value: unknown, worldId: string, format: 1 | 2 | 3): 
   for (const entry of statusEffectsValue === undefined ? [] : statusEffectsValue) {
     if (!isRecord(entry)) return Result.fail(savedServerStateFailure('statusEffects', 'invalid status effect state'))
     const effects = validateServerStatusEffects(entry['state'])
-    if (Result.isFailure(effects)) return Result.fail(effects.failure)
+    if (Result.isFailure(effects)) return Result.fail(savedServerStateFailure(effects.failure.fieldPath, effects.failure.reason))
     const player = Schema.decodeUnknownResult(PlayerIdSchema)(entry['player'])
     if (Result.isFailure(player)) return Result.fail(savedServerStateFailure('statusEffects', 'invalid status effect player'))
-    statusEffects.push({ player: player.success, state: effects.success })
+    statusEffects.push({ player: player.success, state: effects.success.state })
   }
 
   const anvilNamesValue = state['anvilNames']
@@ -629,7 +629,7 @@ export const loadServerState = async (
   } catch (error) {
     if (isRecord(error) && error['code'] === 'ENOENT') return Result.succeed(undefined)
     const code = isRecord(error) && typeof error['code'] === 'string' ? error['code'] : undefined
-    return Result.fail(savedServerStateFailure(path, 'failed to read multiplayer state', {
+    return Result.fail(savedServerStateFailure(undefined, 'failed to read multiplayer state', {
       filePath: path, ...(code === undefined ? {} : { code }),
     }))
   }
@@ -637,12 +637,12 @@ export const loadServerState = async (
   try {
     value = JSON.parse(source)
   } catch {
-    return Result.fail(savedServerStateFailure(path, 'invalid multiplayer state JSON', { filePath: path }))
+    return Result.fail(savedServerStateFailure(undefined, 'invalid multiplayer state JSON', { filePath: path }))
   }
-  if (!isRecord(value)) return Result.fail(savedServerStateFailure(path, 'invalid multiplayer state envelope', { filePath: path }))
+  if (!isRecord(value)) return Result.fail(savedServerStateFailure(undefined, 'invalid multiplayer state envelope', { filePath: path }))
   const format = value['format']
   if ((format !== 1 && format !== 2 && format !== 3) || value['worldId'] !== worldId || value['seed'] !== seed) {
-    return Result.fail(savedServerStateFailure(path, 'multiplayer state file does not match world and seed or supported format', { filePath: path }))
+    return Result.fail(savedServerStateFailure(undefined, 'multiplayer state file does not match world and seed or supported format', { filePath: path }))
   }
   const decodedState = decodeServerState(value['state'], worldId, format)
   if (Result.isFailure(decodedState)) {

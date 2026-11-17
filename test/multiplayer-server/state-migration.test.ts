@@ -129,7 +129,7 @@ describe.each([1, 2])('format %s to format 3 migration', (format) => {
     }
     const source = JSON.stringify({ format, worldId, seed, state: { revision: 0, blocks: [], brewingStands: [{ at, state }] } })
     await writeFile(path, source, 'utf8')
-    expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', path: 'brewingStands', reason, filePath: path }))
+    expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', fieldPath: 'brewingStands', reason, filePath: path }))
     expect(await readFile(path, 'utf8')).toBe(source)
   })
 
@@ -205,7 +205,7 @@ describe('format 3 state validation', () => {
     await writeFile(path, JSON.stringify({ format: 3, worldId, seed, state: {
       revision: 0, blocks: [], brewingStands: [{ at, state: wire }],
     } }), 'utf8')
-    expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', path: 'brewingStands', reason: 'invalid-wire', filePath: path }))
+    expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', fieldPath: 'brewingStands', reason: 'invalid-wire', filePath: path }))
   })
 
   it.each([
@@ -218,7 +218,7 @@ describe('format 3 state validation', () => {
     const path = join(await mkdtemp(join(tmpdir(), 'server-envelope-invalid-')), 'state.json')
     await writeFile(path, source, 'utf8')
     expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({
-      _tag: 'SavedServerStateFailure', path: nested ? 'state' : path, reason, filePath: path,
+      _tag: 'SavedServerStateFailure', ...(nested ? { fieldPath: 'state' } : {}), reason, filePath: path,
     }))
   })
 })
@@ -240,7 +240,7 @@ describe.each([1, 2, 3])('format %s status effect ingress', (format) => {
     } })
     await writeFile(path, source, 'utf8')
     expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({
-      _tag: 'SavedServerStateFailure', path: 'statusEffects', reason, filePath: path,
+      _tag: 'SavedServerStateFailure', fieldPath: 'statusEffects', reason, filePath: path,
     }))
     expect(await readFile(path, 'utf8')).toBe(source)
   })
@@ -250,7 +250,7 @@ describe('saved state filesystem diagnostics', () => {
   it('retains the real EISDIR error and requested file path', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'server-read-directory-'))
     expect(await loadServerState(directory, worldId, seed)).toEqual(Result.fail({
-      _tag: 'SavedServerStateFailure', path: directory, filePath: directory,
+      _tag: 'SavedServerStateFailure', filePath: directory,
       reason: 'failed to read multiplayer state', code: 'EISDIR',
     }))
   })
@@ -260,7 +260,7 @@ describe('saved state filesystem diagnostics', () => {
     await writeFile(parent, '{}', 'utf8')
     const path = join(parent, 'state.json')
     expect(await loadServerState(path, worldId, seed)).toEqual(Result.fail({
-      _tag: 'SavedServerStateFailure', path, filePath: path,
+      _tag: 'SavedServerStateFailure', filePath: path,
       reason: 'failed to read multiplayer state', code: 'ENOTDIR',
     }))
   })

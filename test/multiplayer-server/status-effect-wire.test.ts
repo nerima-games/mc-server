@@ -1,5 +1,5 @@
 import { applyStatusEffect, emptyStatusEffectState, type StatusEffectType } from '@nerima-games/mx-gameplay'
-import { statusEffectsToWire } from '../../apps/multiplayer-server/brewing-stands'
+import { statusEffectsToWire, validateServerStatusEffects } from '../../apps/multiplayer-server/brewing-stands'
 import { emptyBrewingState } from '@nerima-games/mc-sim'
 import {
   BrewingCommand,
@@ -37,6 +37,16 @@ describe('visible status-effect wire state', () => {
     expect(state).toEqual(before)
   })
 
+  it('returns the validated authoritative copy and its visible wire projection together', () => {
+    const weaker = Result.getOrThrow(applyStatusEffect(emptyStatusEffectState(), { type: 'regeneration', durationSecs: 45 })).state
+    const state = Result.getOrThrow(applyStatusEffect(weaker, { type: 'regeneration', durationSecs: 5, amplifier: 1 })).state
+    const validated = Result.getOrThrow(validateServerStatusEffects(state))
+    expect(validated.state).toEqual(state)
+    expect(validated.state).not.toBe(state)
+    expect(validated.state.effects[0]?.hiddenEffects).toEqual([{ remainingSecs: 45, pulseClockSecs: 0, amplifier: 0 }])
+    expect(validated.wire).toEqual({ effects: [{ type: 'regeneration', remainingSecs: 5, pulseClockSecs: 0, amplifier: 1 }] })
+  })
+
   it('returns a typed failure for an authoritative effect outside the wire vocabulary', () => {
     const state = Result.getOrThrow(applyStatusEffect(emptyStatusEffectState(), { type: 'night_vision', durationSecs: 12 })).state
     expect(statusEffectsToWire(state)).toEqual(Result.fail({ _tag: 'UnsupportedVisibleStatusEffect', type: 'night_vision' }))
@@ -53,7 +63,7 @@ describe('visible status-effect wire state', () => {
         containers: [], furnaces: [], villagerTrades: [], statusEffects: [{ player, state }],
       },
     })
-    expect(result).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', path: 'statusEffects', reason: 'unsupported visible status effect type: night_vision' }))
+    expect(result).toEqual(Result.fail({ _tag: 'SavedServerStateFailure', fieldPath: 'statusEffects', reason: 'unsupported visible status effect type: night_vision' }))
   })
 
   it('rejects an unsupported realm-transfer effect before mutating destination state', () => {
@@ -79,7 +89,7 @@ describe('visible status-effect wire state', () => {
       commandId: CommandId.make('transfer'), fromWorld: WorldId.make('world-1'),
       at: { x: 0, y: 64, z: 0 }, facing: { yawRadians: 0, pitchRadians: 0 },
     }, Result.getOrThrow(destination.prepareRealmTransfer()))).toEqual(Result.fail({
-      _tag: 'SavedServerStateFailure', path: 'statusEffects', reason: 'unsupported visible status effect type: night_vision',
+      _tag: 'RealmTransferStateFailure', fieldPath: 'statusEffects', reason: 'unsupported visible status effect type: night_vision',
     }))
     expect(destination.snapshot()).toEqual(before)
     expect(sent).toHaveLength(frameCount)

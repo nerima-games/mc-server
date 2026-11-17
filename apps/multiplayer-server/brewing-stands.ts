@@ -3,7 +3,6 @@ import { BREWING_FUEL_ITEM, BREWING_MAX_FUEL_CHARGES, VANILLA_BREWING_RECIPES, a
 import { type BrewingAction, brewingStateToWire, furnaceStateFromWire, type BrewingWireConversionFailure, type FurnaceWireConversionFailure, type StatusEffectState as StatusEffectsWire, type ActiveStatusEffect } from '@nerima-games/mx-multiplayer'
 import { Result } from 'effect'
 import { copyStatusEffectState, isValidStatusEffectState, type StatusEffectState } from '@nerima-games/mx-gameplay'
-import { savedServerStateFailure, type SavedServerStateFailure } from './legacy-state.js'
 
 export { advanceBrewing, emptyBrewingState, brewingStateToWire, furnaceStateFromWire, setBrewingBottle }
 export type { BrewingState, BrewingWireConversionFailure, FurnaceWireConversionFailure }
@@ -28,9 +27,11 @@ export const insertBrewingItem = (
       if (!bottleItem(source.item) || state.bottles[action.bottleIndex] !== undefined) return rejected()
       return Result.flatMap(itemStack(source.item, 1), (bottle) => setBrewingBottle(state, action.bottleIndex, bottle))
     case 'insert-ingredient':
+      // mx-gameplay 0.12.0 dist/stages/interactions-stage.js:1630–1639 rejects occupied ingredients and inserts one item.
       if (!ingredientItem(source.item) || state.ingredient !== undefined) return rejected()
       return Result.flatMap(itemStack(source.item, 1), (ingredient) => setBrewingIngredient(state, ingredient))
     case 'insert-fuel': {
+      // mx-gameplay 0.12.0 dist/stages/interactions-stage.js:1564–1566 rejects fuel at full charges.
       if (source.item !== BREWING_FUEL_ITEM || state.fuelCharges === BREWING_MAX_FUEL_CHARGES || (state.fuel !== undefined && (state.fuel.item !== BREWING_FUEL_ITEM || state.fuel.count === maxStackCountForItem(BREWING_FUEL_ITEM)))) return rejected()
       const fuel = itemStack(BREWING_FUEL_ITEM, (state.fuel?.count ?? 0) + 1)
       return Result.flatMap(fuel, (stack) => Result.flatMap(brewingState({ ...state, fuel: stack }), addBrewingFuel))
@@ -58,11 +59,13 @@ export const statusEffectsToWire = (state: StatusEffectState): Result.Result<Sta
   return Result.succeed({ effects })
 }
 
-export const validateServerStatusEffects = (value: unknown): Result.Result<StatusEffectState, SavedServerStateFailure> => {
-  if (!isValidStatusEffectState(value)) return Result.fail(savedServerStateFailure('statusEffects', 'invalid status effect state'))
+export type StatusEffectsValidationFailure = Readonly<{ _tag: 'StatusEffectsValidationFailure'; fieldPath: 'statusEffects'; reason: string }>
+
+export const validateServerStatusEffects = (value: unknown): Result.Result<Readonly<{ state: StatusEffectState; wire: StatusEffectsWire }>, StatusEffectsValidationFailure> => {
+  if (!isValidStatusEffectState(value)) return Result.fail({ _tag: 'StatusEffectsValidationFailure', fieldPath: 'statusEffects', reason: 'invalid status effect state' })
   const projected = statusEffectsToWire(value)
-  if (Result.isFailure(projected)) return Result.fail(savedServerStateFailure('statusEffects', `unsupported visible status effect type: ${projected.failure.type}`))
-  return Result.succeed(copyStatusEffectState(value))
+  if (Result.isFailure(projected)) return Result.fail({ _tag: 'StatusEffectsValidationFailure', fieldPath: 'statusEffects', reason: `unsupported visible status effect type: ${projected.failure.type}` })
+  return Result.succeed({ state: copyStatusEffectState(value), wire: projected.success })
 }
 
 export const brewingDrops = (state: BrewingState): ReadonlyArray<ItemStack> =>
