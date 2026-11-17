@@ -4,18 +4,20 @@ import { Result, Schema } from 'effect'
 
 export type SavedServerStateFailure = {
   readonly _tag: 'SavedServerStateFailure'
-  readonly path: string
+  readonly fieldPath?: string
   readonly reason: string
   readonly code?: string
   readonly filePath?: string
 }
 
 export const savedServerStateFailure = (
-  path: string,
+  fieldPath: string | undefined,
   reason: string,
   context?: { readonly code?: string; readonly filePath?: string },
 ): SavedServerStateFailure => ({
-  _tag: 'SavedServerStateFailure', path, reason, ...context,
+  _tag: 'SavedServerStateFailure', reason,
+  ...(fieldPath === undefined ? {} : { fieldPath }),
+  ...context,
 })
 
 const potion = Schema.Literals(['awkward', 'speed', 'poison', 'regeneration'])
